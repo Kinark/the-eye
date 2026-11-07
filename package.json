@@ -1,6 +1,6 @@
 {
   "name": "the-eye",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server that measures what is visible on a macOS screen over time: real on-screen fps, stalls, hitches and motion extent per displayed frame.",
   "type": "module",
   "bin": { "the-eye": "src/index.ts" },

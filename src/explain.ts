@@ -1,4 +1,4 @@
-// eye_explain: joins, on ONE clock (seconds since the first captured frame), what was SEEN (frames.csv),
+// eye_report view:"explain": joins, on ONE clock (seconds since the first captured frame), what was SEEN (frames.csv),
 // where the cursor was and what it was over (cursor.csv), what the agent was doing (actions.jsonl), and
 // what the app's main thread was doing (profile.json from Instruments).
 import { existsSync, readFileSync } from "node:fs";

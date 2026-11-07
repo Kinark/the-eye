@@ -14,11 +14,10 @@ const log = (h, s) => console.log(`== ${h}\n${s}`);
 const watch = ["PublicGlassHostView", "NSGlassEffectView", "CABackdropLayer", "DropAreaView"];
 
 try {
-  log("attach", await call("eye_probe_attach", { process: proc }));
-  log("lock", await call("eye_lock_input", { seconds: 120, strict: true }));
+  log("lock", await call("eye_lock", { seconds: 120, strict: true }));
   for (const mode of ["none", "focus", "full", "none"]) {
-    log(`mode ${mode} capture`, await call("eye_start", { rect: { x: 400, y: 0, w: 712, h: 240 }, label: `cost-${mode}`, max_seconds: 30, cursor: false }));
-    if (mode !== "none") log("probe", await call("eye_probe_start", { process: proc, label: mode, max_seconds: 30, watch, full_walk: mode === "full" }));
+    log(`mode ${mode} capture`, await call("eye_record", { rect: { x: 400, y: 0, w: 712, h: 240 }, label: `cost-${mode}`, max_seconds: 30, cursor: false }));
+    if (mode !== "none") log("probe", await call("eye_probe", { process: proc, label: mode, max_seconds: 30, watch, full_walk: mode === "full" }));
     log("open", await call("eye_act", { target_process: proc, label: "open", steps: [
       { op: "move", x: 756, y: 14, ms: 250 }, { op: "wait", ms: 500 }, { op: "click" }, { op: "wait", ms: 1500 },
     ] }));
@@ -27,11 +26,11 @@ try {
     ] }));
     const cap = await call("eye_stop");
     log(`mode ${mode} capture report`, cap.split("\n").slice(0, 8).join("\n"));
-    if (mode !== "none") log(`mode ${mode} probe report`, (await call("eye_probe_stop", { top: 4 })).split("\n").slice(0, 8).join("\n"));
+    if (mode !== "none") log(`mode ${mode} probe report`, (await call("eye_stop", { top: 4 })).split("\n").slice(0, 8).join("\n"));
   }
 } catch (e) {
   log("FAILED", e.message);
 } finally {
-  log("unlock", await call("eye_unlock"));
+  log("unlock", await call("eye_lock", { release: true }));
   await client.close();
 }

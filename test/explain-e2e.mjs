@@ -1,4 +1,4 @@
-// End-to-end: capture + Instruments + cursor/AX + labeled eye_act phases → eye_explain.
+// End-to-end: capture + Instruments + cursor/AX + labeled eye_act phases → eye_report.
 // usage: node test/explain-e2e.mjs <process-name> [label]
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -16,9 +16,9 @@ const act = async (lbl, steps) => {
   if (stop) throw new Error(stop[1]);
   return r;
 };
-console.log(await call("eye_lock_input", { seconds: 120 }));
+console.log(await call("eye_lock", { seconds: 120 }));
 await call("eye_act", { steps: [{ op: "move", x: cx, y: 420, ms: 200 }, { op: "wait", ms: 1500 }] });
-console.log(await call("eye_start", { rect: { x: 356, y: 0, w: 800, h: 300 }, label, max_seconds: 120, profile: { process: proc }, ax_hz: Number(process.env.AX_HZ ?? 4) }));
+console.log(await call("eye_record", { rect: { x: 356, y: 0, w: 800, h: 300 }, label, max_seconds: 120, profile: { process: proc }, ax_hz: Number(process.env.AX_HZ ?? 4) }));
 try {
   await act("settle", [{ op: "wait", ms: 600 }, { op: "assert", expr: "!a || a.h < 30" }]);
   for (let round = 1; round <= 2; round++) {
@@ -37,9 +37,9 @@ try {
       { op: "wait_until", expr: "!a || a.h < 45", timeout_ms: 2500 }, { op: "wait", ms: 500 }]);
   }
 } catch (e) { console.log("probe stopped:", e.message); }
-console.log(await call("eye_unlock"));
+console.log(await call("eye_lock", { release: true }));
 const rep = await call("eye_stop");
 console.log(rep.split("\n").filter((l) => /WHILE|profile|csv:/.test(l)).join("\n"));
 const csv = rep.match(/csv: (.*)/)?.[1];
-console.log("\n" + await call("eye_explain", { csv, top: 8 }));
+console.log("\n" + await call("eye_report", { csv, view: "explain", top: 8 }));
 await client.close();

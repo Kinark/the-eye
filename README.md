@@ -39,24 +39,43 @@ For each segment it reports:
 
 ## Tools
 
+Ten tools. The server's MCP `instructions` carry the full "what / when / how" guide agents see on connect.
+
 | tool | what |
 |---|---|
-| `eye_displays` | displays: id, points, scale, refresh rate |
-| `eye_record` | record a region for N s (blocking) and return the report |
-| `eye_start` / `eye_stop` | background recording around your own actions |
-| `eye_record_while` | record + optionally **lock the physical trackpad/mouse** + run a shell command (your input driver) + report. Best for A/B tests. |
-| `eye_act` | **interactive driving**: run a few input steps (`move`, `click`, `down`/`up`, `scroll`, `wait`, `wait_until`, `assert`) and get the measured visible state after **every** step. You read it, think, and send the next steps. Steps can carry a `guard`. Scrolls are refused unless the pointer is inside the measured open area or a `scroll_zones` rect. |
-| `eye_peek` / `eye_abort` | live status of a background `eye_record_while` run (what's visible now, last few seconds of fps and hitches, the driver's latest output), or kill it immediately |
-| `eye_analyze` | re-analyze a run (time window, thresholds) |
-| `eye_compare` | side-by-side table of runs with deltas vs the first |
-| `eye_timeline` | binned time series (frames, idle, worst gap, % moved, luma, extent) |
-| `eye_frames` | keyframe PNGs near a time (record with `keyframe_ms`) |
-| `eye_snapshot` | one PNG of a region |
-| `eye_lock_input` / `eye_unlock` | block physical pointer input. Synthetic events pass, the keyboard stays live, **Esc** releases, and it auto-releases after a timeout. |
-| `eye_status` | active captures and locks |
-| `eye_probe_attach` | load the **layer probe** into a running app (see below) |
-| `eye_probe_start` / `eye_probe_peek` / `eye_probe_stop` | record per-frame layer geometry; peek every ~0.5s while acting |
-| `eye_probe_report` | re-analyze a probe recording, or dump one layer's per-frame series |
+| `eye_status` | displays (id, points, scale, refresh rate), active recordings / probe runs / locks, runs dir |
+| `eye_inspect` | **accessibility view, no recording**: everything the element under a point exposes (default: the pointer), or the element **tree** of the windows visible in a rect, one line per element with its bounds |
+| `eye_snapshot` | one PNG of a region (`rect`), or a recording's keyframes near a time (`csv`, `t_s`) |
+| `eye_record` | record a region. No command/seconds → background, returns an id at once (with the AX tree). `seconds` → blocking. `command` → runs your input driver while recording, optional `lock_input`, returns output + report. `background:true` for long runs |
+| `eye_peek` | live state of a running recording or probe: moving, extent, recent fps/hitches, **element under the pointer** (`hover:"full"` for every attribute), command output, probe layers, optional fresh AX `tree` |
+| `eye_act` | **interactive driving**: `move`, `click`, `down`/`up`, `scroll`, `wait`, `wait_until`, `assert`. After **every** step: pointer, element under it, visible state. Expressions get `h` (the element). Presses only on `target_process`; scrolls only inside the open area or `scroll_zones` |
+| `eye_stop` | end a recording and/or probe run (all if no id), kill a running command, return the report(s); the probe report is aligned to the capture |
+| `eye_report` | re-analyze: `summary`, `timeline`, `explain` (worst gaps × cursor × element × eye_act step × main thread), `hover` (element-under-pointer changes), `compare` (runs), `probe` (probe.ndjson / one layer) |
+| `eye_lock` | lock the physical pointer (`seconds`, `strict` also blocks the keyboard) or `release:true` |
+| `eye_probe` | load the layer probe into an app if needed and start recording layer geometry (see below) |
+
+Old → new: `eye_displays`→`eye_status` · `eye_start`/`eye_record_while`→`eye_record` · `eye_abort`→`eye_stop` ·
+`eye_analyze`/`eye_timeline`/`eye_compare`/`eye_explain`/`eye_probe_report`→`eye_report` · `eye_frames`→`eye_snapshot` ·
+`eye_lock_input`/`eye_unlock`→`eye_lock` · `eye_probe_attach`/`eye_probe_start`→`eye_probe` · `eye_probe_peek`→`eye_peek` ·
+`eye_probe_stop`→`eye_stop`.
+
+## Accessibility (AX) context
+
+So an agent knows **what** it is looking at and **where** things are:
+
+- **Hover**: while recording with `ax` (default on, off with `profile`), the capture hit-tests the element under the
+  pointer up to `ax_hz` (10) times a second. When the element changes, its full description (every attribute,
+  actions, parameterized attributes, ancestors, app, window, readable path) goes to the live JSON (`hover`) and to
+  `hover.jsonl`; while it stays the same, its frame/state is refreshed every 0.5s. Reports end with a timeline of
+  what the pointer was over; `cursor.csv` keeps role/label columns for `eye_report view:"explain"`.
+- **Tree**: `eye_record` snapshots the element tree of the observed windows at start (`tree: basic|full|none`,
+  saved as `ax_tree_start.txt/.json`); `eye_inspect`, `eye_peek {tree}` and `eye_act {tree}` dump it on demand.
+  The observed windows are found by AX hit-testing a grid of points in the rect, so only what is actually on top
+  counts (occluded windows and transparent full-screen windows are ignored); `process` picks an app explicitly.
+  `basic` folds unlabeled layout groups; `full` lists every node and its actions.
+- AX frames are **global** points (same space as the pointer and `eye_act` x/y; equal to display-local on the main display).
+- **Cost:** any AX client makes SwiftUI apps maintain their accessibility graph (measured ~18% more main-thread time,
+  −25% fps on NOOTCH!). Use `ax:false` for final fps numbers and A/B runs; reports say when AX was on.
 
 ## Layer probe (geometry from inside the app, no pixels)
 
@@ -66,23 +85,23 @@ For each segment it reports:
 `CAShapeLayer` mask. Everything is in display-local points, top-left origin (the same space as the capture), and
 timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` narrow what is logged and shown.
 
-- **Attach:** `eye_probe_attach {process}` builds the library and signs a copy with the **target's own certificate**
+- **Attach:** `eye_probe {process}` builds the library and signs a copy with the **target's own certificate**
   (needed for library validation; the key must be in your keychain). It stages the copy where the app can read it (its
   container when sandboxed) and loads it with `lldb -p`. If Xcode already debugs the app, it returns the commands
   to send through Xcode's `InvokeDebuggerCommand` instead. The target must be debuggable (`get-task-allow`, e.g. a Debug build).
 - **Control** is file based (`control.json` / `status.json` in that directory), so it works inside the sandbox.
 - **Live:** `<recording>.live.json` is rewritten every 0.25s with the last 0.5s: ticks/s, walk cost, the layers that
   moved (updates, coverage = frames changed / frames in its motion, max gap, current rect/shape) and the `watch` layers.
-  `eye_probe_peek`, `eye_peek` and `eye_act` show it. `eye_act` expressions get `pr` (the JSON) and `L('label')`.
+  `eye_peek` and `eye_act` show it. `eye_act` expressions get `pr` (the JSON) and `L('label')`.
 - **Cost:** about 0.2ms per frame on the app's main thread for a small tree. It's reported in every peek and report.
 - **Limit:** it sees what the app hands to the system. Effects the window server renders itself (system glass,
-  backdrops) can still lag on screen. Record an `eye_start` capture of the same moment and pass its `capture_csv`.
+  backdrops) can still lag on screen. Record an `eye_record` capture of the same moment; `eye_stop` aligns the probe report to it.
   Probe rows that update every frame alongside a capture that doesn't change point at the window server.
 
 Test: `node test/probe-e2e.mjs '<process>' [seconds] '<start args json>'`.
 
 Coordinates are **display-local points, top-left origin**. Runs are stored in `~/Library/Caches/the-eye/runs/<time>_<label>/`
-(`frames.csv`, `frames.csv.meta.json`, `keyframes/`). Override the location with `THE_EYE_DIR`.
+(`frames.csv`, `frames.csv.meta.json`, `cursor.csv`, `hover.jsonl`, `ax_tree_start.*`, `actions.jsonl`, `keyframes/`). Override the location with `THE_EYE_DIR`.
 
 ### Live state
 
@@ -93,11 +112,11 @@ While recording, `frames.csv.live.json` is rewritten 10 times a second with what
   display center; its height is how far the change hangs down. This is the open notch or panel, unaffected by changes elsewhere.
 - `changed_extent_screen`: the bounding box of every change since the first frame
 
-Commands started by `eye_record_while` get `THE_EYE_LIVE` (that file's path), `THE_EYE_RECT` and `THE_EYE_RUN_DIR`, so a
+Commands started by `eye_record` get `THE_EYE_LIVE` (that file's path), `THE_EYE_RECT` and `THE_EYE_RUN_DIR`, so a
 driver script can check state before every action. In `eye_act` expressions, `a` is `anchored_screen`, `e` is the
-changed extent, and `p` is the pointer.
+changed extent, `p` is the pointer and `h` the element under it.
 
-Interactive loop: `eye_start` → `eye_lock_input` → repeat `eye_act` (act → read numbers → decide) → `eye_unlock` → `eye_stop`.
+Interactive loop: `eye_inspect` (find targets) → `eye_record` → repeat `eye_act` (act → read numbers + element → decide) → `eye_stop`.
 
 ### Input lock and drivers
 
@@ -142,8 +161,8 @@ the input lock.
 ## Example
 
 ```
-eye_record_while { rect: {x:356,y:0,w:800,h:300}, command: "./drive full", lock_input: true, label: "timer-on" }
-eye_compare { runs: [{csv: ".../frames.csv", label: "baseline"}, {csv: ".../frames.csv", label: "timer-on"}] }
+eye_record { rect: {x:356,y:0,w:800,h:300}, command: "./drive full", lock_input: true, ax: false, label: "timer-on" }
+eye_report { runs: [{csv: ".../frames.csv", label: "baseline"}, {csv: ".../frames.csv", label: "timer-on"}] }
 ```
 
-Test: `node test/smoke.mjs`.
+Tests: `node test/smoke.mjs` (all non-interactive tools), `node test/ax.mjs` (AX hover/tree path; never moves the pointer).

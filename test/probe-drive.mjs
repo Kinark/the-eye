@@ -20,7 +20,7 @@ const log = (h, s) => {
 let probeFile = "";
 async function peekLoop(ms) {
   const end = Date.now() + ms;
-  while (Date.now() < end) { await sleep(500); log("peek", await call("eye_probe_peek", { max: 6 })); }
+  while (Date.now() < end) { await sleep(500); log("peek", await call("eye_peek", { max: 6 })); }
 }
 async function liveJson() {
   const fs = await import("node:fs");
@@ -28,13 +28,12 @@ async function liveJson() {
 }
 
 try {
-  log("attach", await call("eye_probe_attach", { process: proc }));
-  log("capture", await call("eye_start", { rect: { x: 356, y: 0, w: 800, h: 320 }, label: "drive-capture", max_seconds: 60, cursor: false }));
-  const st = await call("eye_probe_start", { process: proc, label: "drive", max_seconds: 60, watch: ["PublicGlassHostView", "CABackdropLayer", "DropAreaView"] });
+  log("capture", await call("eye_record", { rect: { x: 356, y: 0, w: 800, h: 320 }, label: "drive-capture", max_seconds: 60, cursor: false }));
+  const st = await call("eye_probe", { process: proc, label: "drive", max_seconds: 60, watch: ["PublicGlassHostView", "CABackdropLayer", "DropAreaView"] });
   log("probe", st);
   if (st.startsWith("ERROR")) throw new Error("probe did not start");
   probeFile = st.match(/→ (\S+\.ndjson)/)[1];
-  log("lock", await call("eye_lock_input", { seconds: 90, strict: true }));
+  log("lock", await call("eye_lock", { seconds: 90, strict: true }));
 
   // 1. Open: hover, then click if hovering alone doesn't open it.
   log("open", await call("eye_act", { label: "open", steps: [
@@ -81,10 +80,10 @@ try {
   log("FAILED", e.message);
 } finally {
   log("release", await call("eye_act", { lock: false, steps: [{ op: "up", button: "left" }] }));
-  log("unlock", await call("eye_unlock"));
+  log("unlock", await call("eye_lock", { release: true }));
   const cap = await call("eye_stop");
   const csv = cap.match(/csv: (\S+)/)?.[1];
   log("capture report", cap);
-  log("probe report", await call("eye_probe_stop", { top: 12, capture_csv: csv, match: ["PublicGlass", "NSGlassEffectView", "CABackdropLayer"] }));
+  log("probe report", await call("eye_stop", { top: 12, capture_csv: csv, match: ["PublicGlass", "NSGlassEffectView", "CABackdropLayer"] }));
   await client.close();
 }

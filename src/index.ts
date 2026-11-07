@@ -1,17 +1,22 @@
 #!/usr/bin/env node
-// the-eye — an MCP server that lets an agent MEASURE what is visible on a macOS screen over time.
-// Native capture (ScreenCaptureKit, full display refresh) lives in bin/eye-capture (swift/EyeCapture.swift).
+// the-eye — an MCP server that lets an agent SEE and MEASURE what is on a macOS screen over time: per-frame
+// timing and motion (pixels → numbers), what UI element is under the pointer and the element tree of the
+// observed windows (Accessibility), and, optionally, layer geometry from inside an app (probe.ts).
+// Native capture, input and AX live in bin/eye-capture (swift/EyeCapture.swift).
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { analyze, compare, formatAnalysis, loadRun, timeline, type Options } from "./analyze.ts";
 import { explain } from "./explain.ts";
-import { activeProbeLive, activeProbeTarget, describeProbeLive, probeRunsStatus, registerProbeTools, resolvePid } from "./probe.ts";
+import {
+  activeProbeLive, activeProbeTarget, analyzeProbe, describeProbeLive, isProbeRun, peekProbe, probeRunIds, probeRunsStatus,
+  registerProbeTools, resolvePid, stopProbes,
+} from "./probe.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = join(ROOT, "bin", "eye-capture");
@@ -41,10 +46,15 @@ const profileSchema = z.object({
   template: z.string().optional().describe("Instruments template (default 'Time Profiler')."),
   hitches: z.boolean().optional().describe("Add the Hitches instrument (default true)."),
   keep_trace: z.boolean().optional().describe("Keep the raw .trace (default false: it embeds the app's environment, which may contain secrets)."),
-}).optional().describe("Also record Instruments on the app and align it with the frames (see eye_explain). Starting xctrace takes a few seconds.");
-const cursorOpts = {
-  cursor: z.boolean().optional().describe("Log cursor position + the accessibility element under it (default true)."),
-  ax_hz: z.number().optional().describe("Accessibility hit-tests per second to label what the cursor is over (default 0 = OFF). WARNING: any AX query makes SwiftUI apps maintain their accessibility graph on every frame — measured ~18% extra main-thread time and −25% fps on NOOTCH!. Use only for a separate labeling pass, never in a performance measurement."),
+}).optional().describe("Also record Instruments on the app and align it with the frames (eye_report view:'explain'). Starting xctrace takes a few seconds.");
+
+const treeSchema = z.enum(["none", "basic", "full"]);
+const axOpts = {
+  ax: z.boolean().optional().describe("Accessibility context: log the element under the pointer (live + hover.jsonl) and snapshot the element tree of the observed windows. Default true, false when `profile` is set. COST: makes SwiftUI apps maintain their AX graph (~18% more main-thread time, up to −25% fps) — set false for final fps numbers and A/B comparisons."),
+  ax_hz: z.number().optional().describe("Hover hit-tests per second when ax is on (default 10)."),
+  tree: treeSchema.optional().describe("Element tree of the observed windows at start: basic (labeled elements + bounds, default when ax on), full (every node + actions), none."),
+  process: z.string().optional().describe("Focus the AX tree on this app (name or pid). Default: whatever is actually visible in rect."),
+  cursor: z.boolean().optional().describe("Log the pointer position to cursor.csv (default true; false also disables ax)."),
 };
 
 const analysisOpts = {
@@ -61,6 +71,8 @@ function runDir(label?: string) {
   return d;
 }
 
+// ---- capture / trace / lock processes
+
 type Capture = {
   id: string; label: string; dir: string; csv: string; child: ChildProcess; done: Promise<string>; started: number;
   trace?: Trace; profileNote?: string; stopping?: boolean;
@@ -69,6 +81,7 @@ const captures = new Map<string, Capture>();
 type Lock = { id: string; child: ChildProcess; done: Promise<string>; until: number; strict?: boolean };
 const locks = new Map<string, Lock>();
 const finishedLocks: string[] = []; // reports of locks that ended on their own (timeout / Esc)
+const diedCaptures: string[] = [];
 let seq = 0;
 
 function collect(child: ChildProcess): Promise<string> {
@@ -96,19 +109,18 @@ function startCapture(p: {
   if (p.fps) args.push("--fps", String(p.fps));
   if (p.keyframe_ms) args.push("--keyframes-dir", join(dir, "keyframes"), "--keyframe-ms", String(p.keyframe_ms));
   if (p.cursor === false) args.push("--cursor", "off");
-  if (p.ax_hz !== undefined) args.push("--ax-hz", String(p.ax_hz));
+  args.push("--ax-hz", String(p.ax_hz ?? 0));
   const child = spawn(BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
   const id = `cap${++seq}`;
   const c: Capture = { id, label: p.label ?? id, dir, csv, child, done: collect(child), started: Date.now() };
   if (p.profile) c.trace = startTrace(dir, p.profile, p.seconds + 15);
   captures.set(id, c);
   c.done.then((msg) => {
-    // Ended on its own (not via eye_stop): keep why, so the next eye_stop/eye_act can say so.
+    // Ended on its own (not via eye_stop): keep why, so the next call can say so.
     if (captures.has(id) && !c.stopping) diedCaptures.push(`${id} "${c.label}" ended after ${((Date.now() - c.started) / 1000).toFixed(1)}s: ${msg.slice(-600)}`);
   }).finally(() => captures.delete(id));
   return c;
 }
-const diedCaptures: string[] = [];
 
 /** Instruments alongside the capture: Time Profiler (+ Hitches) attached to the app. */
 function startTrace(dir: string, p: ProfileOpts, limitS: number): Trace {
@@ -180,7 +192,6 @@ function startLock(seconds: number, allow: "synthetic" | "tagged", strict = fals
     .finally(() => locks.delete(id));
   return l;
 }
-
 async function stopLock(l: Lock) {
   return (await endChild(l.child, l.done, "SIGTERM", 3000)).out;
 }
@@ -194,264 +205,7 @@ const text = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
 const fail = (t: string) => ({ content: [{ type: "text" as const, text: t }], isError: true });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-const server = new McpServer({ name: "the-eye", version: "0.1.0" }, {
-  instructions: [
-    "the-eye measures what is VISIBLE on a macOS screen region over time, as numbers — per displayed frame:",
-    "timestamp, gap since the previous new image, how much changed, and the extent of everything that differs",
-    "from the first frame (e.g. an opening panel's width/height). Use it instead of eyeballing screenshots to",
-    "judge animation smoothness (real on-screen fps, stalls, hitches, motion velocity jumps) and to A/B changes.",
-    "Typical flow: eye_displays → eye_record_while (run your input-driver command with lock_input so the",
-    "user's trackpad can't interfere) or eye_start/eye_stop around your own actions → eye_compare across runs.",
-    "eye_timeline shows the curve over time; eye_frames returns saved keyframe PNG paths near a moment.",
-    "Coordinates are display-local points, top-left origin. Needs Screen Recording (capture) and Accessibility",
-    "(input lock) permission for the host app.",
-    "For geometry from INSIDE an app (every layer's live animated frame/shape per display refresh, no pixels):",
-    "eye_probe_attach → eye_probe_start → poll eye_probe_peek every ~0.5s while acting → eye_probe_stop.",
-  ].join(" "),
-});
-
-server.registerTool("eye_displays", {
-  title: "List displays",
-  description: "List displays with id, size in points, backing scale and refresh rate (the fps target).",
-  inputSchema: {},
-}, async () => {
-  ensureBinary();
-  const r = await run(BIN, ["displays"], 8000);
-  return r.code === 0 ? text(r.stdout.trim()) : fail(r.stdout + r.stderr);
-});
-
-server.registerTool("eye_snapshot", {
-  title: "Snapshot a region",
-  description: "Save a single PNG of a screen region. Returns the path; set return_image to also get the image inline.",
-  inputSchema: { rect: rectSchema, display: z.number().int().optional(), return_image: z.boolean().optional(), path: z.string().optional() },
-}, async ({ rect, display, return_image, path }) => {
-  ensureBinary();
-  const out = path ?? join(runDir("snapshot"), "snapshot.png");
-  const args = ["snapshot", "--rect", rectArg(rect), "--out", out];
-  if (display !== undefined) args.push("--display", String(display));
-  let r = await run(BIN, args, 6000);
-  let note = r.stdout.trim();
-  if (r.code !== 0 && display === undefined) {
-    // ScreenCaptureKit wedged: fall back to the system screenshot tool (main display, points).
-    const fb = await run("/usr/sbin/screencapture", ["-x", "-R", `${rect.x},${rect.y},${rect.w},${rect.h}`, out], 8000);
-    if (fb.code === 0 && existsSync(out)) {
-      note = JSON.stringify({ path: out, via: "screencapture fallback", reason: (r.stderr || r.stdout).trim().slice(0, 200) });
-      r = fb;
-    }
-  }
-  if (r.code !== 0) return fail(r.stdout + r.stderr);
-  const content: any[] = [{ type: "text", text: note }];
-  if (return_image) content.push({ type: "image", data: readFileSync(out).toString("base64"), mimeType: "image/png" });
-  return { content };
-});
-
-server.registerTool("eye_record", {
-  title: "Record & measure",
-  description: "Record a region for N seconds (blocking) at the display's refresh rate and return the measured animation report. Do your interactions from another process meanwhile, or prefer eye_record_while.",
-  inputSchema: {
-    rect: rectSchema, seconds: z.number().positive().max(300), label: z.string().optional(),
-    display: z.number().int().optional(), fps: z.number().optional(),
-    keyframe_ms: z.number().optional().describe("Also save a PNG every N ms (for eye_frames). Omit to save none."),
-    profile: profileSchema, ...cursorOpts,
-    ...analysisOpts,
-  },
-}, async (p) => {
-  const c = startCapture(p);
-  if (c.trace) await c.trace.ready;
-  const meta = await c.done;
-  await stopCapture(c);
-  if (!existsSync(c.csv + ".meta.json")) return fail(meta);
-  return text(`${report(c.csv, c.label, p)}${c.profileNote ? `\n${c.profileNote}` : ""}\n\nrun: ${c.dir}\ncsv: ${c.csv}`);
-});
-
-server.registerTool("eye_start", {
-  title: "Start background recording",
-  description: "Start recording a region in the background and return a capture id immediately. Act, then call eye_stop.",
-  inputSchema: {
-    rect: rectSchema, label: z.string().optional(), display: z.number().int().optional(), fps: z.number().optional(),
-    max_seconds: z.number().positive().max(600).optional().describe("Safety stop (default 300)."),
-    keyframe_ms: z.number().optional(),
-    profile: profileSchema, ...cursorOpts,
-  },
-}, async (p) => {
-  const c = startCapture({ ...p, seconds: p.max_seconds ?? 300 });
-  const traceState = c.trace ? await c.trace.ready : "";
-  await sleep(400);
-  if (c.child.exitCode !== null) return fail(await c.done);
-  return text(`capture ${c.id} recording → ${c.csv}${c.trace ? `\nInstruments: ${traceState}` : ""}`);
-});
-
-server.registerTool("eye_stop", {
-  title: "Stop recording & measure",
-  description: "Stop a background capture (or all) and return the measured report.",
-  inputSchema: { capture_id: z.string().optional().describe("Omit to stop every active capture."), ...analysisOpts },
-}, async (p) => {
-  const list = p.capture_id ? [captures.get(p.capture_id)].filter(Boolean) as Capture[] : [...captures.values()];
-  if (!list.length) return fail(diedCaptures.length ? `no active capture — ${diedCaptures.join("\n")}` : "no active capture");
-  const out: string[] = [];
-  for (const c of list) {
-    await stopCapture(c);
-    let body: string;
-    try { body = report(c.csv, c.label, p); } catch (e: any) { body = `${c.label}: could not analyze (${e.message})`; }
-    out.push(`${body}${c.profileNote ? `\n${c.profileNote}` : ""}\n\nrun: ${c.dir}\ncsv: ${c.csv}`);
-  }
-  return text(out.join("\n\n"));
-});
-
-// A command run under observation (eye_record_while). Lives in `jobs` so eye_peek/eye_abort can
-// reach it while it runs, and keeps its final report after it ends.
-type Job = {
-  id: string; label: string; capture: Capture; lock?: Lock; cmd?: ChildProcess; output: string[];
-  started: number; state: "starting" | "running" | "finishing" | "done" | "aborted"; exitCode?: number | null;
-  lockResult?: string; abortReason?: string; final?: string; finished: Promise<string>; opts: Options;
-};
-const jobs = new Map<string, Job>();
-const liveFile = (c: Capture) => c.csv + ".live.json";
-function readLive(c: Capture): any | null {
-  try { return JSON.parse(readFileSync(liveFile(c), "utf8")); } catch { return null; }
-}
-
-function runJob(p: {
-  rect: Rect; command: string; cwd?: string; label?: string; display?: number; lock_input?: boolean;
-  pre_ms?: number; post_ms?: number; timeout_s?: number; keyframe_ms?: number;
-  profile?: ProfileOpts; cursor?: boolean; ax_hz?: number;
-} & Options): Job {
-  const timeout = p.timeout_s ?? 300;
-  const c = startCapture({ rect: p.rect, display: p.display, label: p.label, keyframe_ms: p.keyframe_ms, seconds: timeout + 30,
-    profile: p.profile, cursor: p.cursor, ax_hz: p.ax_hz });
-  const id = `run${++seq}`;
-  const job: Job = { id, label: p.label ?? id, capture: c, output: [], started: Date.now(), state: "starting", finished: null as any, opts: p };
-  jobs.set(id, job);
-  job.finished = (async () => {
-    if (c.trace) job.output.push(`Instruments: ${await c.trace.ready}`);
-    job.lock = p.lock_input ? startLock(timeout + 10, "synthetic") : undefined;
-    await sleep(p.pre_ms ?? 500);
-    if (c.child.exitCode !== null) {
-      if (job.lock) job.lockResult = await stopLock(job.lock);
-      job.state = "done"; job.final = `capture failed: ${await c.done}`;
-      return job.final;
-    }
-    if (job.state !== "aborted") {
-      job.state = "running";
-      job.cmd = spawn("/bin/zsh", ["-lc", p.command], {
-        cwd: p.cwd, stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, THE_EYE_LIVE: liveFile(c), THE_EYE_RECT: rectArg(p.rect), THE_EYE_RUN_DIR: c.dir },
-      });
-      const push = (d: Buffer) => {
-        for (const line of String(d).split("\n")) if (line.trim()) job.output.push(`${((Date.now() - job.started) / 1000).toFixed(1)}s ${line}`);
-        if (job.output.length > 400) job.output.splice(0, job.output.length - 400);
-      };
-      job.cmd.stdout!.on("data", push);
-      job.cmd.stderr!.on("data", push);
-      const killer = setTimeout(() => { job.abortReason ??= "timeout"; job.cmd?.kill("SIGTERM"); }, timeout * 1000);
-      job.exitCode = await new Promise((r) => job.cmd!.on("close", r));
-      clearTimeout(killer);
-    }
-    if (job.lock) job.lockResult = await stopLock(job.lock);
-    if (job.state !== "aborted") job.state = "finishing";
-    await sleep(job.state === "aborted" ? 0 : p.post_ms ?? 1000);
-    await stopCapture(c);
-    const tail = job.output.slice(-15).join("\n");
-    job.final = [
-      `${job.state === "aborted" ? `ABORTED (${job.abortReason}) · ` : ""}command exit ${job.exitCode ?? "-"}${job.lockResult ? ` · input lock: ${job.lockResult}` : ""}`,
-      tail ? `command output (tail):\n${tail}` : "",
-      report(c.csv, c.label, p),
-      c.profileNote ?? "",
-      `run: ${c.dir}\ncsv: ${c.csv}`,
-    ].filter(Boolean).join("\n\n");
-    if (job.state !== "aborted") job.state = "done";
-    return job.final;
-  })();
-  return job;
-}
-
-function describeLive(live: any): string {
-  if (!live) return "live: (no data yet)";
-  const l = live.last_1s ?? {};
-  const e = live.changed_extent_screen, a = live.anchored_screen;
-  const anch = a ? `top-anchored: x ${a.x0.toFixed(0)}..${a.x1.toFixed(0)} (${a.w.toFixed(0)}pt wide), hangs ${a.h.toFixed(0)}pt down` : "top-anchored: nothing changed at the top edge";
-  const ext = e ? `any change: x ${e.x0.toFixed(0)}..${e.x1.toFixed(0)}, y ${e.y0.toFixed(0)}..${e.y1.toFixed(0)}` : "region identical to first frame";
-  return `live @${live.t.toFixed(1)}s: ${live.moving ? "MOVING" : "still"} · last 1s: ${l.new_frames} new frames, ${l.idle} idle, max gap ${Number(l.max_gap_ms).toFixed(1)}ms, ${l.hitches} hitches\n  ${anch} · ${ext}`;
-}
-
-server.registerTool("eye_record_while", {
-  title: "Record while running a command",
-  description: "Start recording, optionally lock the user's PHYSICAL trackpad/mouse (synthetic input still passes; Esc releases), run a shell command (e.g. your input-driver script), keep recording a little after it ends, then return the command result + the measured report. With background:true it returns a run id immediately — poll eye_peek every few seconds to verify the test is doing what you expect, and eye_abort the moment it isn't. The command gets env THE_EYE_LIVE (path of a JSON file refreshed 10×/s with what is visible right now: changed_extent_screen, moving, last_1s stats) so drivers can check state before acting, plus THE_EYE_RECT and THE_EYE_RUN_DIR.",
-  inputSchema: {
-    rect: rectSchema, command: z.string().describe("Run with /bin/zsh -lc"), cwd: z.string().optional(),
-    label: z.string().optional(), display: z.number().int().optional(),
-    background: z.boolean().optional().describe("Return immediately with a run id (default false). Recommended for anything longer than a few seconds."),
-    lock_input: z.boolean().optional().describe("Block physical pointer input while the command runs (default false)."),
-    pre_ms: z.number().optional().describe("Record this long before starting the command (default 500)."),
-    post_ms: z.number().optional().describe("Keep recording after the command exits (default 1000)."),
-    timeout_s: z.number().positive().max(600).optional().describe("Kill the command after this (default 300)."),
-    keyframe_ms: z.number().optional(),
-    profile: profileSchema, ...cursorOpts,
-    ...analysisOpts,
-  },
-}, async (p) => {
-  const job = runJob(p);
-  if (!p.background) return text(await job.finished);
-  await sleep((p.pre_ms ?? 500) + 300);
-  return text(`${job.id} started (${job.state}) — poll eye_peek {run_id:"${job.id}"}; eye_abort to stop.\nlive file: ${liveFile(job.capture)}`);
-});
-
-server.registerTool("eye_peek", {
-  title: "Peek at a running test",
-  description: "Live status of a background eye_record_while run (or an eye_start capture): state, elapsed, the command's latest output lines, what is visible RIGHT NOW (moving or not, extent of the visible change in screen points), and the measured smoothness over the last few seconds. When the run is finished it returns the final report.",
-  inputSchema: {
-    run_id: z.string().optional().describe("eye_record_while run id or eye_start capture id. Omit for the most recent."),
-    window_s: z.number().positive().optional().describe("Seconds of recent history to measure (default 3)."),
-    output_lines: z.number().int().optional().describe("Command output lines to include (default 8)."),
-  },
-}, async (p) => {
-  const job = p.run_id ? jobs.get(p.run_id) : [...jobs.values()].pop();
-  const cap = job?.capture ?? (p.run_id ? captures.get(p.run_id) : [...captures.values()].pop());
-  if (!cap) return fail(`unknown run ${p.run_id ?? "(none active)"}`);
-  if (job?.final && (job.state === "done" || job.state === "aborted")) return text(`${job.id} ${job.state}\n\n${job.final}`);
-  const live = readLive(cap);
-  const lines: string[] = [];
-  const elapsed = ((Date.now() - (job?.started ?? cap.started)) / 1000).toFixed(1);
-  lines.push(`${job?.id ?? cap.id} "${job?.label ?? cap.label}" ${job?.state ?? "recording"} · ${elapsed}s elapsed${job?.lock ? " · input locked" : ""}`);
-  lines.push(describeLive(live));
-  try {
-    const { rows, meta } = loadRun(cap.csv);
-    const t = live?.t ?? (rows.length ? rows[rows.length - 1].t : 0);
-    const w = p.window_s ?? 3;
-    const a = analyze(rows, meta, { ...(job?.opts ?? {}), from_s: Math.max(0, t - w) });
-    lines.push(a.overall
-      ? `last ${w}s while animating: ${a.overall.fps} fps of ${a.overall.target_fps} · hitches ${a.overall.hitches} (long ${a.overall.long_hitches}) · p95 gap ${a.overall.gap_p95_ms}ms · max ${a.overall.gap_max_ms}ms`
-      : `last ${w}s: no animation`);
-  } catch { /* csv not flushed yet */ }
-  if (job) {
-    const n = p.output_lines ?? 8;
-    lines.push(job.output.length ? `command output (last ${Math.min(n, job.output.length)}):\n${job.output.slice(-n).join("\n")}` : "command output: (none yet)");
-  }
-  const pl = activeProbeLive();
-  if (pl) lines.push(describeProbeLive(pl, 5));
-  return text(lines.join("\n"));
-});
-
-server.registerTool("eye_abort", {
-  title: "Abort a running test",
-  description: "Kill a background eye_record_while run immediately: stops the command, releases the input lock, stops the capture, and returns the (partial) report.",
-  inputSchema: { run_id: z.string().optional().describe("Omit to abort every running job."), reason: z.string().optional() },
-}, async (p) => {
-  const list = p.run_id ? [jobs.get(p.run_id)].filter(Boolean) as Job[] : [...jobs.values()].filter((j) => j.state !== "done" && j.state !== "aborted");
-  if (!list.length) return text("nothing running");
-  const out: string[] = [];
-  for (const j of list) {
-    if (j.state === "done" || j.state === "aborted") { out.push(`${j.id} already ${j.state}`); continue; }
-    j.state = "aborted";
-    j.abortReason = p.reason ?? "aborted by agent";
-    j.cmd?.kill("SIGTERM");
-    if (j.lock) j.lockResult = await stopLock(j.lock);
-    out.push(`${j.id}:\n${await j.finished}`);
-  }
-  return text(out.join("\n\n"));
-});
-
-// ---- Interactive driving: a persistent native input process + steps checked against live state.
+// ---- input + AX actor: one persistent native process (eye-capture input), JSON lines in/out
 
 let actor: { child: ChildProcess; pending: ((s: string) => void)[]; buf: string } | null = null;
 function inputActor() {
@@ -468,9 +222,9 @@ function inputActor() {
   actor = a;
   return a;
 }
-function actorSend(cmd: object): Promise<any> {
+function actorSend(cmd: object, extraMs = 0): Promise<any> {
   const a = inputActor();
-  const budget = 10_000 + Number((cmd as any).ms ?? 0) + 50 * Number((cmd as any).events ?? 0);
+  const budget = 10_000 + extraMs + Number((cmd as any).ms ?? 0) + 50 * Number((cmd as any).events ?? 0);
   return new Promise((res) => {
     // If the actor wedges, kill it: its close handler fails every pending command and the next call respawns it.
     const t = setTimeout(() => a.child.kill("SIGKILL"), budget);
@@ -479,14 +233,446 @@ function actorSend(cmd: object): Promise<any> {
   });
 }
 
-function activeCapture(id?: string): Capture | undefined {
-  if (id) return jobs.get(id)?.capture ?? captures.get(id);
-  const running = [...jobs.values()].filter((j) => j.state !== "done" && j.state !== "aborted").map((j) => j.capture);
-  return running.pop() ?? [...captures.values()].pop();
+// ---- AX formatting
+
+const fr = (f?: number[]) => (f ? ` [${f[0].toFixed(0)},${f[1].toFixed(0)} ${f[2].toFixed(0)}×${f[3].toFixed(0)}]` : "");
+/** Last `n` path segments, unlabeled layout groups dropped (the element itself always stays). */
+const tailPath = (p: string, n: number) => {
+  const all = p.split(" › ");
+  const s = all.filter((x, i) => i === all.length - 1 || !/^(Group|Unknown|LayoutArea|ScrollArea|SplitGroup)(\/\w+)?$/.test(x));
+  return s.length > n || s.length < all.length ? `… › ${s.slice(-n).join(" › ")}` : p;
+};
+/** One line: `NOOTCH! › … › Group › Button "Camera" [743,233 125×125] (focused) {Press}`. */
+function hoverLine(h: any, segs = 4): string {
+  if (!h) return "nothing (no accessibility element)";
+  const flags = [h.enabled === false && "disabled", h.focused && "focused", h.selected && "selected"].filter(Boolean).join(",");
+  const id = h.identifier && !String(h.path ?? "").includes(h.identifier) ? ` #${h.identifier}` : "";
+  return `${h.app ?? `pid ${h.pid}`} › ${tailPath(h.path ?? h.role ?? "?", segs)}${id}${fr(h.frame)}${flags ? ` (${flags})` : ""}${h.actions?.length ? ` {${h.actions.join(",")}}` : ""}`;
+}
+/** Everything the element exposes, readable. */
+function hoverFull(h: any): string {
+  if (!h) return "nothing (no accessibility element under that point)";
+  const { path, ancestors, attributes, parameterized_attributes, ...core } = h;
+  const L = [`${h.app ?? "?"} (pid ${h.pid}${h.bundle_id ? `, ${h.bundle_id}` : ""})`, `path: ${path ?? "?"}`, `element: ${JSON.stringify(core)}`];
+  if (attributes) L.push(`other attributes: ${JSON.stringify(attributes)}`);
+  if (parameterized_attributes) L.push(`parameterized attributes: ${parameterized_attributes.join(", ")}`);
+  if (ancestors?.length) L.push("ancestors (nearest first):", ...ancestors.map((a: any) => `  ${JSON.stringify(a)}`));
+  return L.join("\n");
 }
 
+/** The element tree of the windows in a display-local rect (or under a point); full JSON saved to `out`. */
+async function axTree(o: { rect?: Rect; display?: number; x?: number; y?: number; process?: string; mode: "basic" | "full"; depth?: number; max_nodes?: number; out?: string; clip?: boolean }) {
+  const r = await actorSend({
+    op: "tree", rect: o.rect ? [o.rect.x, o.rect.y, o.rect.w, o.rect.h] : undefined, display: o.display, x: o.x, y: o.y,
+    process: o.process, mode: o.mode, depth: o.depth, max_nodes: o.max_nodes, out: o.out, clip: o.clip,
+  }, 20_000);
+  if (!r.ok) return { ok: false, text: `AX tree failed: ${r.error}`, nodes: 0 };
+  return { ok: true, text: String(r.text), nodes: Number(r.nodes ?? 0) };
+}
+function capLines(s: string, n: number, more: string) {
+  const l = s.split("\n");
+  return l.length > n ? `${l.slice(0, n).join("\n")}\n… ${l.length - n} more lines — ${more}` : s;
+}
+
+/** Hover changes during a run, from hover.jsonl, on the frames clock. */
+function hoverTimeline(csv: string, max = 30, from?: number, to?: number): string {
+  const p = join(dirname(csv), "hover.jsonl");
+  if (!existsSync(p)) return "";
+  let t0 = 0;
+  try { t0 = JSON.parse(readFileSync(csv + ".meta.json", "utf8")).t0_mach ?? 0; } catch { /* still recording */ }
+  const lines: string[] = [];
+  let last = "";
+  for (const l of readFileSync(p, "utf8").split("\n")) {
+    if (!l) continue;
+    let r: any; try { r = JSON.parse(l); } catch { continue; }
+    const t = t0 ? r.t - t0 : r.t;
+    if ((from !== undefined && t < from) || (to !== undefined && t > to)) continue;
+    const d = hoverLine(r.hover, 3);
+    if (d === last) continue;
+    last = d;
+    lines.push(`${t0 ? t.toFixed(2) + "s" : "?"} ${r.kind === "update" ? "~" : "→"} ${d}`);
+  }
+  if (!lines.length) return "";
+  const h = Math.floor(max / 2);
+  const shown = lines.length > max ? [...lines.slice(0, h), `… ${lines.length - max} more (eye_report {view:"hover"})`, ...lines.slice(-h)] : lines;
+  return `## what the pointer was over (accessibility; → new element, ~ same element changed; times on the frames clock)\n${shown.join("\n")}`;
+}
+
+// ---- recordings (one Job per eye_record call; command optional)
+
+type Job = {
+  id: string; label: string; capture: Capture; rect: Rect; display?: number; process?: string; ax: boolean;
+  lock?: Lock; cmd?: ChildProcess; command?: string; output: string[]; started: number;
+  state: "starting" | "running" | "finishing" | "done"; exitCode?: number | null; lockResult?: string;
+  stopped?: string; final?: string; finished: Promise<string>; opts: Options; tree?: string; treeFile?: string;
+  stopNow: () => void;
+};
+const jobs = new Map<string, Job>();
+const liveFile = (c: Capture) => c.csv + ".live.json";
+function readLive(c: Capture): any | null {
+  try { return JSON.parse(readFileSync(liveFile(c), "utf8")); } catch { return null; }
+}
+const running = (j: Job) => j.state !== "done";
+
+type RecordParams = {
+  rect: Rect; label?: string; display?: number; fps?: number; keyframe_ms?: number; profile?: ProfileOpts;
+  ax?: boolean; ax_hz?: number; tree?: "none" | "basic" | "full"; process?: string; cursor?: boolean;
+  command?: string; cwd?: string; lock_input?: boolean; pre_ms?: number; post_ms?: number; timeout_s?: number;
+  seconds?: number; max_seconds?: number; background?: boolean;
+} & Options;
+
+function startJob(p: RecordParams): Job {
+  const hasCmd = !!p.command;
+  const limit = hasCmd ? (p.timeout_s ?? 300) : (p.seconds ?? p.max_seconds ?? 300);
+  const ax = p.cursor !== false && (p.ax ?? !p.profile);
+  const c = startCapture({ rect: p.rect, display: p.display, label: p.label, keyframe_ms: p.keyframe_ms, fps: p.fps,
+    seconds: hasCmd ? limit + 30 : limit, profile: p.profile, cursor: p.cursor, ax_hz: ax ? (p.ax_hz ?? 10) : 0 });
+  let stopNow!: () => void;
+  const stopReq = new Promise<void>((r) => (stopNow = r));
+  const id = `run${++seq}`;
+  const job: Job = { id, label: p.label ?? id, capture: c, rect: p.rect, display: p.display, process: p.process, ax, command: p.command,
+    output: [], started: Date.now(), state: "starting", finished: null as any, opts: p, stopNow };
+  jobs.set(id, job);
+  job.finished = (async () => {
+    if (c.trace) job.output.push(`Instruments: ${await c.trace.ready}`);
+    job.lock = p.lock_input ? startLock(limit + 10, "synthetic") : undefined;
+    const pre = sleep(p.pre_ms ?? (hasCmd ? 500 : 0));
+    // ScreenCaptureKit can take seconds to start: never run the command (or report "recording") before frames
+    // are on disk. The helper itself gives up after 8s.
+    for (let i = 0; i < 95 && c.child.exitCode === null && !(existsSync(c.csv) && statSync(c.csv).size > 200); i++) await sleep(100);
+    if (c.child.exitCode === null && !existsSync(c.csv)) { c.child.kill("SIGTERM"); await c.done; }
+    if (c.child.exitCode !== null || c.child.signalCode !== null) {
+      if (job.lock) job.lockResult = await stopLock(job.lock);
+      job.state = "done"; job.final = `capture failed: ${await c.done}`;
+      return job.final;
+    }
+    const treeMode = p.tree ?? (ax ? "basic" : "none");
+    if (treeMode !== "none" && !job.stopped) {
+      job.treeFile = join(c.dir, "ax_tree_start.json");
+      const t = await axTree({ rect: p.rect, display: p.display, process: p.process, mode: treeMode, out: job.treeFile });
+      job.tree = t.text;
+      if (t.ok) writeFileSync(join(c.dir, "ax_tree_start.txt"), t.text);
+    }
+    await pre;
+    if (!job.stopped) {
+      job.state = "running";
+      if (hasCmd) {
+        job.cmd = spawn("/bin/zsh", ["-lc", p.command!], {
+          cwd: p.cwd, stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, THE_EYE_LIVE: liveFile(c), THE_EYE_RECT: rectArg(p.rect), THE_EYE_RUN_DIR: c.dir },
+        });
+        const push = (d: Buffer) => {
+          for (const line of String(d).split("\n")) if (line.trim()) job.output.push(`${((Date.now() - job.started) / 1000).toFixed(1)}s ${line}`);
+          if (job.output.length > 400) job.output.splice(0, job.output.length - 400);
+        };
+        job.cmd.stdout!.on("data", push);
+        job.cmd.stderr!.on("data", push);
+        const killer = setTimeout(() => { job.stopped ??= "timeout"; job.cmd?.kill("SIGTERM"); }, limit * 1000);
+        job.exitCode = await new Promise((r) => job.cmd!.on("close", r));
+        clearTimeout(killer);
+      } else {
+        await Promise.race([c.done, stopReq]);
+      }
+    }
+    if (job.lock) job.lockResult = await stopLock(job.lock);
+    job.state = "finishing";
+    if (hasCmd && !job.stopped) await sleep(p.post_ms ?? 1000);
+    const helperOut = await stopCapture(c);
+    let body: string;
+    try { body = report(c.csv, c.label, job.opts); }
+    catch (e: any) { body = `${c.label}: could not analyze (${e.message})${existsSync(c.csv) ? "" : `\ncapture helper said: ${String(helperOut).slice(-600)}`}`; }
+    const tail = job.output.slice(-15).join("\n");
+    const hv = ax ? hoverTimeline(c.csv) : "";
+    job.final = [
+      hasCmd ? `${job.stopped ? `STOPPED (${job.stopped}) · ` : ""}command exit ${job.exitCode ?? "-"}${job.lockResult ? ` · input lock: ${job.lockResult}` : ""}` : (job.stopped && job.stopped !== "stopped by agent" ? `STOPPED (${job.stopped})` : ""),
+      tail ? `command output (tail):\n${tail}` : "",
+      body,
+      ax ? "NOTE: recorded with accessibility inspection ON (ax) — on SwiftUI apps fps can read lower than without it. Use ax:false for final numbers." : "",
+      hv,
+      c.profileNote ?? "",
+      `run: ${c.dir}\ncsv: ${c.csv}${job.treeFile && existsSync(job.treeFile) ? `\nAX tree at start: ${job.treeFile.replace(/json$/, "txt")}` : ""}${ax ? `\nhover log: ${join(c.dir, "hover.jsonl")}` : ""}`,
+    ].filter(Boolean).join("\n\n");
+    job.state = "done";
+    return job.final;
+  })();
+  return job;
+}
+
+function describeLive(live: any): string {
+  if (!live) return "live: (no data yet)";
+  const l = live.last_1s ?? {};
+  const e = live.changed_extent_screen, a = live.anchored_screen;
+  const anch = a ? `top-anchored: x ${a.x0.toFixed(0)}..${a.x1.toFixed(0)} (${a.w.toFixed(0)}pt wide), hangs ${a.h.toFixed(0)}pt down` : "top-anchored: nothing changed at the top edge";
+  const ext = e ? `any change: x ${e.x0.toFixed(0)}..${e.x1.toFixed(0)}, y ${e.y0.toFixed(0)}..${e.y1.toFixed(0)}` : "region identical to first frame";
+  const hp = live.hover_point;
+  const hov = live.ax ? `\n  pointer${hp ? ` (${hp[0].toFixed(0)},${hp[1].toFixed(0)})` : ""} over: ${hoverLine(live.hover)}` : "";
+  return `live @${live.t.toFixed(1)}s: ${live.moving ? "MOVING" : "still"} · last 1s: ${l.new_frames} new frames, ${l.idle} idle, max gap ${Number(l.max_gap_ms).toFixed(1)}ms, ${l.hitches} hitches\n  ${anch} · ${ext}${hov}`;
+}
+
+function activeJob(id?: string): Job | undefined {
+  if (id) return jobs.get(id);
+  return [...jobs.values()].filter(running).pop();
+}
+
+// ---- server
+
+const INSTRUCTIONS = `
+the-eye: see and measure what a macOS screen shows, over time. Three kinds of evidence, all on one clock:
+1. PIXELS AS NUMBERS: per displayed frame, whether the region showed a new image, the gap since the last one, how much changed, and the size/position of what changed. Answers "is this animation smooth?", "did my change help?", "how wide is the panel right now?". Reports give real on-screen fps vs the display refresh, stalls, hitches and velocity jumps.
+2. ACCESSIBILITY (AX) CONTEXT: what UI element is under the pointer (role, label, identifier, value, frame, enabled/focused/selected, actions, every other attribute, ancestors, app, window), and the element TREE of the observed windows with each element's bounds. Answers "what am I looking at?", "where is the X button?", "what was the pointer over when the frame dropped?".
+3. LAYER GEOMETRY from inside an app (eye_probe; Debug builds only): which layer moved or stuttered, per frame, no pixels.
+
+WHEN TO USE WHAT
+- Find UI / coordinates: eye_inspect {rect} for the element tree of what's visible there, or eye_inspect {} for the element under the pointer. Use the frames it returns as eye_act x/y.
+- A still image: eye_snapshot {rect}. Don't record for a static look.
+- An animation you trigger yourself, step by step: eye_record {rect, label} (returns an id at once, with the AX tree) → eye_act {target_process, steps} (after EVERY step: pointer, element under it, visible extent, fps) → eye_stop → report.
+- A scripted, repeatable run (A/B): eye_record {rect, command:"./drive", lock_input:true, ax:false, label:"A"} (blocks, returns the report), repeat for B, then eye_report {view:"compare", runs:[...]}.
+- Something only the USER can reproduce (real trackpad, timing-sensitive hover): ask the user "Ready?" and wait for yes, then eye_record {rect, label} with NO input lock, let them act, eye_stop. The report lists what the pointer was over over time; eye_report {view:"explain"} ties the worst frames to the cursor/element/main thread.
+- Long background runs: eye_record {..., background:true} → eye_peek every few seconds → eye_stop early if it goes wrong.
+- Re-analyze any run later: eye_report {csv, view: summary|timeline|explain|hover} or {runs, view:"compare"}. Keyframe images: eye_snapshot {csv, t_s} (record with keyframe_ms).
+
+KNOW THESE
+- Coordinates are POINTS, top-left origin. rect is display-local (eye_status lists displays). Pointer, AX frames and eye_act x/y are global; on the main display both are the same.
+- AX costs performance: an AX client makes SwiftUI apps rebuild their accessibility graph (~18% more main-thread time, up to −25% fps). eye_record has ax on by default (off with profile). For final fps numbers or A/B comparisons use ax:false, and compare runs recorded the same way. Reports say when AX was on.
+- eye_act input is synthetic. It reaches apps through a different path than a physical trackpad (event taps, hover shields and pointer-location APIs can see it differently). If a bug doesn't reproduce with eye_act, have the user reproduce it while you record.
+- eye_act safety: presses only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. While its steps run it holds a STRICT lock: the user's trackpad AND keyboard are blocked. lock_input on eye_record blocks only the physical pointer (Esc releases). Never lock while the user should be acting.
+- Needs Screen Recording (capture) and Accessibility (AX, input, lock) permission for the host app.
+- Run files live in ~/Library/Caches/the-eye/runs/<time>_<label>/: frames.csv, cursor.csv, hover.jsonl, ax_tree_start.txt/.json, actions.jsonl, keyframes/.
+
+TOOLS: eye_status · eye_inspect · eye_snapshot · eye_record · eye_peek · eye_act · eye_stop · eye_report · eye_lock · eye_probe
+`.trim();
+
+const server = new McpServer({ name: "the-eye", version: "0.2.0" }, { instructions: INSTRUCTIONS });
+
+server.registerTool("eye_status", {
+  title: "Displays, active runs and locks",
+  description: "Displays (id, size in points, scale, refresh rate = the fps target), active recordings / probe runs / input locks, and where runs are stored. Start here to pick a display and rect.",
+  inputSchema: {},
+}, async () => {
+  ensureBinary();
+  const now = Date.now();
+  const d = await run(BIN, ["displays"], 8000);
+  return text([
+    d.code === 0 ? d.stdout.trim() : `displays: ${(d.stdout + d.stderr).trim()}`,
+    `runs dir: ${RUNS}`,
+    ...[...jobs.values()].filter(running).map((j) => `${j.id} "${j.label}" ${j.state} (${((now - j.started) / 1000).toFixed(0)}s)${j.ax ? " · ax on" : ""} → ${j.capture.csv}`),
+    ...[...locks.values()].map((l) => `${l.id} ${l.strict ? "STRICT " : ""}locked, ${Math.max(0, (l.until - now) / 1000).toFixed(0)}s left`),
+    ...finishedLocks.slice(0, 3).map((r) => `ended ${r}`),
+    ...probeRunsStatus(),
+    ...diedCaptures.slice(-2).map((x) => `capture ended early: ${x}`),
+  ].join("\n"));
+});
+
+server.registerTool("eye_inspect", {
+  title: "What UI is here (Accessibility)",
+  description: [
+    "Accessibility view of the screen, no recording needed. Without rect: EVERYTHING the element under a point exposes (default:",
+    "the pointer) — role, labels, value, frame, state, actions, every other attribute, ancestors, app and window. With rect (or",
+    "tree set): the element tree of the windows actually visible there, one line per element with its bounds",
+    "`Button \"Camera\" #id [x,y w×h] (focused) {Press}`. Frames are global points (same space as eye_act x/y).",
+    "Note: querying a SwiftUI app turns on its accessibility work for a while (slower frames) — don't do it in the middle of a perf measurement.",
+  ].join(" "),
+  inputSchema: {
+    x: z.number().optional(), y: z.number().optional().describe("Point to inspect (global points). Default: the pointer."),
+    rect: rectSchema.optional().describe("Tree of the windows visible in this display-local rect (clipped to it)."),
+    display: z.number().int().optional(),
+    process: z.string().optional().describe("Only this app's windows (name substring or pid), visible or not."),
+    tree: treeSchema.optional().describe("basic (default with rect): labeled elements only, unlabeled layout groups folded. full: every node + its actions. none."),
+    depth: z.number().int().optional().describe("Max tree depth (default 40 basic / 60 full)."),
+    max_nodes: z.number().int().optional().describe("Max printed nodes (default 250 basic / 2000 full)."),
+  },
+}, async (p) => {
+  const out: string[] = [];
+  const mode = p.tree ?? (p.rect || p.process ? "basic" : "none");
+  if (!p.rect) {
+    const r = await actorSend({ op: "inspect", x: p.x, y: p.y });
+    if (!r.ok) return fail(r.error);
+    out.push(`at (${Number(r.x).toFixed(0)},${Number(r.y).toFixed(0)}): ${hoverFull(r.element)}`);
+    if (r.cg_window) out.push(`window-server window there: ${JSON.stringify(r.cg_window)}`);
+  }
+  if (mode !== "none") {
+    const dir = runDir("inspect");
+    const file = join(dir, "ax_tree.json");
+    const t = await axTree({ rect: p.rect, display: p.display, x: p.rect ? undefined : p.x, y: p.rect ? undefined : p.y,
+      process: p.process, mode, depth: p.depth, max_nodes: p.max_nodes, out: file });
+    if (t.ok) writeFileSync(join(dir, "ax_tree.txt"), t.text);
+    out.push(`element tree (${mode}, ${t.nodes} nodes; global points):\n${t.text}${t.ok ? `\nfull JSON: ${file}` : ""}`);
+  }
+  return text(out.join("\n\n"));
+});
+
+server.registerTool("eye_snapshot", {
+  title: "Image of a region (live or recorded)",
+  description: "Live: one PNG of a screen region {rect}. Recorded: the saved keyframes of a run closest to a time {csv, t_s} (record with keyframe_ms). Returns paths; return_image adds the image(s) inline.",
+  inputSchema: {
+    rect: rectSchema.optional(), display: z.number().int().optional(), path: z.string().optional(),
+    csv: z.string().optional().describe("frames.csv of a recording, to get its keyframes instead of a live image."),
+    t_s: z.number().optional(), count: z.number().int().min(1).max(8).optional(),
+    return_image: z.boolean().optional(),
+  },
+}, async (p) => {
+  if (p.csv) {
+    const dir = join(dirname(p.csv), "keyframes");
+    if (!existsSync(dir)) return fail("this recording has no keyframes (record with keyframe_ms)");
+    const files = readdirSync(dir).filter((f) => f.endsWith(".png"))
+      .map((f) => ({ f, t: Number(f.replace(/^frame_|ms\.png$/g, "")) / 1000 }))
+      .sort((a, b) => Math.abs(a.t - (p.t_s ?? 0)) - Math.abs(b.t - (p.t_s ?? 0))).slice(0, p.count ?? 3).sort((a, b) => a.t - b.t);
+    const content: any[] = [{ type: "text", text: files.map((x) => `${x.t.toFixed(3)}s ${join(dir, x.f)}`).join("\n") }];
+    if (p.return_image) for (const x of files) content.push({ type: "image", data: readFileSync(join(dir, x.f)).toString("base64"), mimeType: "image/png" });
+    return { content };
+  }
+  if (!p.rect) return fail("pass rect (live) or csv + t_s (recorded keyframes)");
+  ensureBinary();
+  const rect = p.rect;
+  const out = p.path ?? join(runDir("snapshot"), "snapshot.png");
+  const args = ["snapshot", "--rect", rectArg(rect), "--out", out];
+  if (p.display !== undefined) args.push("--display", String(p.display));
+  let r = await run(BIN, args, 6000);
+  let note = r.stdout.trim();
+  if (r.code !== 0 && p.display === undefined) {
+    // ScreenCaptureKit wedged: fall back to the system screenshot tool (main display, points).
+    const fb = await run("/usr/sbin/screencapture", ["-x", "-R", `${rect.x},${rect.y},${rect.w},${rect.h}`, out], 8000);
+    if (fb.code === 0 && existsSync(out)) {
+      note = JSON.stringify({ path: out, via: "screencapture fallback", reason: (r.stderr || r.stdout).trim().slice(0, 200) });
+      r = fb;
+    }
+  }
+  if (r.code !== 0) return fail(r.stdout + r.stderr);
+  const content: any[] = [{ type: "text", text: note }];
+  if (p.return_image) content.push({ type: "image", data: readFileSync(out).toString("base64"), mimeType: "image/png" });
+  return { content };
+});
+
+server.registerTool("eye_record", {
+  title: "Record a region (and optionally run a command)",
+  description: [
+    "Record a screen region at the display's full refresh rate, with the pointer and (ax) the element under it. Three modes:",
+    "(1) no command, no seconds → starts in the background and returns an id at once with the AX tree of what's there; act",
+    "(eye_act, or the user), then eye_stop for the report. (2) seconds → records that long and returns the report.",
+    "(3) command → runs a shell command (your input driver) while recording, optionally with the physical pointer locked",
+    "(lock_input), keeps recording post_ms after it exits, returns command output + report. background:true makes (2)/(3)",
+    "return an id at once — poll eye_peek, eye_stop to end early. The command gets env THE_EYE_LIVE (JSON refreshed 10×/s: moving,",
+    "extent, last_1s stats, hover), THE_EYE_RECT and THE_EYE_RUN_DIR.",
+  ].join(" "),
+  inputSchema: {
+    rect: rectSchema, label: z.string().optional().describe("Name for this run (used in the run folder and reports)."),
+    display: z.number().int().optional().describe("Display id from eye_status (default main)."),
+    seconds: z.number().positive().max(600).optional().describe("Record this long (no command)."),
+    command: z.string().optional().describe("Shell command to run while recording (/bin/zsh -lc)."), cwd: z.string().optional(),
+    background: z.boolean().optional().describe("Return an id immediately (default: true without command/seconds, false otherwise)."),
+    lock_input: z.boolean().optional().describe("Block the user's PHYSICAL pointer while the command runs (synthetic input passes; Esc releases). Default false."),
+    pre_ms: z.number().optional().describe("Record this long before starting the command (default 500)."),
+    post_ms: z.number().optional().describe("Keep recording after the command exits (default 1000)."),
+    timeout_s: z.number().positive().max(600).optional().describe("Kill the command after this (default 300)."),
+    max_seconds: z.number().positive().max(600).optional().describe("Safety stop for open-ended recordings (default 300)."),
+    fps: z.number().optional(),
+    keyframe_ms: z.number().optional().describe("Also save a PNG every N ms (eye_snapshot {csv, t_s}). Omit to save none."),
+    profile: profileSchema,
+    ...axOpts,
+    ...analysisOpts,
+  },
+}, async (p) => {
+  const job = startJob(p);
+  const blocking = p.background === undefined ? !!(p.command || p.seconds) : !p.background;
+  if (blocking) {
+    const final = await job.finished;
+    const tree = job.tree ? `\n\nobserved windows at start (AX tree, global points):\n${capLines(job.tree, 60, `full tree: ${join(job.capture.dir, "ax_tree_start.txt")}`)}` : "";
+    return text(`${job.id} done\n\n${final}${tree}`);
+  }
+  for (let i = 0; i < 100 && job.state === "starting"; i++) await sleep(50);
+  if (job.state === "done") return fail(job.final ?? "capture failed");
+  const live = readLive(job.capture);
+  return text([
+    `${job.id} recording "${job.label}" ${rectArg(p.rect)}${p.display !== undefined ? ` on display ${p.display}` : ""} → ${job.capture.csv}`,
+    job.output.length ? job.output.join("\n") : "",
+    job.ax ? "AX inspection ON (hover + tree): fps can read lower on SwiftUI apps; use ax:false for final numbers." : "AX inspection off.",
+    describeLive(live),
+    job.tree ? `observed windows (AX tree, global points):\n${capLines(job.tree, 120, `full tree: ${join(job.capture.dir, "ax_tree_start.txt")}`)}` : "",
+    `next: eye_act {steps, target_process} or let the user act · eye_peek {id:"${job.id}"} · eye_stop {id:"${job.id}"}`,
+  ].filter(Boolean).join("\n"));
+});
+
+server.registerTool("eye_peek", {
+  title: "Live state of a recording",
+  description: "What a running recording sees RIGHT NOW: moving or not, the visible extent, smoothness over the last few seconds, the element under the pointer, the command's latest output, and the live probe layers. Optionally the full element under the pointer (hover:'full') or a fresh AX tree of the region (tree). Returns the final report once the run has ended.",
+  inputSchema: {
+    id: z.string().optional().describe("eye_record or eye_probe id. Omit for the most recent running one."),
+    window_s: z.number().positive().optional().describe("Seconds of recent history to measure (default 3)."),
+    output_lines: z.number().int().optional().describe("Command output lines to include (default 8)."),
+    hover: z.enum(["short", "full"]).optional().describe("full = every attribute of the element under the pointer (default short)."),
+    tree: treeSchema.optional().describe("Also dump the CURRENT AX tree of the recorded region (default none)."),
+    max_layers: z.number().int().optional().describe("Probe layers per list (default 5)."),
+  },
+}, async (p) => {
+  if (p.id && isProbeRun(p.id)) return text(peekProbe(p.id, p.max_layers ?? 8) ?? "no probe run");
+  const job = p.id ? jobs.get(p.id) : (activeJob() ?? [...jobs.values()].pop());
+  if (!job) {
+    const pr = peekProbe(undefined, p.max_layers ?? 8);
+    return pr ? text(pr) : fail(`unknown run ${p.id ?? "(none active)"}`);
+  }
+  if (job.state === "done") return text(`${job.id} done\n\n${job.final}`);
+  const cap = job.capture;
+  const live = readLive(cap);
+  const lines: string[] = [];
+  lines.push(`${job.id} "${job.label}" ${job.state} · ${((Date.now() - job.started) / 1000).toFixed(1)}s elapsed${job.lock ? " · input locked" : ""}${job.ax ? "" : " · ax off"}`);
+  lines.push(describeLive(live));
+  if (p.hover === "full" && job.ax) lines.push(`element under the pointer:\n${hoverFull(live?.hover)}`);
+  try {
+    const { rows, meta } = loadRun(cap.csv);
+    const t = live?.t ?? (rows.length ? rows[rows.length - 1].t : 0);
+    const w = p.window_s ?? 3;
+    const a = analyze(rows, meta, { ...job.opts, from_s: Math.max(0, t - w) });
+    lines.push(a.overall
+      ? `last ${w}s while animating: ${a.overall.fps} fps of ${a.overall.target_fps} · hitches ${a.overall.hitches} (long ${a.overall.long_hitches}) · p95 gap ${a.overall.gap_p95_ms}ms · max ${a.overall.gap_max_ms}ms`
+      : `last ${w}s: no animation`);
+  } catch { /* csv not flushed yet */ }
+  if (job.command) {
+    const n = p.output_lines ?? 8;
+    lines.push(job.output.length ? `command output (last ${Math.min(n, job.output.length)}):\n${job.output.slice(-n).join("\n")}` : "command output: (none yet)");
+  }
+  if (p.tree && p.tree !== "none") {
+    const t = await axTree({ rect: job.rect, display: job.display, process: job.process, mode: p.tree });
+    lines.push(`AX tree now (${p.tree}, global points):\n${t.text}`);
+  }
+  const pl = activeProbeLive();
+  if (pl) lines.push(describeProbeLive(pl, p.max_layers ?? 5));
+  return text(lines.join("\n"));
+});
+
+server.registerTool("eye_stop", {
+  title: "Stop and report",
+  description: "End a recording (eye_record) and/or probe run (eye_probe) now and return the report: smoothness, what the pointer was over, command output, and the probe's per-layer report aligned to the capture. A running command is killed. Omit id to stop everything that's running.",
+  inputSchema: {
+    id: z.string().optional().describe("eye_record or eye_probe id. Omit to stop all."),
+    reason: z.string().optional().describe("Why (shown in the report when a command was cut short)."),
+    match: z.array(z.string()).optional().describe("Probe report: only layers whose label contains one of these."),
+    top: z.number().int().optional().describe("Probe report: layers to list (default 15)."),
+    ...analysisOpts,
+  },
+}, async (p) => {
+  const { id, reason, match, top, ...opts } = p;
+  const jobList = id ? (isProbeRun(id) ? [] : [jobs.get(id)].filter(Boolean) as Job[]) : [...jobs.values()].filter(running);
+  const probeIds = id ? (isProbeRun(id) ? [id] : []) : probeRunIds();
+  if (!jobList.length && !probeIds.length) return fail(diedCaptures.length ? `nothing running — ${diedCaptures.slice(-2).join("\n")}` : `nothing running${id ? ` with id ${id}` : ""}`);
+  const out: string[] = [];
+  for (const j of jobList) {
+    if (running(j)) {
+      j.opts = { ...j.opts, ...opts };
+      j.stopped ??= reason ?? "stopped by agent";
+      j.cmd?.kill("SIGTERM");
+      j.stopNow();
+    }
+    out.push(`${j.id}:\n${await j.finished}`);
+  }
+  const csv = jobList[0]?.capture.csv;
+  for (const r of await stopProbes(runDir, probeIds.length === 1 ? probeIds[0] : undefined, { capture_csv: csv, match, top })) out.push(r);
+  return text(out.join("\n\n"));
+});
+
+// ---- eye_act
+
 /** Variables available to guard/until/assert expressions. */
-function scope(live: any, ptr: { x: number; y: number }) {
+function scope(live: any, ptr: { x: number; y: number }, hover: any) {
   return {
     live,
     a: live?.anchored_screen ?? null,          // top-anchored extent {x0,x1,w,h,cx,y0,y1} in screen points, or null
@@ -495,7 +681,8 @@ function scope(live: any, ptr: { x: number; y: number }) {
     fps1: live?.last_1s?.new_frames ?? 0,      // new frames in the last second
     gap1: live?.last_1s?.max_gap_ms ?? 0,
     p: ptr,                                    // pointer position
-    pr: activeProbeLive(),                     // layer-probe live JSON (eye_probe_start), or null
+    h: hover ?? null,                          // AX element under the pointer {role,title,description,identifier,value,frame,path,app,...}
+    pr: activeProbeLive(),                     // layer-probe live JSON (eye_probe), or null
     L: (s: string) => {                        // first moving/watched probe layer whose label contains s
       const pl = activeProbeLive();
       const want = s.toLowerCase();
@@ -520,44 +707,46 @@ const stepSchema = z.object({
   button: z.enum(["left", "right"]).optional(), count: z.number().int().optional(), hold_ms: z.number().optional(),
   dy: z.number().optional(), dx: z.number().optional(), events: z.number().int().optional(),
   interval_ms: z.number().optional(), phased: z.boolean().optional().describe("scroll: trackpad phases (default true)"),
-  expr: z.string().optional().describe("wait_until/assert: JS expression over a, e, moving, fps1, gap1, p, live"),
+  expr: z.string().optional().describe("wait_until/assert: JS expression over a, e, moving, fps1, gap1, p, h, live, pr, L()"),
   timeout_ms: z.number().optional().describe("wait_until timeout (default 2000)"),
   guard: z.string().optional().describe("Expression that must hold BEFORE this step runs, else the sequence stops."),
   force: z.boolean().optional().describe("scroll: skip the inside-the-open-area safety check. Presses (click/down) can NOT be forced."),
-  on: z.union([z.string(), z.number()]).optional().describe("click/down/move: aim at a probe layer (label substring or layer id) instead of x,y — its centre (shape bounds if any), resolved from the probe's live data at that moment. The layer must be in the live moving/watched lists (add it to eye_probe_start watch)."),
+  on: z.union([z.string(), z.number()]).optional().describe("click/down/move: aim at a probe layer (label substring or layer id) instead of x,y — its centre, from the probe's live data. The layer must be in the live moving/watched lists (eye_probe watch)."),
   note: z.string().optional(),
 });
 
 server.registerTool("eye_act", {
   title: "Act and observe",
   description: [
-    "Drive the screen step by step and get the measured visible state after EVERY step, so you can think and react between calls.",
-    "Steps: move {x,y,ms}, click {x?,y?,button,count}, down/up {button} (drag), scroll {dy,dx,events,phased}, wait {ms},",
-    "wait_until {expr,timeout_ms}, assert {expr}. Any step may carry `guard` (expression that must hold first).",
-    "Expressions see: a = top-anchored open extent {x0,x1,w,h,cx} in screen points or null, e = bbox of all change,",
-    "moving, fps1 (new frames last 1s), gap1 (max frame gap last 1s, ms), p = pointer {x,y}, live = raw live JSON,",
-    "pr = layer-probe live JSON (eye_probe_start; null if none), L('label substring') = that probe layer {rect,shape,updates,coverage,max_gap_ms} or null.",
-    "SAFETY: scroll is refused unless the pointer is inside `a` (the measured open area) or inside one of `scroll_zones`, unless force:true.",
-    "Needs an active recording (eye_start or a background eye_record_while) for live state; events pass eye_lock_input.",
-    "The sequence stops at the first failed guard/assert/wait_until and reports why.",
+    "Drive the pointer step by step and get, after EVERY step, the pointer position, the accessibility element under it, and the",
+    "measured visible state — so you can think and react between calls. Steps: move {x,y,ms}, click {x?,y?,button,count},",
+    "down/up {button} (drag = down, move, up), scroll {dy,dx,events,phased}, wait {ms}, wait_until {expr,timeout_ms}, assert {expr}.",
+    "Any step may carry `guard`. Expressions see: a = top-anchored open extent {x0,x1,w,h,cx} or null, e = bbox of all change,",
+    "moving, fps1, gap1 (ms), p = pointer {x,y}, h = element under the pointer (role, title, description, identifier, value, frame,",
+    "path, app, enabled, focused, selected, actions) or null, live = raw live JSON, pr / L('label') = probe layers.",
+    "e.g. wait_until {expr:\"h?.identifier=='close'\"}. Find targets first with eye_inspect. SAFETY: presses only on target_process;",
+    "scroll only inside `a` or scroll_zones unless force. Holds a STRICT input lock (user's trackpad + keyboard) while it runs.",
+    "Live visible state needs a running eye_record. Input is synthetic: if a bug only happens with the real trackpad, have the user reproduce it.",
   ].join(" "),
   inputSchema: {
     steps: z.array(stepSchema).min(1).max(60),
-    capture_id: z.string().optional().describe("Capture/run whose live state to use (default: most recent active)."),
+    id: z.string().optional().describe("Recording whose live state to use (default: most recent running)."),
+    target_process: z.union([z.string(), z.number()]).optional().describe("App that presses must land on (name or pid). Default: the app of the running eye_probe. Presses are refused without a target."),
     scroll_zones: z.array(rectSchema).optional().describe("Extra screen rects (points) where scrolling is allowed, e.g. the closed notch."),
-    label: z.string().optional().describe("Phase name recorded with these steps in the run's action log (eye_explain groups by it)."),
-    target_process: z.union([z.string(), z.number()]).optional().describe("App that presses must land on (name or pid). Default: the app of the running probe recording. Presses are refused without a target."),
-    lock: z.boolean().optional().describe("Hold a STRICT input lock (physical pointer + keyboard, Esc ignored) for exactly the duration of these steps (default true)."),
+    label: z.string().optional().describe("Phase name recorded with these steps in the run's action log (eye_report view:'explain' groups by it)."),
+    ax: z.boolean().optional().describe("Report the element under the pointer after each step (default: the recording's ax setting, true without a recording)."),
+    tree: treeSchema.optional().describe("After the steps, also dump the AX tree of the recorded region (or the window under the pointer). Default none."),
+    lock: z.boolean().optional().describe("Hold a STRICT input lock for exactly the duration of these steps (default true)."),
   },
 }, async (p) => {
   let target: { pid: number; name: string } | null = null;
   try { target = p.target_process !== undefined ? await resolvePid(p.target_process) : activeProbeTarget(); }
   catch (e: any) { return fail(e.message); }
   let strictLock: Lock | undefined;
-  // A strict session lock (eye_lock_input strict) already covers us, including between calls mid-drag.
+  // A strict session lock (eye_lock strict) already covers us, including between calls mid-drag.
   const covered = [...locks.values()].some((l) => l.strict && l.until > Date.now() + 5000);
   if (p.lock !== false && !covered) {
-    const budget = p.steps.reduce((t, s) => t + (s.ms ?? 0) + (s.timeout_ms ?? (s.op === "wait_until" ? 2000 : 0)) + (s.hold_ms ?? 0) + 300, 0);
+    const budget = p.steps.reduce((t, s) => t + (s.ms ?? 0) + (s.timeout_ms ?? (s.op === "wait_until" ? 2000 : 0)) + (s.hold_ms ?? 0) + 400, 0);
     strictLock = startLock(Math.min(300, Math.ceil(budget / 1000) + 15), "tagged", true);
     await sleep(150);
     if (strictLock.child.exitCode !== null) return fail(`could not take the input lock: ${await strictLock.done}`);
@@ -567,12 +756,21 @@ server.registerTool("eye_act", {
 });
 
 async function actSteps(p: any, target: { pid: number; name: string } | null) {
-  const cap = activeCapture(p.capture_id);
+  const job = activeJob(p.id);
+  const cap = job?.capture;
   const readNow = () => (cap ? readLive(cap) : null);
+  const axOn: boolean = p.ax ?? (job ? job.ax : true);
   const t0 = Date.now();
   const lines: string[] = [];
   let ptr = { x: 0, y: 0 };
+  let hover: any = null;
+  const look = async () => {
+    if (!axOn) return;
+    const r = await actorSend({ op: "inspect", x: ptr.x, y: ptr.y, brief: true });
+    hover = r.ok ? r.element : null;
+  };
   { const r = await actorSend({ op: "pos" }); if (r.ok) ptr = { x: r.x, y: r.y }; }
+  await look();
   const stamp = () => `${((Date.now() - t0) / 1000).toFixed(2)}s`;
   let stopped = "";
   const wallNow = () => (performance.timeOrigin + performance.now()) / 1000;
@@ -582,24 +780,30 @@ async function actSteps(p: any, target: { pid: number; name: string } | null) {
       appendFileSync(join(cap.dir, "actions.jsonl"), JSON.stringify({ wall0, wall1: wallNow(), op: s.op, note: s.note ?? p.label, x: ptr.x, y: ptr.y, ok }) + "\n");
     } catch { /* run dir gone */ }
   };
+  const over = () => (axOn ? ` · over ${hoverLine(hover, 3)}` : "");
   for (const [i, s] of p.steps.entries()) {
     const tag = `#${i} ${s.op}${s.note ? ` (${s.note})` : ""}`;
     const wall0 = wallNow();
-    const before = lines.length, stoppedBefore = stopped;
+    const stoppedBefore = stopped;
     try {
-      if (s.guard && !evalExpr(s.guard, scope(readNow(), ptr))) { stopped = `${tag}: guard failed: ${s.guard}`; break; }
-      if (s.op === "wait") { await sleep(s.ms ?? 300); }
+      if (s.guard && !evalExpr(s.guard, scope(readNow(), ptr, hover))) { stopped = `${tag}: guard failed: ${s.guard}`; break; }
+      if (s.op === "wait") { await sleep(s.ms ?? 300); await look(); }
       else if (s.op === "wait_until" || s.op === "assert") {
         if (!s.expr) { stopped = `${tag}: needs expr`; break; }
+        const needsHover = /\bh\b/.test(s.expr);
         const end = Date.now() + (s.op === "assert" ? 0 : s.timeout_ms ?? 2000);
-        let ok = evalExpr(s.expr, scope(readNow(), ptr));
-        while (!ok && Date.now() < end) { await sleep(25); ok = evalExpr(s.expr, scope(readNow(), ptr)); }
-        if (!ok) { lines.push(`${stamp()} ${tag} ✗ ${s.expr} · ${short(readNow())}`); stopped = `${tag}: not satisfied: ${s.expr}`; break; }
+        let ok = evalExpr(s.expr, scope(readNow(), ptr, hover));
+        while (!ok && Date.now() < end) {
+          await sleep(needsHover ? 60 : 25);
+          if (needsHover) await look();
+          ok = evalExpr(s.expr, scope(readNow(), ptr, hover));
+        }
+        if (!ok) { lines.push(`${stamp()} ${tag} ✗ ${s.expr} · ${short(readNow())}${over()}`); stopped = `${tag}: not satisfied: ${s.expr}`; break; }
       } else {
         if (s.op === "scroll" && !s.force) {
           const live = readNow(), a = live?.anchored_screen;
           const inA = a && ptr.x > a.x0 + 10 && ptr.x < a.x1 - 10 && ptr.y < (a.y0 ?? 0) + a.h - 5;
-          const inZone = (p.scroll_zones ?? []).some((z) => ptr.x >= z.x && ptr.x <= z.x + z.w && ptr.y >= z.y && ptr.y <= z.y + z.h);
+          const inZone = (p.scroll_zones ?? []).some((z: Rect) => ptr.x >= z.x && ptr.x <= z.x + z.w && ptr.y >= z.y && ptr.y <= z.y + z.h);
           if (!inA && !inZone) { stopped = `${tag}: REFUSED scroll at ${ptr.x.toFixed(0)},${ptr.y.toFixed(0)} — not inside the open area or a scroll_zone`; break; }
         }
         const { guard, force, note, expr, timeout_ms, on, ...cmd } = s as any;
@@ -610,13 +814,13 @@ async function actSteps(p: any, target: { pid: number; name: string } | null) {
           const want = String(on).toLowerCase();
           const hit = [...(pl?.moving ?? []), ...(pl?.watched ?? [])].find((e: any) =>
             !e.gone && e.rect && (typeof on === "number" ? e.id === on : String(e.label).toLowerCase().includes(want)));
-          if (!hit) { stopped = `${tag}: no live probe layer matches ${JSON.stringify(on)} (watch it in eye_probe_start)`; break; }
+          if (!hit) { stopped = `${tag}: no live probe layer matches ${JSON.stringify(on)} (watch it in eye_probe)`; break; }
           aimed = hit.shape ?? hit.rect;
           cmd.x = aimed![0] + aimed![2] / 2; cmd.y = aimed![1] + aimed![3] / 2;
         }
         if (s.op === "click" || s.op === "down") {
           // Presses can never land outside the target app: no force, both checks always run.
-          if (!target) { stopped = `${tag}: REFUSED press — no target app (pass target_process, or run eye_probe_start)`; break; }
+          if (!target) { stopped = `${tag}: REFUSED press — no target app (pass target_process, or run eye_probe)`; break; }
           const at = { x: cmd.x ?? ptr.x, y: cmd.y ?? ptr.y };
           const pl = activeProbeLive();
           if (pl) {
@@ -633,10 +837,11 @@ async function actSteps(p: any, target: { pid: number; name: string } | null) {
         const r = await actorSend(cmd);
         if (!r.ok) { stopped = `${tag}: ${r.error}`; break; }
         ptr = { x: r.x, y: r.y };
+        await look();
       }
-      lines.push(`${stamp()} ${tag} → p(${ptr.x.toFixed(0)},${ptr.y.toFixed(0)}) · ${short(readNow())}`);
+      lines.push(`${stamp()} ${tag} → p(${ptr.x.toFixed(0)},${ptr.y.toFixed(0)}) · ${short(readNow())}${over()}`);
     } catch (err: any) { stopped = `${tag}: ${err.message}`; break; }
-    finally { if (s.op !== "assert") logAction(s, wall0, stopped === stoppedBefore); void before; }
+    finally { if (s.op !== "assert") logAction(s, wall0, stopped === stoppedBefore); }
   }
   const live = readNow();
   let recent = "";
@@ -648,125 +853,97 @@ async function actSteps(p: any, target: { pid: number; name: string } | null) {
       recent = a.overall ? `during these steps while animating: ${a.overall.fps} fps of ${a.overall.target_fps} · hitches ${a.overall.hitches} (long ${a.overall.long_hitches}) · p95 ${a.overall.gap_p95_ms}ms · max ${a.overall.gap_max_ms}ms` : "during these steps: no animation";
     } catch { /* not flushed yet */ }
   }
+  let tree = "";
+  if (p.tree && p.tree !== "none") {
+    const t = job ? await axTree({ rect: job.rect, display: job.display, process: job.process, mode: p.tree })
+      : await axTree({ x: ptr.x, y: ptr.y, mode: p.tree });
+    tree = `AX tree now (${p.tree}, global points):\n${t.text}`;
+  }
   return text([
     ...lines,
     stopped ? `STOPPED — ${stopped}` : `all ${p.steps.length} steps done`,
-    cap ? describeLive(live) : diedCaptures.length ? `(capture ended early — ${diedCaptures[diedCaptures.length - 1]})` : "(no active capture — start one with eye_start for live state)",
+    axOn && hover ? `element under the pointer now: ${hoverLine(hover, 6)}` : "",
+    cap ? describeLive(live) : diedCaptures.length ? `(capture ended early — ${diedCaptures[diedCaptures.length - 1]})` : "(no running eye_record — start one for the visible-state numbers)",
     recent,
     activeProbeLive() ? describeProbeLive(activeProbeLive(), 5) : "",
+    tree,
   ].filter(Boolean).join("\n"));
 }
 
-server.registerTool("eye_explain", {
-  title: "Explain a recording",
+// ---- reports
+
+server.registerTool("eye_report", {
+  title: "Analyze recordings",
   description: [
-    "Join everything recorded for a run on ONE clock and explain the bad frames: for each worst on-screen gap during",
-    "animation → when, how long, where the cursor was and which accessibility element it was over, which eye_act step",
-    "was running, and (if recorded with profile) how busy the app's main thread was, which of the app's own functions",
-    "were on it, and any Instruments hitch. Also: smoothness grouped by what the cursor was over and by agent action, and",
-    "the app functions over-represented during dropped frames vs. smooth ones.",
+    "Re-analyze recorded runs. view: summary (default for csv) = animation segments with fps/stalls/hitches/extent;",
+    "timeline = binned time series (frames, idle, worst gap, % moved, luma, extent); explain = the worst on-screen gaps joined",
+    "with where the pointer was, which element it was over, which eye_act step ran and (with profile) the app's main thread;",
+    "hover = every change of the element under the pointer; compare (default for runs) = side-by-side table vs the first run;",
+    "probe (default for an .ndjson file) = per-layer report, or one layer's per-frame series with layer_id.",
   ].join(" "),
   inputSchema: {
-    csv: z.string().describe("frames.csv of the run"),
-    top: z.number().int().optional().describe("How many worst gaps to list (default 12)."),
-    gap_frames: z.number().optional().describe("Minimum gap, in refreshes, to list (default 3)."),
-    app_binary: z.string().optional().describe("The app's binary name in stacks (default: guessed)."),
-    from_s: z.number().optional(), to_s: z.number().optional(),
+    view: z.enum(["summary", "timeline", "explain", "hover", "compare", "probe"]).optional(),
+    csv: z.string().optional().describe("frames.csv of a run."),
+    runs: z.array(z.object({ csv: z.string(), label: z.string() })).optional().describe("compare: first is the baseline."),
+    file: z.string().optional().describe("probe: probe.ndjson."),
+    label: z.string().optional(), from_s: z.number().optional(), to_s: z.number().optional(),
+    max_segments: z.number().int().optional().describe("summary: segments to list."),
+    bin_ms: z.number().positive().optional().describe("timeline: bin size (default 50)."),
+    top: z.number().int().optional().describe("explain: worst gaps (default 12) · hover: changes (default 200) · probe: layers (default 15)."),
+    gap_frames: z.number().optional().describe("explain: minimum gap in refreshes (default 3)."),
+    app_binary: z.string().optional().describe("explain: the app's binary name in stacks (default guessed)."),
+    match: z.array(z.string()).optional(), layer_id: z.number().int().optional(), max_rows: z.number().int().optional(),
+    split_ms: z.number().optional(), capture_csv: z.string().optional().describe("probe: align times to this capture."),
+    ...analysisOpts,
   },
 }, async (p) => {
-  try { return text(explain(p.csv, p)); } catch (e: any) { return fail(e.stack ?? e.message); }
-});
-
-server.registerTool("eye_analyze", {
-  title: "Analyze a recording",
-  description: "Re-analyze a recorded frames.csv, optionally within a time window or with different thresholds.",
-  inputSchema: {
-    csv: z.string(), label: z.string().optional(), from_s: z.number().optional(), to_s: z.number().optional(),
-    max_segments: z.number().int().optional(), ...analysisOpts,
-  },
-}, async (p) => {
-  try { return text(report(p.csv, p.label ?? p.csv, p, p.max_segments)); } catch (e: any) { return fail(e.message); }
-});
-
-server.registerTool("eye_compare", {
-  title: "Compare recordings",
-  description: "Side-by-side table of several recordings (first one is the baseline for deltas).",
-  inputSchema: { runs: z.array(z.object({ csv: z.string(), label: z.string() })).min(1), ...analysisOpts },
-}, async (p) => {
+  const view = p.view ?? (p.runs ? "compare" : p.file ? "probe" : "summary");
   try {
-    return text(compare(p.runs.map(({ csv, label }) => { const { rows, meta } = loadRun(csv); return { label, a: analyze(rows, meta, p) }; })));
-  } catch (e: any) { return fail(e.message); }
+    switch (view) {
+      case "compare":
+        if (!p.runs?.length) return fail("compare needs runs");
+        return text(compare(p.runs.map(({ csv, label }) => { const { rows, meta } = loadRun(csv); return { label, a: analyze(rows, meta, p) }; })));
+      case "probe":
+        if (!p.file) return fail("probe needs file (probe.ndjson)");
+        return text(analyzeProbe(p.file, p));
+    }
+    if (!p.csv) return fail(`${view} needs csv`);
+    switch (view) {
+      case "timeline": return text(timeline(loadRun(p.csv).rows, p.bin_ms ?? 50, p.from_s, p.to_s));
+      case "explain": return text(explain(p.csv, p));
+      case "hover": return text(hoverTimeline(p.csv, p.top ?? 200, p.from_s, p.to_s) || "no hover log for this run (recorded with ax off?)");
+      default: return text(report(p.csv, p.label ?? p.csv, p, p.max_segments));
+    }
+  } catch (e: any) { return fail(e.stack ?? e.message); }
 });
 
-server.registerTool("eye_timeline", {
-  title: "Time series",
-  description: "Binned time series of a recording: new frames, idle refreshes, worst gap, % pixels moved, luminance and the changed-region extent per bin. Use it to see the shape of an animation over time.",
-  inputSchema: { csv: z.string(), bin_ms: z.number().positive().optional(), from_s: z.number().optional(), to_s: z.number().optional() },
-}, async (p) => {
-  try { return text(timeline(loadRun(p.csv).rows, p.bin_ms ?? 50, p.from_s, p.to_s)); } catch (e: any) { return fail(e.message); }
-});
-
-server.registerTool("eye_frames", {
-  title: "Keyframes near a time",
-  description: "Paths of saved keyframes (recordings made with keyframe_ms) closest to a time, optionally returned inline.",
-  inputSchema: { csv: z.string(), t_s: z.number(), count: z.number().int().min(1).max(8).optional(), return_images: z.boolean().optional() },
-}, async (p) => {
-  const dir = join(dirname(p.csv), "keyframes");
-  if (!existsSync(dir)) return fail("this recording has no keyframes (record with keyframe_ms)");
-  const files = readdirSync(dir).filter((f) => f.endsWith(".png"))
-    .map((f) => ({ f, t: Number(f.replace(/^frame_|ms\.png$/g, "")) / 1000 }))
-    .sort((a, b) => Math.abs(a.t - p.t_s) - Math.abs(b.t - p.t_s)).slice(0, p.count ?? 3).sort((a, b) => a.t - b.t);
-  const content: any[] = [{ type: "text", text: files.map((x) => `${x.t.toFixed(3)}s ${join(dir, x.f)}`).join("\n") }];
-  if (p.return_images) for (const x of files) content.push({ type: "image", data: readFileSync(join(dir, x.f)).toString("base64"), mimeType: "image/png" });
-  return { content };
-});
-
-server.registerTool("eye_lock_input", {
-  title: "Lock physical pointer",
-  description: "Block the user's PHYSICAL trackpad/mouse (moves, clicks, scroll, gestures) so automated input runs undisturbed. Synthetic events from other processes still pass. Keyboard stays live; Esc releases it. Auto-releases after `seconds` (max 600).",
+server.registerTool("eye_lock", {
+  title: "Lock / unlock physical input",
+  description: "Block the user's PHYSICAL trackpad/mouse so automated input runs undisturbed (synthetic events pass, keyboard stays live, Esc releases, auto-release after `seconds`). strict also blocks the keyboard and ignores Esc (eye_act takes one automatically while it drives; use a strict session lock only to keep a drag held across several eye_act calls). release:true (or no seconds) releases locks and reports how many physical events were blocked.",
   inputSchema: {
-    seconds: z.number().positive().max(600),
+    seconds: z.number().positive().max(600).optional(),
+    release: z.boolean().optional(),
+    id: z.string().optional().describe("Release only this lock."),
     allow: z.enum(["synthetic", "tagged"]).optional().describe("synthetic (default): any process-posted event passes. tagged: only events with eventSourceUserData 0x45594521."),
-    strict: z.boolean().optional().describe("Also block the physical KEYBOARD, ignore Esc, and pass only the-eye's own events. Ends only on timeout or eye_unlock. eye_act takes one automatically while it drives."),
+    strict: z.boolean().optional(),
   },
 }, async (p) => {
+  if (p.release || !p.seconds) {
+    const list = p.id ? [locks.get(p.id)].filter(Boolean) as Lock[] : [...locks.values()];
+    const out: string[] = [];
+    for (const l of list) out.push(`${l.id}: ${await stopLock(l)}`);
+    if (!out.length) {
+      const prior = p.id ? finishedLocks.filter((r) => r.startsWith(p.id + ":")) : finishedLocks.slice(0, 3);
+      return text(prior.length ? `no active lock; already ended:\n${prior.join("\n")}` : "no active lock");
+    }
+    return text(out.join("\n"));
+  }
   const l = startLock(p.seconds, p.allow ?? "synthetic", !!p.strict);
   await sleep(300);
   if (l.child.exitCode !== null) return fail(await l.done);
   return text(p.strict
-    ? `${l.id}: physical pointer AND keyboard locked for ${p.seconds}s (strict: Esc does not release). Call eye_unlock when done.`
-    : `${l.id}: physical pointer locked for ${p.seconds}s (Esc releases). Call eye_unlock when done.`);
-});
-
-server.registerTool("eye_unlock", {
-  title: "Unlock physical pointer",
-  description: "Release input locks (all, or one id). Reports how many physical events were blocked.",
-  inputSchema: { lock_id: z.string().optional() },
-}, async (p) => {
-  const list = p.lock_id ? [locks.get(p.lock_id)].filter(Boolean) as Lock[] : [...locks.values()];
-  const out: string[] = [];
-  for (const l of list) out.push(`${l.id}: ${await stopLock(l)}`);
-  if (!out.length) {
-    const prior = p.lock_id ? finishedLocks.filter((r) => r.startsWith(p.lock_id + ":")) : finishedLocks.slice(0, 3);
-    return text(prior.length ? `no active lock; already ended:\n${prior.join("\n")}` : "no active lock");
-  }
-  return text(out.join("\n"));
-});
-
-server.registerTool("eye_status", {
-  title: "Active captures and locks",
-  description: "List active background captures and input locks, and where runs are stored.",
-  inputSchema: {},
-}, async () => {
-  const now = Date.now();
-  return text([
-    `runs dir: ${RUNS}`,
-    ...[...jobs.values()].map((j) => `${j.id} "${j.label}" ${j.state} (${((now - j.started) / 1000).toFixed(0)}s)`),
-    ...[...captures.values()].map((c) => `${c.id} "${c.label}" recording for ${((now - c.started) / 1000).toFixed(1)}s → ${c.csv}`),
-    ...[...locks.values()].map((l) => `${l.id} locked, ${Math.max(0, (l.until - now) / 1000).toFixed(0)}s left`),
-    ...finishedLocks.slice(0, 3).map((r) => `ended ${r}`),
-    ...probeRunsStatus(),
-  ].join("\n"));
+    ? `${l.id}: physical pointer AND keyboard locked for ${p.seconds}s (strict: Esc does not release). eye_lock {release:true} when done.`
+    : `${l.id}: physical pointer locked for ${p.seconds}s (Esc releases). eye_lock {release:true} when done.`);
 });
 
 registerProbeTools(server, { root: ROOT, runDir, text, fail });

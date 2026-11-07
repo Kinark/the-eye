@@ -10,8 +10,8 @@ const call = async (name, a = {}) => {
   return t;
 };
 const cx = 756;
-await call("eye_start", { rect: { x: 356, y: 0, w: 800, h: 300 }, label: "act-test" });
-await call("eye_lock_input", { seconds: 40 });
+await call("eye_record", { rect: { x: 356, y: 0, w: 800, h: 300 }, label: "act-test" });
+await call("eye_lock", { seconds: 40 });
 await call("eye_act", { steps: [
   { op: "move", x: cx, y: 12, ms: 300, note: "to notch" },
   { op: "click" },
@@ -27,6 +27,6 @@ await call("eye_act", { steps: [
 await call("eye_act", { steps: [
   { op: "wait_until", expr: "!a || a.h < 45", timeout_ms: 2000, note: "closed?" },
 ] });
-await call("eye_unlock");
+await call("eye_lock", { release: true });
 await call("eye_stop");
 await client.close();

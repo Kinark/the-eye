@@ -269,76 +269,95 @@ export function analyzeProbe(file: string, o: Opts = {}): string {
   return out.filter((x) => x !== "").join("\n");
 }
 
-// ---- tools
+// ---- stop (used by eye_stop) / peek (eye_peek)
+
+export function probeRunIds(): string[] { return [...runs.values()].filter((r) => !r.final).map((r) => r.id); }
+export function isProbeRun(id: string) { return runs.has(id); }
+export function peekProbe(id?: string, max = 8): string | null {
+  const r = id ? runs.get(id) : [...runs.values()].filter((x) => !x.final).pop();
+  if (!r) return null;
+  if (r.final) return r.final;
+  const s = readStatus(r.target.dir, r.v);
+  const ended = s && s.state === "idle" && s.last?.id === r.id ? ` · ENDED (${s.last.reason}) — eye_stop for the report` : "";
+  return `${r.id} "${r.label}" · ${((Date.now() - r.started) / 1000).toFixed(1)}s${ended}\n${describeProbeLive(liveOf(r), max)}`;
+}
+/** Stop probe recordings (one id, or every running one) and return their reports. */
+export async function stopProbes(runDir: (label?: string) => string, id?: string, o: { capture_csv?: string; match?: string[]; top?: number } = {}): Promise<string[]> {
+  const list = id ? [runs.get(id)].filter(Boolean) as ProbeRun[] : [...runs.values()].filter((x) => !x.final);
+  const out: string[] = [];
+  for (const r of list) {
+    if (r.final) { out.push(r.final); continue; }
+    writeFileSync(join(r.target.dir, "control.json"), JSON.stringify({ cmd: "stop", version: r.v, nonce: Math.random() }));
+    for (let i = 0; i < 30; i++) {
+      const s = readStatus(r.target.dir, r.v);
+      if (s?.state === "idle" && s.last?.id === r.id) break;
+      await sleep(100);
+    }
+    await sleep(150); // let the io queue land the last lines
+    const dir = runDir(r.label);
+    const dest = join(dir, "probe.ndjson");
+    try { copyFileSync(r.out, dest); } catch (e: any) { r.final = `${r.id}: could not read the recording: ${e.message}`; out.push(r.final); continue; }
+    r.runDir = dir;
+    try { r.final = analyzeProbe(dest, o); } catch (e: any) { r.final = `could not analyze ${dest}: ${e.message}`; }
+    out.push(r.final);
+  }
+  return out;
+}
+
+// ---- tool
 
 export function registerProbeTools(server: any, d: Deps) {
   root = d.root;
   const { text, fail } = d;
-  const procSchema = z.union([z.string(), z.number()]).describe("Target app: process name (e.g. 'NOOTCH! AppStore') or pid.");
-
-  server.registerTool("eye_probe_attach", {
-    title: "Attach the layer probe to an app",
+  server.registerTool("eye_probe", {
+    title: "Record layer geometry from inside an app",
     description: [
-      "Load the-eye's layer probe INTO a running app (macOS). Once loaded, eye_probe_start records, on every display refresh, the",
-      "PRESENTATION geometry (live animated values) of every layer in the app's visible windows — frames, opacity, and shape/mask",
-      "path bounds — in display-local points, top-left origin. No screenshots. Needs: a debuggable target (get-task-allow, e.g. a",
-      "Debug build) and its signing certificate in your keychain. Tries `lldb -p` itself; if another debugger (Xcode) already owns",
-      "the process it returns the exact lldb commands to send through Xcode's InvokeDebuggerCommand (process interrupt → commands",
-      "→ process continue), then call this again to confirm. Idempotent: it reports when the current probe is already loaded.",
-      "LIMIT: the probe sees what the app hands to the system. Effects the window server renders itself (system glass, backdrops)",
-      "can still lag on screen: compare against an eye_start capture of the same moment (eye_probe_report capture_csv).",
-    ].join(" "),
-    inputSchema: { process: procSchema, method: z.enum(["auto", "print"]).optional().describe("print = don't run lldb, just return the commands (default auto).") },
-  }, async (p: any) => {
-    try {
-      const t = await resolveTarget(p.process);
-      const built = await buildProbe();
-      if (alive(t, built.v)) { retireOthers(t, built.v); return text(`probe ${built.v} already loaded in ${t.name} (pid ${t.pid}) · dir ${t.dir}`); }
-      const dylib = await stageFor(t, built);
-      const cmds = injectCommands(dylib, t.dir, built.v);
-      const viaXcode = [
-        `Send these through Xcode's debugger (tools.xcode.InvokeDebuggerCommand), in order, then call eye_probe_attach again to confirm:`,
-        `  process interrupt`, ...cmds.map((c) => `  ${c}`), `  process continue`,
-        `(If dlopen "couldn't look up symbols", the app was interrupted mid-launch: continue, wait ~2s, retry.)`,
-      ].join("\n");
-      if (p.method === "print") return text(`${t.name} pid ${t.pid}\n${viaXcode}`);
-      const debugged = (await run("/bin/ps", ["-o", "ppid=", "-p", String(t.pid)], 3000)).stdout.trim();
-      const parent = debugged ? (await run("/bin/ps", ["-o", "comm=", "-p", debugged], 3000)).stdout : "";
-      if (parent.includes("debugserver")) return text(`${t.name} (pid ${t.pid}) is already under a debugger (Xcode).\n${viaXcode}`);
-      const args = ["--batch", "-p", String(t.pid)];
-      for (const c of cmds) args.push("-o", c);
-      args.push("-o", "process detach");
-      const r = await run("lldb", args, 60_000);
-      for (let i = 0; i < 20 && !alive(t, built.v); i++) await sleep(150);
-      if (alive(t, built.v)) { retireOthers(t, built.v); return text(`probe ${built.v} loaded into ${t.name} (pid ${t.pid}) · dir ${t.dir}`); }
-      return fail(`lldb could not load the probe.\n${(r.stdout + r.stderr).trim().slice(-1500)}\n\nIf a debugger owns the process, or attaching needs Developer Tools access:\n${viaXcode}`);
-    } catch (e: any) { return fail(e.message); }
-  });
-
-  server.registerTool("eye_probe_start", {
-    title: "Start a layer-probe recording",
-    description: [
-      "Start recording layer geometry in the attached app (see eye_probe_attach) on every display refresh. Returns at once.",
-      "POLL eye_probe_peek about every 0.5s while you act: it reports the last 0.5s (which layers moved, on how many frames each",
-      "actually updated, max gap, their current rects). eye_act steps can also read it (expressions get `pr` = probe live JSON and",
-      "L('substring') = first moving/watched layer whose label matches). Stop with eye_probe_stop.",
+      "Load the-eye's layer probe INTO a running app (if not loaded yet) and start recording, on every display refresh, the",
+      "PRESENTATION geometry (live animated values) of the app's layers: frame, opacity, shape/mask bounds, in display-local points.",
+      "No pixels. Use it when you need to know WHICH layer moved/stuttered, not just that the screen did. Returns at once;",
+      "eye_peek shows the live state (call ~every 0.5s while acting), eye_act can aim at layers (`on`) and read them (`L('label')`),",
+      "eye_stop ends it and returns the per-layer report (aligned to a running eye_record capture automatically).",
+      "Needs a debuggable target (Debug build, get-task-allow) whose signing certificate is in your keychain. If Xcode is already",
+      "debugging the app, this returns lldb commands to send through Xcode's InvokeDebuggerCommand; do that and call eye_probe again.",
+      "LIMIT: effects the window server renders itself (system glass, backdrops) are not in the app's layer tree.",
     ].join(" "),
     inputSchema: {
-      process: procSchema,
+      process: z.union([z.string(), z.number()]).describe("Target app: process name (e.g. 'NOOTCH!') or pid."),
+      method: z.enum(["auto", "print"]).optional().describe("print = don't run lldb, just return the attach commands (default auto)."),
       label: z.string().optional(),
-      display: z.number().int().optional().describe("Display id (eye_displays). Default: the main display."),
+      display: z.number().int().optional().describe("Display id (eye_status). Default: the main display."),
       rect: z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() }).optional().describe("Only log layers intersecting this display-local rect (points)."),
       match: z.array(z.string()).optional().describe("Only log layers whose label (layer class, view class, name) contains one of these."),
       watch: z.array(z.string()).optional().describe("Always show these layers in the live summary, moving or not (label substrings, e.g. 'NSGlassEffectView')."),
       max_seconds: z.number().positive().max(600).optional().describe("Safety stop (default 60)."),
       max_layers: z.number().int().positive().optional().describe("Max layers walked per frame (default 6000)."),
-      full_walk: z.boolean().optional().describe("Walk the whole layer tree every frame. Default false when match/watch is given: the tree is walked only every 30 frames to rediscover the matching layers, and the frames between re-measure just those (keeps the probe's main-thread cost near zero). Layers that newly appear can take up to 30 frames to be picked up."),
+      full_walk: z.boolean().optional().describe("Walk the whole layer tree every frame. Default false when match/watch is given (the tree is re-walked every 30 frames; new layers can take up to 30 frames to appear)."),
     },
   }, async (p: any) => {
     try {
       const t = await resolveTarget(p.process);
-      const v = version();
-      if (!alive(t, v)) return fail(`probe ${v} is not loaded in ${t.name} (pid ${t.pid}). Run eye_probe_attach first.`);
+      const built = await buildProbe();
+      const v = built.v;
+      if (!alive(t, v)) {
+        const dylib = await stageFor(t, built);
+        const cmds = injectCommands(dylib, t.dir, v);
+        const viaXcode = [
+          `Send these through Xcode's debugger (tools.xcode.InvokeDebuggerCommand), in order, then call eye_probe again:`,
+          `  process interrupt`, ...cmds.map((c) => `  ${c}`), `  process continue`,
+          `(If dlopen "couldn't look up symbols", the app was interrupted mid-launch: continue, wait ~2s, retry.)`,
+        ].join("\n");
+        if (p.method === "print") return text(`${t.name} pid ${t.pid}\n${viaXcode}`);
+        const ppid = (await run("/bin/ps", ["-o", "ppid=", "-p", String(t.pid)], 3000)).stdout.trim();
+        const parent = ppid ? (await run("/bin/ps", ["-o", "comm=", "-p", ppid], 3000)).stdout : "";
+        if (parent.includes("debugserver")) return text(`${t.name} (pid ${t.pid}) is already under a debugger (Xcode). The probe is NOT loaded yet.\n${viaXcode}`);
+        const args = ["--batch", "-p", String(t.pid)];
+        for (const c of cmds) args.push("-o", c);
+        args.push("-o", "process detach");
+        const r = await run("lldb", args, 60_000);
+        for (let i = 0; i < 20 && !alive(t, v); i++) await sleep(150);
+        if (!alive(t, v)) return fail(`lldb could not load the probe.\n${(r.stdout + r.stderr).trim().slice(-1500)}\n\nIf a debugger owns the process, or attaching needs Developer Tools access:\n${viaXcode}`);
+      }
+      retireOthers(t, v);
       const id = `probe${++seq}_${Date.now().toString(36)}`;
       const out = join(t.dir, `${id}.ndjson`);
       writeFileSync(join(t.dir, "control.json"), JSON.stringify({
@@ -349,64 +368,11 @@ export function registerProbeTools(server: any, d: Deps) {
       for (let i = 0; i < 20; i++) {
         await sleep(100);
         const s = readStatus(t.dir, v);
-        if (s?.state === "recording" && s.id === id) { runs.set(id, r); return text(`${id} recording in ${t.name} → ${out}\npoll eye_probe_peek {run_id:"${id}"} every ~0.5s; eye_probe_stop to finish.`); }
+        if (s?.state === "recording" && s.id === id) { runs.set(id, r); return text(`${id} recording layers in ${t.name} (pid ${t.pid}) → ${out}\neye_peek every ~0.5s while acting; eye_stop {id:"${id}"} for the report.`); }
         if (s?.last?.error) return fail(`probe refused: ${s.last.error}`);
       }
       return fail("the probe did not start within 2s (is the app's main thread blocked?)");
     } catch (e: any) { return fail(e.message); }
-  });
-
-  server.registerTool("eye_probe_peek", {
-    title: "Live layer-probe state",
-    description: "What the probe measured over the last 0.5s (refreshed every 0.25s): ticks/s, walk cost, the layers that moved with their update coverage, max gap and current rect/shape, plus the watched layers. Cheap; call it about every 0.5s to steer. Returns the final report once the recording has ended.",
-    inputSchema: { run_id: z.string().optional().describe("Omit for the most recent."), max: z.number().int().optional().describe("Layers per list (default 8).") },
-  }, async (p: any) => {
-    const r = p.run_id ? runs.get(p.run_id) : [...runs.values()].pop();
-    if (!r) return fail("no probe recording");
-    if (r.final) return text(r.final);
-    const s = readStatus(r.target.dir, r.v);
-    const ended = s && s.state === "idle" && s.last?.id === r.id ? ` · ENDED (${s.last.reason}) — call eye_probe_stop for the report` : "";
-    return text(`${r.id} "${r.label}" · ${((Date.now() - r.started) / 1000).toFixed(1)}s${ended}\n${describeProbeLive(liveOf(r), p.max ?? 8)}`);
-  });
-
-  server.registerTool("eye_probe_stop", {
-    title: "Stop a layer-probe recording",
-    description: "Stop the probe recording (or the most recent) and return the report: per moving layer, how many display frames its geometry actually changed on (coverage), max gap, travel, motion windows. Pass capture_csv (an eye_start/eye_record frames.csv from the same moment) to put times on the capture's clock.",
-    inputSchema: {
-      run_id: z.string().optional(),
-      capture_csv: z.string().optional(), match: z.array(z.string()).optional(), top: z.number().int().optional(),
-    },
-  }, async (p: any) => {
-    const r = p.run_id ? runs.get(p.run_id) : [...runs.values()].filter((x) => !x.final).pop();
-    if (!r) return fail("no running probe recording");
-    if (r.final) return text(r.final);
-    writeFileSync(join(r.target.dir, "control.json"), JSON.stringify({ cmd: "stop", version: r.v, nonce: Math.random() }));
-    for (let i = 0; i < 30; i++) {
-      const s = readStatus(r.target.dir, r.v);
-      if (s?.state === "idle" && s.last?.id === r.id) break;
-      await sleep(100);
-    }
-    await sleep(150); // let the io queue land the last lines
-    const dir = d.runDir(r.label);
-    const dest = join(dir, "probe.ndjson");
-    try { copyFileSync(r.out, dest); } catch (e: any) { return fail(`could not read the recording: ${e.message}`); }
-    r.runDir = dir;
-    try { r.final = analyzeProbe(dest, { capture_csv: p.capture_csv, match: p.match, top: p.top }); }
-    catch (e: any) { r.final = `could not analyze ${dest}: ${e.message}`; }
-    return text(r.final);
-  });
-
-  server.registerTool("eye_probe_report", {
-    title: "Analyze a layer-probe recording",
-    description: "Re-analyze a probe.ndjson: filter layers (match), time window (from_s/to_s), align to a capture (capture_csv), or dump one layer's per-frame series (layer_id) — x,y,w,h,opacity and shape bounds per change.",
-    inputSchema: {
-      file: z.string(), capture_csv: z.string().optional(), match: z.array(z.string()).optional(),
-      from_s: z.number().optional(), to_s: z.number().optional(), top: z.number().int().optional(),
-      split_ms: z.number().optional().describe("A pause longer than this splits a layer's motion (default 150)."),
-      layer_id: z.number().int().optional(), max_rows: z.number().int().optional(),
-    },
-  }, async (p: any) => {
-    try { return text(analyzeProbe(p.file, p)); } catch (e: any) { return fail(e.message); }
   });
 }
 

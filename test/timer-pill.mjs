@@ -20,13 +20,12 @@ const live = () => { try { return JSON.parse(readFileSync(probeFile + ".live.jso
 let capturing = false;
 
 try {
-  log("attach", await call("eye_probe_attach", { process: proc }));
-  const st = await call("eye_probe_start", { process: proc, label: "timer-pill", max_seconds: 90,
+  const st = await call("eye_probe", { process: proc, label: "timer-pill", max_seconds: 90,
     watch: ["PublicGlassHostView", "PublicGlassRectHostView", "NSGlassEffectView", "DropAreaView", "ScrollWheelNSView"] });
   log("probe", st);
   if (st.startsWith("ERROR")) throw new Error("probe did not start");
   probeFile = st.match(/→ (\S+\.ndjson)/)[1];
-  log("lock", await call("eye_lock_input", { seconds: 90, strict: true }));
+  log("lock", await call("eye_lock", { seconds: 90, strict: true }));
   const nookOpen = "pr && pr.watched.some(w => w.rect && w.label.includes('PublicGlassHostView') && w.rect[3] > 120)";
   log("open", await call("eye_act", { label: "open", steps: [
     { op: "move", x: 756, y: 14, ms: 250 }, { op: "wait", ms: 500 },
@@ -47,12 +46,12 @@ try {
       { op: "move", x: px, y: py, ms: 300 }, { op: "wait", ms: 900 } ] }));
     log("watched", (live()?.watched ?? []).filter((e) => e.rect && !e.gone)
       .map((e) => `#${e.id} ${e.label.trim().slice(0, 70)} ${JSON.stringify(e.rect.map((n) => Math.round(n)))}`).join("\n"));
-    log("probe A stop", (await call("eye_probe_stop", { top: 3 })).split("\n").slice(0, 3).join("\n"));
-    const st2 = await call("eye_probe_start", { process: proc, label: "timer-pill-near", max_seconds: 60, full_walk: true,
+    log("probe A stop", (await call("eye_stop", { top: 3 })).split("\n").slice(0, 3).join("\n"));
+    const st2 = await call("eye_probe", { process: proc, label: "timer-pill-near", max_seconds: 60, full_walk: true,
       rect: { x: px - 90, y: py - 50, w: 180, h: 100 }, watch: ["PublicGlassRectHostView", "NSGlassEffectView"] });
     log("probe B", st2);
     probeFile = st2.match(/→ (\S+\.ndjson)/)[1];
-    log("capture", await call("eye_start", { rect: { x: Math.round(px - 90), y: Math.round(py - 50), w: 180, h: 100 },
+    log("capture", await call("eye_record", { rect: { x: Math.round(px - 90), y: Math.round(py - 50), w: 180, h: 100 },
       label: "timer-pill", max_seconds: 40, keyframe_ms: 25, cursor: false }));
     capturing = true;
     log("drag", await call("eye_act", { label: "drag", steps: [
@@ -68,13 +67,13 @@ try {
 } finally {
   log("release", await call("eye_act", { lock: false, steps: [{ op: "up", button: "left" }] }));
   log("close", await call("eye_act", { lock: false, steps: [{ op: "move", x: 756, y: 600, ms: 250 }] }));
-  log("unlock", await call("eye_unlock"));
+  log("unlock", await call("eye_lock", { release: true }));
   let csv;
   if (capturing) {
     const cap = await call("eye_stop");
     csv = cap.match(/csv: (\S+)/)?.[1];
     log("capture report", cap);
   }
-  log("probe report", await call("eye_probe_stop", { top: 30, capture_csv: csv }));
+  log("probe report", await call("eye_stop", { top: 30, capture_csv: csv }));
   await client.close();
 }
