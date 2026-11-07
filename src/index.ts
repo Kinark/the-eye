@@ -216,29 +216,48 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // ---- input + AX actor: one persistent native process (eye-capture input), JSON lines in/out
 
-let actor: { child: ChildProcess; pending: ((s: string) => void)[]; buf: string } | null = null;
+let actor: { child: ChildProcess; pending: ((s: string) => void)[]; buf: string; binMtime: number } | null = null;
 function inputActor() {
-  if (actor && actor.child.exitCode === null) return actor;
   ensureBinary();
+  const binMtime = statSync(BIN).mtimeMs;
+  // A process killed by a signal keeps exitCode null (signalCode is set): check both.
+  if (actor && actor.child.exitCode === null && actor.child.signalCode === null) {
+    // A rebuilt binary must replace the running actor, or fixes never reach it. Swap only when idle.
+    if (actor.binMtime === binMtime || actor.pending.length) return actor;
+    actor.child.kill("SIGTERM");
+  }
   const child = spawn(BIN, ["input"], { stdio: ["pipe", "pipe", "pipe"] });
-  const a = { child, pending: [] as ((s: string) => void)[], buf: "" };
+  const a = { child, pending: [] as ((s: string) => void)[], buf: "", binMtime };
   child.stdout!.on("data", (d) => {
     a.buf += d;
     let i;
     while ((i = a.buf.indexOf("\n")) >= 0) { const line = a.buf.slice(0, i); a.buf = a.buf.slice(i + 1); a.pending.shift()?.(line); }
   });
-  child.on("close", () => { for (const p of a.pending.splice(0)) p(JSON.stringify({ ok: false, error: "input actor exited" })); });
+  child.stdin!.on("error", () => {}); // EPIPE after the actor died is answered via actorSend's write callback
+  child.on("close", () => { if (actor === a) actor = null; for (const p of a.pending.splice(0)) p(JSON.stringify({ ok: false, error: "input actor exited" })); });
   actor = a;
   return a;
 }
-function actorSend(cmd: object, extraMs = 0): Promise<any> {
+async function actorSend(cmd: object, extraMs = 0): Promise<any> {
+  const r = await actorSendOnce(cmd, extraMs);
+  // The actor was already dead when we wrote (killed, crashed): the command never ran, so retry once on a fresh one.
+  if (r?.ok === false && /input actor gone/.test(String(r.error))) return actorSendOnce(cmd, extraMs);
+  return r;
+}
+function actorSendOnce(cmd: object, extraMs = 0): Promise<any> {
   const a = inputActor();
   const budget = 10_000 + extraMs + Number((cmd as any).ms ?? 0) + 50 * Number((cmd as any).events ?? 0);
   return new Promise((res) => {
-    // If the actor wedges, kill it: its close handler fails every pending command and the next call respawns it.
-    const t = setTimeout(() => a.child.kill("SIGKILL"), budget);
-    a.pending.push((line) => { clearTimeout(t); try { res(JSON.parse(line)); } catch { res({ ok: false, error: line }); } });
-    a.child.stdin!.write(JSON.stringify(cmd) + "\n");
+    let done = false;
+    const answer = (line: string) => { if (done) return; done = true; clearTimeout(t); try { res(JSON.parse(line)); } catch { res({ ok: false, error: line }); } };
+    // If the actor wedges (or is already dead), kill it, drop it and answer anyway: the next call respawns it.
+    const t = setTimeout(() => {
+      a.child.kill("SIGKILL");
+      if (actor === a) actor = null;
+      answer(JSON.stringify({ ok: false, error: `input actor did not answer within ${budget}ms (restarted)` }));
+    }, budget);
+    a.pending.push(answer);
+    a.child.stdin!.write(JSON.stringify(cmd) + "\n", (e) => { if (e) { if (actor === a) actor = null; answer(JSON.stringify({ ok: false, error: `input actor gone: ${e.message}` })); } });
   });
 }
 

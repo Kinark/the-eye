@@ -625,20 +625,28 @@ enum AXI {
             out.append((pid, NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)", root, f))
         }
         if let want = process?.lowercased() {
-            let apps = NSWorkspace.shared.runningApplications.filter {
-                String($0.processIdentifier) == want || ($0.localizedName?.lowercased().contains(want) ?? false)
+            // Not NSWorkspace.runningApplications: this actor is long-lived and never spins the run loop that
+            // refreshes it, so apps launched after it started (every relaunch of the app under test) were missing.
+            // The window server's list is always live.
+            var pids: [pid_t] = []
+            if let n = pid_t(want) { pids.append(n) }
+            let infos = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+            for w in infos {
+                guard let p = (w[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value, !pids.contains(p) else { continue }
+                let names = [w[kCGWindowOwnerName as String] as? String, NSRunningApplication(processIdentifier: p)?.localizedName]
+                if names.contains(where: { $0?.lowercased().contains(want) ?? false }) { pids.append(p) }
             }
-            for a in apps {
-                let app = AXUIElementCreateApplication(a.processIdentifier)
+            for pid in pids {
+                let app = AXUIElementCreateApplication(pid)
                 AXUIElementSetMessagingTimeout(app, 0.5)
                 let wins = (raw(app, kAXWindowsAttribute) as? [AXUIElement] ?? [])
                     .filter { frame(many($0, [kAXPositionAttribute, kAXSizeAttribute]))?.intersects(rect) ?? false }
-                for w in wins { add(w, a.processIdentifier) }
+                for w in wins { add(w, pid) }
                 if wins.isEmpty {
                     // Borderless panels are often missing from AXWindows: hit-test the rect inside the app.
                     var el: AXUIElement?
                     if AXUIElementCopyElementAtPosition(app, Float(rect.midX), Float(rect.midY), &el) == .success, let el {
-                        add(windowRoot(of: el), a.processIdentifier)
+                        add(windowRoot(of: el), pid)
                     }
                 }
             }
