@@ -160,6 +160,10 @@ another SCK screenshot, and occasional for `SCScreenshotManager`. Every helper c
 
 Regression test: `node test/stop-hang.mjs [rounds]`.
 
+Recordings started back to back sometimes get a spurious TCC refusal ("The user declined TCCs…") that sticks to the
+helper process, so retrying inside it doesn't help. `eye_record` starts a fresh helper (up to 3 tries, 0.7s/1.4s
+apart) and says so in its result ("capture retried 1×…"); only the third refusal is reported as a failure.
+
 ## Install
 
 Requires macOS 14+, Node ≥ 23.6 (it runs the TypeScript directly) and Xcode command-line tools (`swiftc`).

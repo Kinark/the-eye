@@ -44,8 +44,15 @@ expect(l2.err && /already running/.test(l2.t), "a second launch is refused", l2)
 execSync("open -n -a Calculator; sleep 3.5"); // behind the server's back
 const st = await call(B, "eye_status", {});
 expect(/another copy of Calculator/.test(st.t) && /more than one/.test(st.t), "the server noticed the extra copy by itself", st);
-const rec = await call(B, "eye_record", { rect: { x: 0, y: 0, w: 1512, h: 982 }, seconds: 0.5 });
-expect(/⚠ Calculator \(on screen in this rect\) runs 2×/.test(rec.t), "a recording flags the duplicated app in its rect", rec);
+execSync(`osascript -e 'tell application "System Events" to set frontmost of every process whose name is "Calculator" to true'; sleep 1`); // whatever the user has in front would cover it
+const win = execSync(`osascript -e 'tell application "System Events" to get {position, size} of window 1 of (first process whose name is "Calculator")'`).toString().trim().split(", ").map(Number);
+const top = await call(B, "eye_inspect", { x: win[0] + win[2] / 2, y: win[1] + win[3] / 2 });
+if (!/Calculator/.test(top.t.split("\n").slice(0, 3).join(" "))) {
+  console.log("skip a recording flags the duplicated app in its rect (Calculator is covered by the app in front; macOS refused to raise it)");
+} else {
+  const rec = await call(B, "eye_record", { rect: { x: win[0], y: win[1], w: win[2], h: win[3] }, seconds: 0.5 });
+  expect(/⚠ Calculator \(on screen in this rect\) runs 2×/.test(rec.t), "a recording flags the duplicated app in its rect", rec);
+}
 const d1 = await call(B, "eye_act", { target_process: "Calculator", lock: false, steps: [{ op: "wait", ms: 10 }] });
 expect(d1.err && /STOPPED: 2 copies/.test(d1.t) && /relaunch/.test(d1.t), "eye_act stops and offers the choices", d1);
 const before = execSync("pgrep -x Calculator").toString().trim().split("\n");

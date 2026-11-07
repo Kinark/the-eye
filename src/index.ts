@@ -224,13 +224,13 @@ function withNotes<T extends { content: { type: "text"; text: string }[] }>(r: T
   return r;
 }
 /**
- * Apps on screen in a recording's rect (from its AX tree, else AX hit-tests at a 3×3 grid of points): each one
+ * Apps on screen in a recording's rect (its AX tree plus AX hit-tests at a 3×3 grid of points): each one
  * gets watched, and a warning comes back when one of them runs more than once (another build counts too).
  */
 async function observedConflicts(job: { treeFile?: string }, rect: Rect): Promise<string[]> {
   const pids = new Set<number>();
   try { for (const w of JSON.parse(readFileSync(job.treeFile!, "utf8")).windows ?? []) if (w.pid) pids.add(Number(w.pid)); } catch {}
-  if (!pids.size) {
+  {
     for (const fx of [0.2, 0.5, 0.8]) for (const fy of [0.2, 0.5, 0.8]) {
       // AX hit-test, not the topmost CG window: transparent full-screen windows (the Dock's) sit above everything.
       const o = await actorSend({ op: "inspect", x: rect.x + rect.w * fx, y: rect.y + rect.h * fy, brief: true });
@@ -365,7 +365,7 @@ type Job = {
   id: string; label: string; capture: Capture; rect: Rect; display?: number; process?: string; ax: boolean;
   lock?: Lock; cmd?: ChildProcess; command?: string; output: string[]; started: number;
   state: "starting" | "running" | "finishing" | "done"; exitCode?: number | null; lockResult?: string;
-  stopped?: string; final?: string; finished: Promise<string>; opts: Options; tree?: string; treeFile?: string;
+  stopped?: string; final?: string; startNote?: string; finished: Promise<string>; opts: Options; tree?: string; treeFile?: string;
   stopNow: () => void;
 };
 const jobs = new Map<string, Job>();
@@ -386,8 +386,9 @@ function startJob(p: RecordParams): Job {
   const hasCmd = !!p.command;
   const limit = hasCmd ? (p.timeout_s ?? 300) : (p.seconds ?? p.max_seconds ?? 300);
   const ax = p.cursor !== false && (p.ax ?? !p.profile);
-  const c = startCapture({ rect: p.rect, display: p.display, label: p.label, keyframe_ms: p.keyframe_ms, fps: p.fps,
-    seconds: hasCmd ? limit + 30 : limit, profile: p.profile, cursor: p.cursor, ax_hz: ax ? (p.ax_hz ?? 10) : 0 });
+  const capOpts = { rect: p.rect, display: p.display, label: p.label, keyframe_ms: p.keyframe_ms, fps: p.fps,
+    seconds: hasCmd ? limit + 30 : limit, cursor: p.cursor, ax_hz: ax ? (p.ax_hz ?? 10) : 0 };
+  let c = startCapture({ ...capOpts, profile: p.profile });
   let stopNow!: () => void;
   const stopReq = new Promise<void>((r) => (stopNow = r));
   const id = `run${++seq}`;
@@ -398,17 +399,35 @@ function startJob(p: RecordParams): Job {
     if (c.trace) job.output.push(`Instruments: ${await c.trace.ready}`);
     job.lock = p.lock_input ? startLock(limit + 10, "synthetic") : undefined;
     const pre = sleep(p.pre_ms ?? (hasCmd ? 500 : 0));
-    // ScreenCaptureKit can take seconds to start: never run the command (or report "recording") before frames
-    // are on disk. The helper itself gives up after 8s.
-    for (let i = 0; i < 95 && c.child.exitCode === null && !(existsSync(c.csv) && statSync(c.csv).size > 200); i++) await sleep(100);
-    if (c.child.exitCode === null && !existsSync(c.csv)) { c.child.kill("SIGTERM"); await c.done; }
-    // A short `seconds` run can finish before frames were seen here: exit 0 with a CSV is a complete run, not a failure.
-    const finishedClean = c.child.exitCode === 0 && existsSync(c.csv);
-    if (!finishedClean && (c.child.exitCode !== null || c.child.signalCode !== null)) {
+    const retried: string[] = [];
+    for (let attempt = 1; ; attempt++) {
+      // ScreenCaptureKit can take seconds to start: never run the command (or report "recording") before frames
+      // are on disk. The helper itself gives up after 8s.
+      for (let i = 0; i < 95 && c.child.exitCode === null && !(existsSync(c.csv) && statSync(c.csv).size > 200); i++) await sleep(100);
+      if (c.child.exitCode === null && !existsSync(c.csv)) { c.child.kill("SIGTERM"); await c.done; }
+      // A short `seconds` run can finish before frames were seen here: exit 0 with a CSV is a complete run, not a failure.
+      const finishedClean = c.child.exitCode === 0 && existsSync(c.csv);
+      if (finishedClean || (c.child.exitCode === null && c.child.signalCode === null)) break;
+      const why = await c.done;
+      // Back-to-back sessions sometimes get a spurious TCC "declined" (or a wedged replayd) that sticks to the helper
+      // process, so its own retries don't help: start a fresh helper, up to 3 tries.
+      if (attempt < 3 && !job.stopped && /declined TCC|ScreenCaptureKit unavailable|did not respond|capture start failed/i.test(why)) {
+        retried.push(why.split("\n").find((l) => /error|failed|timed out/i.test(l))?.slice(0, 160) ?? "start failed");
+        const at = diedCaptures.findIndex((x) => x.startsWith(`${c.id} `));
+        if (at >= 0) diedCaptures.splice(at, 1);
+        rmSync(c.dir, { recursive: true, force: true });
+        await sleep(700 * attempt);
+        const trace = c.trace;
+        c = startCapture(capOpts);
+        c.trace = trace;
+        job.capture = c;
+        continue;
+      }
       if (job.lock) job.lockResult = await stopLock(job.lock);
-      job.state = "done"; job.final = `capture failed: ${await c.done}`;
+      job.state = "done"; job.final = `capture failed${retried.length ? ` after ${attempt} tries` : ""}: ${why}`;
       return job.final;
     }
+    if (retried.length) job.startNote = (`capture retried ${retried.length}× (ScreenCaptureKit refused to start: ${retried[0]})`);
     const treeMode = p.tree ?? (ax ? "basic" : "none");
     if (treeMode !== "none" && !job.stopped) {
       job.treeFile = join(c.dir, "ax_tree_start.json");
@@ -450,6 +469,7 @@ function startJob(p: RecordParams): Job {
     job.final = [
       hasCmd ? `${job.stopped ? `STOPPED (${job.stopped}) · ` : ""}command exit ${job.exitCode ?? "-"}${job.lockResult ? ` · input lock: ${job.lockResult}` : ""}` : (job.stopped && job.stopped !== "stopped by agent" ? `STOPPED (${job.stopped})` : ""),
       tail ? `command output (tail):\n${tail}` : "",
+      job.startNote ?? "",
       body,
       ax ? "NOTE: recorded with accessibility inspection ON (ax) — on SwiftUI apps fps can read lower than without it. Use ax:false for final numbers." : "",
       hv,
@@ -663,11 +683,12 @@ server.registerTool("eye_record", {
     const tree = job.tree ? `\n\nobserved windows at start (AX tree, global points):\n${capLines(job.tree, 60, `full tree: ${join(job.capture.dir, "ax_tree_start.txt")}`)}` : "";
     return text([instNote, ...(await observedConflicts(job, p.rect)), `${job.id} done\n\n${final}${tree}`, ...freshEvents()].filter(Boolean).join("\n"));
   }
-  for (let i = 0; i < 100 && job.state === "starting"; i++) await sleep(50);
+  for (let i = 0; i < 600 && job.state === "starting"; i++) await sleep(50); // up to 3 helper starts
   if (job.state === "done") return fail(job.final ?? "capture failed");
   const live = readLive(job.capture);
   return text([
     `${job.id} recording "${job.label}" ${rectArg(p.rect)}${p.display !== undefined ? ` on display ${p.display}` : ""} → ${job.capture.csv}`,
+    job.startNote ?? "",
     job.output.length ? job.output.join("\n") : "",
     job.ax ? "AX inspection ON (hover + tree): fps can read lower on SwiftUI apps; use ax:false for final numbers." : "AX inspection off.",
     describeLive(live),
