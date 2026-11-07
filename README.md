@@ -6,6 +6,8 @@ display refresh. From that log it reports how smooth an animation *actually look
 refreshes, hitches, frame-gap distribution, and the size/position curve of whatever moved.
 
 Built to answer "did this change make the animation smoother?" objectively, and to A/B app builds and settings.
+It's meant to be an agent's default way to test a macOS app's UI (SwiftUI or AppKit) on its own: find the element
+(accessibility tree), drive it (`eye_act`), and measure the result, without asking the user to try it.
 
 ## How it measures
 
@@ -51,7 +53,7 @@ Ten tools. The server's MCP `instructions` carry the full "what / when / how" gu
 | `eye_act` | **interactive driving**: `move`, `click`, `down`/`up`, `scroll`, `wait`, `wait_until`, `assert`. After **every** step: pointer, element under it, visible state. Expressions get `h` (the element). Presses only on `target_process`; scrolls only inside the open area or `scroll_zones` |
 | `eye_stop` | end a recording and/or probe run (all if no id), kill a running command, return the report(s); the probe report is aligned to the capture |
 | `eye_report` | re-analyze: `summary`, `timeline`, `explain` (worst gaps × cursor × element × eye_act step × main thread), `hover` (element-under-pointer changes), `compare` (runs), `probe` (probe.ndjson / one layer) |
-| `eye_lock` | lock the physical pointer (`seconds`, `strict` also blocks the keyboard) or `release:true` |
+| `eye_lock` | block all physical input, trackpad and keyboard (`seconds`), or `release:true` |
 | `eye_probe` | load the layer probe into an app if needed and start recording layer geometry (see below) |
 
 Old → new: `eye_displays`→`eye_status` · `eye_start`/`eye_record_while`→`eye_record` · `eye_abort`→`eye_stop` ·
@@ -120,8 +122,13 @@ Interactive loop: `eye_inspect` (find targets) → `eye_record` → repeat `eye_
 
 ### Input lock and drivers
 
-The lock drops pointer events whose source process ID is 0 (physical hardware). Its result includes
-`pointer_events_by_source_pid`, so you can check what it saw. Events posted by any process pass through,
+Every lock (`eye_act`'s automatic one, `eye_record lock_input`, `eye_lock`) taps every event type and drops
+all physical input whose source process ID is 0: pointer, scroll, trackpad gestures, force touch, keys, modifiers and
+media keys. It also pins the cursor. The orange overlay is shown exactly while a lock is held, so orange on screen
+means no physical input gets through. The user's emergency release is Esc three times within 1.5s (those presses
+are swallowed too). Its result includes `pointer_events_by_source_pid` and `blocked_by_event_type`, so you can
+check what it saw. Keystrokes typed while macOS Secure Input is on (a focused password field) bypass every event
+tap, this one included. Events posted by any process pass through,
 including Peekaboo, `cliclick` and your own CGEvent drivers. With `allow: "tagged"`, only events carrying
 `eventSourceUserData == 0x45594521` ("EYE!") pass.
 

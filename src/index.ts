@@ -78,7 +78,7 @@ type Capture = {
   trace?: Trace; profileNote?: string; stopping?: boolean;
 };
 const captures = new Map<string, Capture>();
-type Lock = { id: string; child: ChildProcess; done: Promise<string>; until: number; strict?: boolean };
+type Lock = { id: string; child: ChildProcess; done: Promise<string>; until: number };
 const locks = new Map<string, Lock>();
 const finishedLocks: string[] = []; // reports of locks that ended on their own (timeout / Esc)
 const diedCaptures: string[] = [];
@@ -180,13 +180,13 @@ async function stopCapture(c: Capture) {
   return out;
 }
 
-function startLock(seconds: number, allow: "synthetic" | "tagged", strict = false): Lock {
+/** Every lock blocks ALL physical input (pointer, gestures, keyboard) and shows the orange overlay. */
+function startLock(seconds: number, allow: "synthetic" | "tagged"): Lock {
   ensureBinary();
   const args = ["lock", "--seconds", String(seconds), "--allow", allow];
-  if (strict) args.push("--strict", "1");
   const child = spawn(BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
   const id = `lock${++seq}`;
-  const l: Lock = { id, child, done: collect(child), until: Date.now() + seconds * 1000, strict };
+  const l: Lock = { id, child, done: collect(child), until: Date.now() + seconds * 1000 };
   locks.set(id, l);
   l.done.then((r) => { finishedLocks.unshift(`${id}: ${r}`); finishedLocks.length = Math.min(finishedLocks.length, 10); })
     .finally(() => locks.delete(id));
@@ -422,22 +422,24 @@ the-eye: see and measure what a macOS screen shows, over time. Three kinds of ev
 2. ACCESSIBILITY (AX) CONTEXT: what UI element is under the pointer (role, label, identifier, value, frame, enabled/focused/selected, actions, every other attribute, ancestors, app, window), and the element TREE of the observed windows with each element's bounds. Answers "what am I looking at?", "where is the X button?", "what was the pointer over when the frame dropped?".
 3. LAYER GEOMETRY from inside an app (eye_probe; Debug builds only): which layer moved or stuttered, per frame, no pixels.
 
+USE IT BY DEFAULT: this is how you test a macOS app's UI (SwiftUI or AppKit) yourself. After a UI change builds, launch the app and verify it here: find the element, drive it, measure what happened, and report numbers. Don't hand the check to the user ("try it and tell me", "report what you feel"). Only skip the-eye when the user says they'll drive the test.
+
 WHEN TO USE WHAT
 - Find UI / coordinates: eye_inspect {rect} for the element tree of what's visible there, or eye_inspect {} for the element under the pointer. Use the frames it returns as eye_act x/y.
 - A still image: eye_snapshot {rect}. Don't record for a static look.
 - An animation you trigger yourself, step by step: eye_record {rect, label} (returns an id at once, with the AX tree) → eye_act {target_process, steps} (after EVERY step: pointer, element under it, visible extent, fps) → eye_stop → report.
 - A scripted, repeatable run (A/B): eye_record {rect, command:"./drive", lock_input:true, ax:false, label:"A"} (blocks, returns the report), repeat for B, then eye_report {view:"compare", runs:[...]}.
-- Something only the USER can reproduce (real trackpad, timing-sensitive hover): ask the user "Ready?" and wait for yes, then eye_record {rect, label} with NO input lock, let them act, eye_stop. The report lists what the pointer was over over time; eye_report {view:"explain"} ties the worst frames to the cursor/element/main thread.
+- Only when the user says they'll drive the test themselves: ask "Ready?" and wait for yes, then eye_record {rect, label} with NO input lock, let them act, eye_stop. The report lists what the pointer was over over time; eye_report {view:"explain"} ties the worst frames to the cursor/element/main thread.
 - Long background runs: eye_record {..., background:true} → eye_peek every few seconds → eye_stop early if it goes wrong.
 - Re-analyze any run later: eye_report {csv, view: summary|timeline|explain|hover} or {runs, view:"compare"}. Keyframe images: eye_snapshot {csv, t_s} (record with keyframe_ms).
 
 KNOW THESE
 - Coordinates are POINTS, top-left origin. rect is display-local (eye_status lists displays). Pointer, AX frames and eye_act x/y are global; on the main display both are the same.
 - AX costs performance: an AX client makes SwiftUI apps rebuild their accessibility graph (~18% more main-thread time, up to −25% fps). eye_record has ax on by default (off with profile). For final fps numbers or A/B comparisons use ax:false, and compare runs recorded the same way. Reports say when AX was on.
-- eye_act input is synthetic. It reaches apps through a different path than a physical trackpad (event taps, hover shields and pointer-location APIs can see it differently). If a bug doesn't reproduce with eye_act, have the user reproduce it while you record.
+- eye_act input is synthetic. It reaches apps through a different path than a physical trackpad (event taps, hover shields and pointer-location APIs can see it differently). If a bug doesn't reproduce with eye_act, vary it yourself (speeds, phased vs unphased scroll, hover paths, a CGEvent driver via eye_record command) and report what you tried and what each run measured.
 - The pointer position in live data / cursor.csv comes from the window server. An app whose event tap swallows mouse moves (e.g. NOOTCH!'s hover shield over the notch) freezes it, so live hover can lag; eye_act's p is the position it actually posted.
 - The measured extent (a, e) is a pixel difference. Translucent glass over a similar background can measure smaller than the real view: for true bounds use AX frames (eye_inspect, h.frame), and keep wait_until thresholds loose.
-- eye_act safety: presses only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. While its steps run it holds a STRICT lock: the user's trackpad AND keyboard are blocked. lock_input on eye_record blocks only the physical pointer (Esc releases). Never lock while the user should be acting.
+- eye_act safety: presses only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. Every lock (eye_act's automatic one, eye_record lock_input, eye_lock) blocks ALL physical input: trackpad, mouse, gestures, keyboard, media keys, and it pins the cursor. The orange overlay shows exactly while one is held. The user's only way out is Esc 3× (emergency). Never lock while the user should be acting.
 - Needs Screen Recording (capture) and Accessibility (AX, input, lock) permission for the host app.
 - Run files live in ~/Library/Caches/the-eye/runs/<time>_<label>/: frames.csv, cursor.csv, hover.jsonl, ax_tree_start.txt/.json, actions.jsonl, keyframes/.
 
@@ -458,7 +460,7 @@ server.registerTool("eye_status", {
     d.code === 0 ? d.stdout.trim() : `displays: ${(d.stdout + d.stderr).trim()}`,
     `runs dir: ${RUNS}`,
     ...[...jobs.values()].filter(running).map((j) => `${j.id} "${j.label}" ${j.state} (${((now - j.started) / 1000).toFixed(0)}s)${j.ax ? " · ax on" : ""} → ${j.capture.csv}`),
-    ...[...locks.values()].map((l) => `${l.id} ${l.strict ? "STRICT " : ""}locked, ${Math.max(0, (l.until - now) / 1000).toFixed(0)}s left`),
+    ...[...locks.values()].map((l) => `${l.id} locked, ${Math.max(0, (l.until - now) / 1000).toFixed(0)}s left`),
     ...finishedLocks.slice(0, 3).map((r) => `ended ${r}`),
     ...probeRunsStatus(),
     ...diedCaptures.slice(-2).map((x) => `capture ended early: ${x}`),
@@ -562,7 +564,7 @@ server.registerTool("eye_record", {
     seconds: z.number().positive().max(600).optional().describe("Record this long (no command)."),
     command: z.string().optional().describe("Shell command to run while recording (/bin/zsh -lc)."), cwd: z.string().optional(),
     background: z.boolean().optional().describe("Return an id immediately (default: true without command/seconds, false otherwise)."),
-    lock_input: z.boolean().optional().describe("Block the user's PHYSICAL pointer while the command runs (synthetic input passes; Esc releases). Default false."),
+    lock_input: z.boolean().optional().describe("Block ALL the user's physical input (pointer, gestures, keyboard) while the command runs; process-posted input passes. Default false."),
     pre_ms: z.number().optional().describe("Record this long before starting the command (default 500)."),
     post_ms: z.number().optional().describe("Keep recording after the command exits (default 1000)."),
     timeout_s: z.number().positive().max(600).optional().describe("Kill the command after this (default 300)."),
@@ -590,7 +592,7 @@ server.registerTool("eye_record", {
     job.ax ? "AX inspection ON (hover + tree): fps can read lower on SwiftUI apps; use ax:false for final numbers." : "AX inspection off.",
     describeLive(live),
     job.tree ? `observed windows (AX tree, global points):\n${capLines(job.tree, 120, `full tree: ${join(job.capture.dir, "ax_tree_start.txt")}`)}` : "",
-    `next: eye_act {steps, target_process} or let the user act · eye_peek {id:"${job.id}"} · eye_stop {id:"${job.id}"}`,
+    `next: eye_act {steps, target_process} · eye_peek {id:"${job.id}"} · eye_stop {id:"${job.id}"}`,
   ].filter(Boolean).join("\n"));
 });
 
@@ -727,8 +729,8 @@ server.registerTool("eye_act", {
     "moving, fps1, gap1 (ms), p = pointer {x,y}, h = element under the pointer (role, title, description, identifier, value, frame,",
     "path, app, enabled, focused, selected, actions) or null, live = raw live JSON, pr / L('label') = probe layers.",
     "e.g. wait_until {expr:\"h?.identifier=='close'\"}. Find targets first with eye_inspect. SAFETY: presses only on target_process;",
-    "scroll only inside `a` or scroll_zones unless force. Holds a STRICT input lock (user's trackpad + keyboard) while it runs.",
-    "Live visible state needs a running eye_record. Input is synthetic: if a bug only happens with the real trackpad, have the user reproduce it.",
+    "scroll only inside `a` or scroll_zones unless force. Blocks ALL the user's physical input (trackpad + keyboard) while it runs.",
+    "Live visible state needs a running eye_record. Input is synthetic (see the guide if a bug won't reproduce with it).",
   ].join(" "),
   inputSchema: {
     steps: z.array(stepSchema).min(1).max(60),
@@ -738,18 +740,18 @@ server.registerTool("eye_act", {
     label: z.string().optional().describe("Phase name recorded with these steps in the run's action log (eye_report view:'explain' groups by it)."),
     ax: z.boolean().optional().describe("Report the element under the pointer after each step (default: the recording's ax setting, true without a recording)."),
     tree: treeSchema.optional().describe("After the steps, also dump the AX tree of the recorded region (or the window under the pointer). Default none."),
-    lock: z.boolean().optional().describe("Hold a STRICT input lock for exactly the duration of these steps (default true)."),
+    lock: z.boolean().optional().describe("Block all physical input for exactly the duration of these steps (default true)."),
   },
 }, async (p) => {
   let target: { pid: number; name: string } | null = null;
   try { target = p.target_process !== undefined ? await resolvePid(p.target_process) : activeProbeTarget(); }
   catch (e: any) { return fail(e.message); }
   let strictLock: Lock | undefined;
-  // A strict session lock (eye_lock strict) already covers us, including between calls mid-drag.
-  const covered = [...locks.values()].some((l) => l.strict && l.until > Date.now() + 5000);
+  // A session lock (eye_lock / lock_input) already covers us, including between calls mid-drag.
+  const covered = [...locks.values()].some((l) => l.until > Date.now() + 5000);
   if (p.lock !== false && !covered) {
     const budget = p.steps.reduce((t, s) => t + (s.ms ?? 0) + (s.timeout_ms ?? (s.op === "wait_until" ? 2000 : 0)) + (s.hold_ms ?? 0) + 400, 0);
-    strictLock = startLock(Math.min(300, Math.ceil(budget / 1000) + 15), "tagged", true);
+    strictLock = startLock(Math.min(300, Math.ceil(budget / 1000) + 15), "tagged");
     await sleep(150);
     if (strictLock.child.exitCode !== null) return fail(`could not take the input lock: ${await strictLock.done}`);
   }
@@ -921,13 +923,12 @@ server.registerTool("eye_report", {
 
 server.registerTool("eye_lock", {
   title: "Lock / unlock physical input",
-  description: "Block the user's PHYSICAL trackpad/mouse so automated input runs undisturbed (synthetic events pass, keyboard stays live, Esc releases, auto-release after `seconds`). strict also blocks the keyboard and ignores Esc (eye_act takes one automatically while it drives; use a strict session lock only to keep a drag held across several eye_act calls). release:true (or no seconds) releases locks and reports how many physical events were blocked.",
+  description: "Block ALL of the user's physical input — trackpad/mouse, gestures, keyboard, media keys — and pin the cursor, with the orange overlay on every screen, so automated input runs undisturbed (auto-release after `seconds`; emergency release: the user presses Esc 3× within 1.5s). eye_act takes one automatically while it drives; use a session lock to keep input blocked across several eye_act calls (e.g. a drag held between calls) or around your own driver. release:true (or no seconds) releases locks and reports how many physical events were blocked.",
   inputSchema: {
     seconds: z.number().positive().max(600).optional(),
     release: z.boolean().optional(),
     id: z.string().optional().describe("Release only this lock."),
     allow: z.enum(["synthetic", "tagged"]).optional().describe("synthetic (default): any process-posted event passes. tagged: only events with eventSourceUserData 0x45594521."),
-    strict: z.boolean().optional(),
   },
 }, async (p) => {
   if (p.release || !p.seconds) {
@@ -940,12 +941,10 @@ server.registerTool("eye_lock", {
     }
     return text(out.join("\n"));
   }
-  const l = startLock(p.seconds, p.allow ?? "synthetic", !!p.strict);
+  const l = startLock(p.seconds, p.allow ?? "synthetic");
   await sleep(300);
   if (l.child.exitCode !== null) return fail(await l.done);
-  return text(p.strict
-    ? `${l.id}: physical pointer AND keyboard locked for ${p.seconds}s (strict: Esc does not release). eye_lock {release:true} when done.`
-    : `${l.id}: physical pointer locked for ${p.seconds}s (Esc releases). eye_lock {release:true} when done.`);
+  return text(`${l.id}: physical pointer AND keyboard locked for ${p.seconds}s (Esc ×3 = user's emergency release). eye_lock {release:true} when done.`);
 });
 
 registerProbeTools(server, { root: ROOT, runDir, text, fail });

@@ -9,8 +9,9 @@
 //   snapshot --rect x,y,w,h [--display ID] --out shot.png
 //   input    persistent JSON-lines actor: pointer input + AX inspect/tree (see "input actor" below)
 //   lock     [--seconds N] [--allow synthetic|tagged]
-//            Drops PHYSICAL pointer input (moves, clicks, scroll, gestures) until timeout, SIGTERM,
-//            or the user presses Esc. Keyboard stays live. Synthetic events pass: those tagged with
+//            Drops ALL physical input — pointer, trackpad gestures, force touch, keys, modifiers, media
+//            keys — and pins the cursor, until timeout or SIGTERM. Emergency release: Esc three times
+//            within 1.5s (those presses are swallowed too). Synthetic events pass: those tagged with
 //            eventSourceUserData == 0x45594521 ("EYE!"), and with --allow synthetic (default) any
 //            event posted by a process (sourceUnixProcessID != 0).
 //
@@ -872,14 +873,13 @@ let legacyTag: Int64 = 0x4E4E4452
 let pointerTypes: Set<UInt32> = [1, 2, 3, 4, 5, 6, 7, 22, 23, 24, 25, 26, 27, 29, 30, 31, 32]
 var lockTap: CFMachPort?
 var allowSynthetic = true
-/// Strict lock (while a test drives the pointer): the physical keyboard is blocked too (keys, modifiers, media
-/// keys), Esc does NOT release, and only the-eye's tagged events pass. Ends on timeout or signal only.
-var lockStrict = false
-let keyTypes: Set<UInt32> = [10, 11, 12, 14]
+/// Physical Esc presses (mach seconds): three within `panicWindow` end the lock. Each press is still dropped.
+var escPresses: [Double] = []
+let panicWindow = 1.5
 var blocked = 0, passed = 0
 var pidCounts: [Int64: Int] = [:] // source pid → pointer events seen (diagnostics: physical = 0)
 var blockedTypes: [UInt32: Int] = [:]
-/// Strict lock: where the cursor must stay (lock start, then wherever the-eye's own events last put it).
+/// Where the cursor must stay (lock start, then wherever allowed events last put it).
 var heldCursor: CGPoint?
 func lockReport(_ why: String) -> String {
     json(["ended": why, "blocked": blocked, "passed": passed,
@@ -892,12 +892,7 @@ let lockCallback: CGEventTapCallBack = { _, type, event, _ in
         if let t = lockTap { CGEvent.tapEnable(tap: t, enable: true) }
         return Unmanaged.passUnretained(event)
     }
-    if !lockStrict, type == .keyDown, event.getIntegerValueField(.keyboardEventKeycode) == 53 {
-        print(lockReport("escape"))
-        exit(0)
-    }
-    // Strict: EVERY event type is tapped (trackpad gesture phases, force touch, keys, …), not just the pointer list.
-    guard lockStrict || pointerTypes.contains(type.rawValue) else { return Unmanaged.passUnretained(event) }
+    // EVERY event type is tapped (trackpad gesture phases, force touch, keys, media keys, …).
     let tag = event.getIntegerValueField(.eventSourceUserData)
     let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
     pidCounts[pid, default: 0] += 1
@@ -909,23 +904,26 @@ let lockCallback: CGEventTapCallBack = { _, type, event, _ in
     }
     blocked += 1
     blockedTypes[type.rawValue, default: 0] += 1
+    if type == .keyDown, event.getIntegerValueField(.keyboardEventKeycode) == 53,
+       event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+        let now = CACurrentMediaTime()
+        escPresses = escPresses.filter { now - $0 < panicWindow } + [now]
+        if escPresses.count >= 3 {
+            print(lockReport("escape"))
+            exit(0)
+        }
+    }
     // The window server moves the cursor itself before any tap sees the event: dropping the event stops clicks,
-    // not the arrow. In strict mode put it straight back where the test left it.
-    if lockStrict, isMove, let p = heldCursor { CGWarpMouseCursorPosition(p) }
+    // not the arrow. Put it straight back where the test left it.
+    if isMove, let p = heldCursor { CGWarpMouseCursorPosition(p) }
     return nil
 }
 
 func cmdLock() {
     let seconds = min(opt("seconds").flatMap(Double.init) ?? 60, 600)
-    lockStrict = opt("strict") == "1"
-    if lockStrict { heldCursor = CGEvent(source: nil)?.location }
-    allowSynthetic = !lockStrict && (opt("allow") ?? "synthetic") != "tagged"
-    var mask: CGEventMask = lockStrict ? ~CGEventMask(0) : 0
-    for b in 0..<64 where !lockStrict {
-        let t = UInt32(b)
-        let wanted = pointerTypes.contains(t) || b == 10 || (lockStrict && keyTypes.contains(t))
-        if wanted { mask |= CGEventMask(1) << CGEventMask(b) }
-    }
+    heldCursor = CGEvent(source: nil)?.location
+    allowSynthetic = (opt("allow") ?? "synthetic") != "tagged"
+    let mask: CGEventMask = ~CGEventMask(0)
     guard let tap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
                                       eventsOfInterest: mask, callback: lockCallback, userInfo: nil) else {
         fail("cannot create event tap — grant Accessibility permission to the host app")
@@ -933,18 +931,16 @@ func cmdLock() {
     lockTap = tap
     CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
     CGEvent.tapEnable(tap: tap, enable: true)
-    if opt("overlay") != "0" { showLockOverlay(strict: lockStrict, until: Date().addingTimeInterval(seconds)) }
-    if lockStrict {
-        // Backstop for movement that reaches the cursor without a tappable event: re-pin it every 8 ms.
-        let pin = Timer(timeInterval: 0.008, repeats: true) { _ in
-            guard let want = heldCursor, let now = CGEvent(source: nil)?.location else { return }
-            if abs(now.x - want.x) > 0.5 || abs(now.y - want.y) > 0.5 { CGWarpMouseCursorPosition(want) }
-        }
-        RunLoop.main.add(pin, forMode: .common)
+    // The overlay is only ever shown together with this full lock: orange on screen = no physical input gets through.
+    showLockOverlay(until: Date().addingTimeInterval(seconds))
+    // Backstop for movement that reaches the cursor without a tappable event: re-pin it every 8 ms.
+    let pin = Timer(timeInterval: 0.008, repeats: true) { _ in
+        guard let want = heldCursor, let now = CGEvent(source: nil)?.location else { return }
+        if abs(now.x - want.x) > 0.5 || abs(now.y - want.y) > 0.5 { CGWarpMouseCursorPosition(want) }
     }
-    FileHandle.standardError.write((lockStrict
-        ? "eye-capture: physical pointer + keyboard locked for \(seconds)s (strict: no Esc)\n"
-        : "eye-capture: physical pointer locked for \(seconds)s (Esc ends)\n").data(using: .utf8)!)
+    RunLoop.main.add(pin, forMode: .common)
+    FileHandle.standardError.write("eye-capture: physical pointer + keyboard locked for \(seconds)s (Esc ×3 = emergency release)\n"
+        .data(using: .utf8)!)
     let end: (String) -> Void = { why in
         print(lockReport(why))
         exit(0)
@@ -957,14 +953,12 @@ func cmdLock() {
 /// sweeping sheen, a frame, and a bottom-centre pill with a pulsing dot. Click-through, every Space, every display,
 /// and excluded from sharing, so screen captures never see it (it never adds pixels to a measurement).
 var lockOverlayWindows: [NSWindow] = []
-func showLockOverlay(strict: Bool, until: Date) {
+func showLockOverlay(until: Date) {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     app.finishLaunching()
     let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
-    let message = strict
-        ? "the-eye is testing — trackpad & keyboard locked until \(f.string(from: until))"
-        : "the-eye is testing — trackpad locked until \(f.string(from: until)) · Esc releases"
+    let message = "the-eye is testing — trackpad & keyboard locked until \(f.string(from: until)) · Esc ×3 releases"
     let orange = NSColor(srgbRed: 1, green: 0.55, blue: 0.1, alpha: 0.95).cgColor
     for screen in NSScreen.screens {
         let fr = screen.frame

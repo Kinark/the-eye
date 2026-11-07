@@ -27,7 +27,7 @@ try {
   log("probe", st);
   if (st.startsWith("ERROR")) throw new Error("probe did not start");
   probeFile = st.match(/→ (\S+\.ndjson)/)[1];
-  log("lock", await call("eye_lock", { seconds: 90, strict: true }));
+  log("lock", await call("eye_lock", { seconds: 90 }));
 
   const nookOpen = "pr && pr.watched.some(w => w.rect && w.label.includes('PublicGlassHostView') && w.rect[3] > 120)";
   log("open", await call("eye_act", { label: "open", steps: [
