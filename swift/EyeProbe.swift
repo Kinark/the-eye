@@ -326,7 +326,8 @@ private func round3(_ d: Double) -> Double { d.isFinite ? (d * 1000).rounded() /
 private func num(_ d: Double) -> String {
     guard d.isFinite else { return "null" }
     let v = (d * 1000).rounded() / 1000
-    return v == v.rounded() ? String(Int(v)) : String(v)
+    // Int(_:) traps beyond ±2^63, and some layers report effectively infinite bounds (~1e308).
+    return v == v.rounded() && abs(v) < 1e15 ? String(Int(v)) : String(v)
 }
 private func json(_ s: String) -> String {
     let data = try? JSONSerialization.data(withJSONObject: [s], options: [])
