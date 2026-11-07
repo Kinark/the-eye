@@ -78,7 +78,8 @@ type Capture = {
   trace?: Trace; profileNote?: string; stopping?: boolean;
 };
 const captures = new Map<string, Capture>();
-type Lock = { id: string; child: ChildProcess; done: Promise<string>; until: number };
+/** `ready` resolves true once the countdown is over and input is actually blocked (false if the helper died). */
+type Lock = { id: string; child: ChildProcess; done: Promise<string>; ready: Promise<boolean>; until: number };
 const locks = new Map<string, Lock>();
 const finishedLocks: string[] = []; // reports of locks that ended on their own (timeout / Esc)
 const diedCaptures: string[] = [];
@@ -180,13 +181,21 @@ async function stopCapture(c: Capture) {
   return out;
 }
 
+const LOCK_COUNTDOWN_MS = 1500;
 /** Every lock blocks ALL physical input (pointer, gestures, keyboard) and shows the orange overlay. */
 function startLock(seconds: number, allow: "synthetic" | "tagged"): Lock {
   ensureBinary();
   const args = ["lock", "--seconds", String(seconds), "--allow", allow];
   const child = spawn(BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
   const id = `lock${++seq}`;
-  const l: Lock = { id, child, done: collect(child), until: Date.now() + seconds * 1000 };
+  // The helper shows a 3·2·1 warning (0.5s per number) and then prints "locked" on stderr.
+  const ready = new Promise<boolean>((res) => {
+    let err = "";
+    child.stderr?.on("data", (d) => { err += d; if (err.includes("locked for")) res(true); });
+    child.on("close", () => res(false));
+    setTimeout(() => res(child.exitCode === null), 6000);
+  });
+  const l: Lock = { id, child, done: collect(child), ready, until: Date.now() + LOCK_COUNTDOWN_MS + seconds * 1000 };
   locks.set(id, l);
   l.done.then((r) => { finishedLocks.unshift(`${id}: ${r}`); finishedLocks.length = Math.min(finishedLocks.length, 10); })
     .finally(() => locks.delete(id));
@@ -354,6 +363,7 @@ function startJob(p: RecordParams): Job {
       if (t.ok) writeFileSync(join(c.dir, "ax_tree_start.txt"), t.text);
     }
     await pre;
+    if (job.lock) await job.lock.ready;
     if (!job.stopped) {
       job.state = "running";
       if (hasCmd) {
@@ -439,7 +449,7 @@ KNOW THESE
 - eye_act input is synthetic. It reaches apps through a different path than a physical trackpad (event taps, hover shields and pointer-location APIs can see it differently). If a bug doesn't reproduce with eye_act, vary it yourself (speeds, phased vs unphased scroll, hover paths, a CGEvent driver via eye_record command) and report what you tried and what each run measured.
 - The pointer position in live data / cursor.csv comes from the window server. An app whose event tap swallows mouse moves (e.g. NOOTCH!'s hover shield over the notch) freezes it, so live hover can lag; eye_act's p is the position it actually posted.
 - The measured extent (a, e) is a pixel difference. Translucent glass over a similar background can measure smaller than the real view: for true bounds use AX frames (eye_inspect, h.frame), and keep wait_until thresholds loose.
-- eye_act safety: presses only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. Every lock (eye_act's automatic one, eye_record lock_input, eye_lock) blocks ALL physical input: trackpad, mouse, gestures, keyboard, media keys, and it pins the cursor. The orange overlay shows exactly while one is held. The user's only way out is Esc 3× (emergency). Never lock while the user should be acting.
+- eye_act safety: presses only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. Every lock (eye_act's automatic one, eye_record lock_input, eye_lock) blocks ALL physical input: trackpad, mouse, gestures, keyboard, media keys, and it pins the cursor. Each lock starts with a 1.5s on-screen 3·2·1 warning (0.5s per number); calls wait for it, so budget ~1.5s per eye_act call that takes its own lock (a session eye_lock pays it once). The orange overlay shows exactly while one is held. The user's only way out is Esc 3× (emergency). Never lock while the user should be acting.
 - Needs Screen Recording (capture) and Accessibility (AX, input, lock) permission for the host app.
 - Run files live in ~/Library/Caches/the-eye/runs/<time>_<label>/: frames.csv, cursor.csv, hover.jsonl, ax_tree_start.txt/.json, actions.jsonl, keyframes/.
 
@@ -748,12 +758,12 @@ server.registerTool("eye_act", {
   catch (e: any) { return fail(e.message); }
   let strictLock: Lock | undefined;
   // A session lock (eye_lock / lock_input) already covers us, including between calls mid-drag.
-  const covered = [...locks.values()].some((l) => l.until > Date.now() + 5000);
+  const cover = [...locks.values()].find((l) => l.until > Date.now() + 5000);
+  const covered = !!cover && (await cover.ready);
   if (p.lock !== false && !covered) {
     const budget = p.steps.reduce((t, s) => t + (s.ms ?? 0) + (s.timeout_ms ?? (s.op === "wait_until" ? 2000 : 0)) + (s.hold_ms ?? 0) + 400, 0);
     strictLock = startLock(Math.min(300, Math.ceil(budget / 1000) + 15), "tagged");
-    await sleep(150);
-    if (strictLock.child.exitCode !== null) return fail(`could not take the input lock: ${await strictLock.done}`);
+    if (!(await strictLock.ready)) return fail(`could not take the input lock: ${await strictLock.done}`);
   }
   try { return await actSteps(p, target); }
   finally { if (strictLock) await stopLock(strictLock); }
@@ -923,7 +933,7 @@ server.registerTool("eye_report", {
 
 server.registerTool("eye_lock", {
   title: "Lock / unlock physical input",
-  description: "Block ALL of the user's physical input — trackpad/mouse, gestures, keyboard, media keys — and pin the cursor, with the orange overlay on every screen, so automated input runs undisturbed (auto-release after `seconds`; emergency release: the user presses Esc 3× within 1.5s). eye_act takes one automatically while it drives; use a session lock to keep input blocked across several eye_act calls (e.g. a drag held between calls) or around your own driver. release:true (or no seconds) releases locks and reports how many physical events were blocked.",
+  description: "Block ALL of the user's physical input — trackpad/mouse, gestures, keyboard, media keys — and pin the cursor, with the orange overlay on every screen (after a 1.5s 3·2·1 warning), so automated input runs undisturbed (auto-release after `seconds`; emergency release: the user presses Esc 3× within 1.5s). eye_act takes one automatically while it drives; use a session lock to keep input blocked across several eye_act calls (e.g. a drag held between calls) or around your own driver. release:true (or no seconds) releases locks and reports how many physical events were blocked.",
   inputSchema: {
     seconds: z.number().positive().max(600).optional(),
     release: z.boolean().optional(),
@@ -942,8 +952,7 @@ server.registerTool("eye_lock", {
     return text(out.join("\n"));
   }
   const l = startLock(p.seconds, p.allow ?? "synthetic");
-  await sleep(300);
-  if (l.child.exitCode !== null) return fail(await l.done);
+  if (!(await l.ready)) return fail(await l.done);
   return text(`${l.id}: physical pointer AND keyboard locked for ${p.seconds}s (Esc ×3 = user's emergency release). eye_lock {release:true} when done.`);
 });
 

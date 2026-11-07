@@ -8,8 +8,9 @@
 //            SIGINT/SIGTERM, then writes run.csv.meta.json and prints it.
 //   snapshot --rect x,y,w,h [--display ID] --out shot.png
 //   input    persistent JSON-lines actor: pointer input + AX inspect/tree (see "input actor" below)
-//   lock     [--seconds N] [--allow synthetic|tagged]
-//            Drops ALL physical input — pointer, trackpad gestures, force touch, keys, modifiers, media
+//   lock     [--seconds N] [--allow synthetic|tagged] [--countdown 3]
+//            Warns first with a 3·2·1 countdown (0.5s per number; --countdown 0 skips it), then
+//            drops ALL physical input — pointer, trackpad gestures, force touch, keys, modifiers, media
 //            keys — and pins the cursor, until timeout or SIGTERM. Emergency release: Esc three times
 //            within 1.5s (those presses are swallowed too). Synthetic events pass: those tagged with
 //            eventSourceUserData == 0x45594521 ("EYE!"), and with --allow synthetic (default) any
@@ -921,32 +922,108 @@ let lockCallback: CGEventTapCallBack = { _, type, event, _ in
 
 func cmdLock() {
     let seconds = min(opt("seconds").flatMap(Double.init) ?? 60, 600)
-    heldCursor = CGEvent(source: nil)?.location
+    let countdown = max(0, Int(opt("countdown") ?? "3") ?? 3)
     allowSynthetic = (opt("allow") ?? "synthetic") != "tagged"
     let mask: CGEventMask = ~CGEventMask(0)
+    // Created up front (disabled) so a missing Accessibility permission fails before any countdown.
     guard let tap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
                                       eventsOfInterest: mask, callback: lockCallback, userInfo: nil) else {
         fail("cannot create event tap — grant Accessibility permission to the host app")
     }
+    CGEvent.tapEnable(tap: tap, enable: false)
     lockTap = tap
     CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
-    CGEvent.tapEnable(tap: tap, enable: true)
-    // The overlay is only ever shown together with this full lock: orange on screen = no physical input gets through.
-    showLockOverlay(until: Date().addingTimeInterval(seconds))
-    // Backstop for movement that reaches the cursor without a tappable event: re-pin it every 8 ms.
-    let pin = Timer(timeInterval: 0.008, repeats: true) { _ in
-        guard let want = heldCursor, let now = CGEvent(source: nil)?.location else { return }
-        if abs(now.x - want.x) > 0.5 || abs(now.y - want.y) > 0.5 { CGWarpMouseCursorPosition(want) }
-    }
-    RunLoop.main.add(pin, forMode: .common)
-    FileHandle.standardError.write("eye-capture: physical pointer + keyboard locked for \(seconds)s (Esc ×3 = emergency release)\n"
-        .data(using: .utf8)!)
     let end: (String) -> Void = { why in
         print(lockReport(why))
         exit(0)
     }
     onTerminate { end("signal") }
-    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { end("timeout") }
+    let engage = {
+        heldCursor = CGEvent(source: nil)?.location
+        CGEvent.tapEnable(tap: tap, enable: true)
+        // The overlay is only ever shown together with this full lock: orange on screen = no physical input gets through.
+        showLockOverlay(until: Date().addingTimeInterval(seconds))
+        // Backstop for movement that reaches the cursor without a tappable event: re-pin it every 8 ms.
+        let pin = Timer(timeInterval: 0.008, repeats: true) { _ in
+            guard let want = heldCursor, let now = CGEvent(source: nil)?.location else { return }
+            if abs(now.x - want.x) > 0.5 || abs(now.y - want.y) > 0.5 { CGWarpMouseCursorPosition(want) }
+        }
+        RunLoop.main.add(pin, forMode: .common)
+        // The TS side waits for this line before it drives anything.
+        FileHandle.standardError.write("eye-capture: physical pointer + keyboard locked for \(seconds)s (Esc ×3 = emergency release)\n"
+            .data(using: .utf8)!)
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { end("timeout") }
+    }
+    if countdown > 0 { showLockCountdown(from: countdown, step: 0.5, then: engage) } else { engage() }
+}
+
+/// Warning before a lock: a big "3 · 2 · 1" in the centre of every screen, one number per `step` seconds, input
+/// still free. Excluded from sharing like the lock overlay.
+func showLockCountdown(from n: Int, step: Double, then done: @escaping () -> Void) {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    app.finishLaunching()
+    var numbers: [CATextLayer] = []
+    var windows: [NSWindow] = []
+    let orange = NSColor(srgbRed: 1, green: 0.55, blue: 0.1, alpha: 0.95)
+    for screen in NSScreen.screens {
+        let fr = screen.frame
+        let w = NSWindow(contentRect: fr, styleMask: [.borderless], backing: .buffered, defer: false)
+        w.isOpaque = false; w.backgroundColor = .clear; w.hasShadow = false
+        w.ignoresMouseEvents = true
+        w.level = .screenSaver
+        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        w.sharingType = .none
+        w.animationBehavior = .none
+        let v = NSView(frame: NSRect(origin: .zero, size: fr.size))
+        v.wantsLayer = true
+        let root = v.layer!
+        let frameLayer = CALayer(); frameLayer.frame = CGRect(origin: .zero, size: fr.size)
+        frameLayer.borderColor = orange.withAlphaComponent(0.6).cgColor; frameLayer.borderWidth = 3
+        root.addSublayer(frameLayer)
+        let disc = CALayer()
+        disc.frame = CGRect(x: fr.width / 2 - 90, y: fr.height / 2 - 90, width: 180, height: 180)
+        disc.cornerRadius = 90; disc.backgroundColor = NSColor(white: 0, alpha: 0.55).cgColor
+        disc.borderColor = orange.cgColor; disc.borderWidth = 4
+        root.addSublayer(disc)
+        let num = CATextLayer()
+        num.contentsScale = screen.backingScaleFactor
+        num.alignmentMode = .center
+        num.frame = CGRect(x: 0, y: 32, width: 180, height: 120)
+        disc.addSublayer(num)
+        numbers.append(num)
+        let caption = "the-eye takes over trackpad & keyboard"
+        let font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        let cw = (caption as NSString).size(withAttributes: [.font: font]).width + 32
+        let cap = CATextLayer()
+        cap.string = NSAttributedString(string: caption, attributes: [.font: font, .foregroundColor: orange])
+        cap.contentsScale = screen.backingScaleFactor
+        cap.alignmentMode = .center
+        cap.frame = CGRect(x: (fr.width - cw) / 2, y: fr.height / 2 - 130, width: cw, height: 22)
+        root.addSublayer(cap)
+        w.contentView = v
+        w.orderFrontRegardless()
+        windows.append(w)
+    }
+    let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 96, weight: .heavy)
+    func show(_ k: Int) {
+        for l in numbers {
+            l.string = NSAttributedString(string: "\(k)", attributes: [.font: numberFont, .foregroundColor: orange])
+            let pop = CABasicAnimation(keyPath: "transform.scale")
+            pop.fromValue = 1.35; pop.toValue = 1; pop.duration = min(0.25, step / 2)
+            pop.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            l.add(pop, forKey: "pop")
+        }
+    }
+    for i in 0..<n {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * step) {
+            CATransaction.begin(); CATransaction.setDisableActions(true); show(n - i); CATransaction.commit()
+        }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + Double(n) * step) {
+        windows.forEach { $0.orderOut(nil) }
+        done()
+    }
 }
 
 /// Tells the user a test owns their input: a translucent orange wash over every screen, a breathing edge glow, a

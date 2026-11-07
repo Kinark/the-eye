@@ -124,7 +124,8 @@ Interactive loop: `eye_inspect` (find targets) → `eye_record` → repeat `eye_
 
 Every lock (`eye_act`'s automatic one, `eye_record lock_input`, `eye_lock`) taps every event type and drops
 all physical input whose source process ID is 0: pointer, scroll, trackpad gestures, force touch, keys, modifiers and
-media keys. It also pins the cursor. The orange overlay is shown exactly while a lock is held, so orange on screen
+media keys. It also pins the cursor. Before blocking, it shows a 3·2·1 countdown in the middle of every screen (0.5s per
+number, 1.5s total) while input is still free; the tools wait for it. The orange overlay is shown exactly while a lock is held, so orange on screen
 means no physical input gets through. The user's emergency release is Esc three times within 1.5s (those presses
 are swallowed too). Its result includes `pointer_events_by_source_pid` and `blocked_by_event_type`, so you can
 check what it saw. Keystrokes typed while macOS Secure Input is on (a focused password field) bypass every event
