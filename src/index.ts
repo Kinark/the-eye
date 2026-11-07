@@ -449,7 +449,7 @@ KNOW THESE
 - eye_act input is synthetic. It reaches apps through a different path than a physical trackpad (event taps, hover shields and pointer-location APIs can see it differently). If a bug doesn't reproduce with eye_act, vary it yourself (speeds, phased vs unphased scroll, hover paths, a CGEvent driver via eye_record command) and report what you tried and what each run measured.
 - The pointer position in live data / cursor.csv comes from the window server. An app whose event tap swallows mouse moves (e.g. NOOTCH!'s hover shield over the notch) freezes it, so live hover can lag; eye_act's p is the position it actually posted.
 - The measured extent (a, e) is a pixel difference. Translucent glass over a similar background can measure smaller than the real view: for true bounds use AX frames (eye_inspect, h.frame), and keep wait_until thresholds loose.
-- eye_act safety: presses only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. Every lock (eye_act's automatic one, eye_record lock_input, eye_lock) blocks ALL physical input: trackpad, mouse, gestures, keyboard, media keys, and it pins the cursor. Each lock starts with a 1.5s on-screen 3·2·1 warning (0.5s per number); calls wait for it, so budget ~1.5s per eye_act call that takes its own lock (a session eye_lock pays it once). The orange overlay shows exactly while one is held. The user's only way out is Esc 3× (emergency). Never lock while the user should be acting.
+- eye_act safety: presses only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. Every lock (eye_act's automatic one, eye_record lock_input, eye_lock) blocks ALL physical input: trackpad, mouse, gestures, keyboard, media keys, and it pins the cursor. Each lock starts with a 1.5s on-screen 3·2·1 warning (0.5s per number); calls wait for it, so budget ~1.5s per eye_act call that takes its own lock (a session eye_lock pays it once). The orange overlay shows exactly while one is held. The user's only way out is Esc 6× in a row, ≤1s apart (emergency; the overlay shows the count). Never lock while the user should be acting.
 - Needs Screen Recording (capture) and Accessibility (AX, input, lock) permission for the host app.
 - Run files live in ~/Library/Caches/the-eye/runs/<time>_<label>/: frames.csv, cursor.csv, hover.jsonl, ax_tree_start.txt/.json, actions.jsonl, keyframes/.
 
@@ -933,7 +933,7 @@ server.registerTool("eye_report", {
 
 server.registerTool("eye_lock", {
   title: "Lock / unlock physical input",
-  description: "Block ALL of the user's physical input — trackpad/mouse, gestures, keyboard, media keys — and pin the cursor, with the orange overlay on every screen (after a 1.5s 3·2·1 warning), so automated input runs undisturbed (auto-release after `seconds`; emergency release: the user presses Esc 3× within 1.5s). eye_act takes one automatically while it drives; use a session lock to keep input blocked across several eye_act calls (e.g. a drag held between calls) or around your own driver. release:true (or no seconds) releases locks and reports how many physical events were blocked.",
+  description: "Block ALL of the user's physical input — trackpad/mouse, gestures, keyboard, media keys — and pin the cursor, with the orange overlay on every screen (after a 1.5s 3·2·1 warning), so automated input runs undisturbed (auto-release after `seconds`; emergency release: the user presses Esc 6× in a row, ≤1s apart). eye_act takes one automatically while it drives; use a session lock to keep input blocked across several eye_act calls (e.g. a drag held between calls) or around your own driver. release:true (or no seconds) releases locks and reports how many physical events were blocked.",
   inputSchema: {
     seconds: z.number().positive().max(600).optional(),
     release: z.boolean().optional(),
@@ -953,7 +953,7 @@ server.registerTool("eye_lock", {
   }
   const l = startLock(p.seconds, p.allow ?? "synthetic");
   if (!(await l.ready)) return fail(await l.done);
-  return text(`${l.id}: physical pointer AND keyboard locked for ${p.seconds}s (Esc ×3 = user's emergency release). eye_lock {release:true} when done.`);
+  return text(`${l.id}: physical pointer AND keyboard locked for ${p.seconds}s (Esc ×6 = user's emergency release). eye_lock {release:true} when done.`);
 });
 
 registerProbeTools(server, { root: ROOT, runDir, text, fail });

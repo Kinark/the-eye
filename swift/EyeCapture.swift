@@ -11,8 +11,8 @@
 //   lock     [--seconds N] [--allow synthetic|tagged] [--countdown 3]
 //            Warns first with a 3·2·1 countdown (0.5s per number; --countdown 0 skips it), then
 //            drops ALL physical input — pointer, trackpad gestures, force touch, keys, modifiers, media
-//            keys — and pins the cursor, until timeout or SIGTERM. Emergency release: Esc three times
-//            within 1.5s (those presses are swallowed too). Synthetic events pass: those tagged with
+//            keys — and pins the cursor, until timeout or SIGTERM. Emergency release: Esc six times
+//            in a row, ≤1s apart (those presses are swallowed too; the overlay shows the count). Synthetic events pass: those tagged with
 //            eventSourceUserData == 0x45594521 ("EYE!"), and with --allow synthetic (default) any
 //            event posted by a process (sourceUnixProcessID != 0).
 //
@@ -874,9 +874,12 @@ let legacyTag: Int64 = 0x4E4E4452
 let pointerTypes: Set<UInt32> = [1, 2, 3, 4, 5, 6, 7, 22, 23, 24, 25, 26, 27, 29, 30, 31, 32]
 var lockTap: CFMachPort?
 var allowSynthetic = true
-/// Physical Esc presses (mach seconds): three within `panicWindow` end the lock. Each press is still dropped.
-var escPresses: [Double] = []
-let panicWindow = 1.5
+/// Emergency release: `panicCount` physical Esc presses in a row, each within `panicGap` seconds of the previous.
+/// Each press is still dropped. The overlay pill shows the streak as filling dots.
+let panicCount = 6
+let panicGap = 1.0
+var escStreak = 0
+var escLast = 0.0
 var blocked = 0, passed = 0
 var pidCounts: [Int64: Int] = [:] // source pid → pointer events seen (diagnostics: physical = 0)
 var blockedTypes: [UInt32: Int] = [:]
@@ -908,10 +911,16 @@ let lockCallback: CGEventTapCallBack = { _, type, event, _ in
     if type == .keyDown, event.getIntegerValueField(.keyboardEventKeycode) == 53,
        event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
         let now = CACurrentMediaTime()
-        escPresses = escPresses.filter { now - $0 < panicWindow } + [now]
-        if escPresses.count >= 3 {
+        escStreak = now - escLast < panicGap ? escStreak + 1 : 1
+        escLast = now
+        showEscStreak(escStreak)
+        if escStreak >= panicCount {
             print(lockReport("escape"))
             exit(0)
+        }
+        // Streak expired: empty the dots again.
+        DispatchQueue.main.asyncAfter(deadline: .now() + panicGap) {
+            if CACurrentMediaTime() - escLast >= panicGap - 0.01 { escStreak = 0; showEscStreak(0) }
         }
     }
     // The window server moves the cursor itself before any tap sees the event: dropping the event stops clicks,
@@ -950,7 +959,7 @@ func cmdLock() {
         }
         RunLoop.main.add(pin, forMode: .common)
         // The TS side waits for this line before it drives anything.
-        FileHandle.standardError.write("eye-capture: physical pointer + keyboard locked for \(seconds)s (Esc ×3 = emergency release)\n"
+        FileHandle.standardError.write("eye-capture: physical pointer + keyboard locked for \(seconds)s (Esc ×6 = emergency release)\n"
             .data(using: .utf8)!)
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { end("timeout") }
     }
@@ -1030,12 +1039,47 @@ func showLockCountdown(from n: Int, step: Double, then done: @escaping () -> Voi
 /// sweeping sheen, a frame, and a bottom-centre pill with a pulsing dot. Click-through, every Space, every display,
 /// and excluded from sharing, so screen captures never see it (it never adds pixels to a measurement).
 var lockOverlayWindows: [NSWindow] = []
+let escDotPitch: CGFloat = 14
+/// Per screen: the pill, its Esc-progress dots, and the "keep pressing" hint above it.
+var escFeedback: [(pill: CALayer, dots: [CALayer], hint: CATextLayer)] = []
+
+/// Shows how far the user is into the Esc emergency release (0 = idle).
+func showEscStreak(_ n: Int) {
+    CATransaction.begin()
+    CATransaction.setAnimationDuration(0.12)
+    let hintFont = NSFont.systemFont(ofSize: 14, weight: .bold)
+    let left = panicCount - n
+    let hintText = left <= 1 ? "Esc once more to release" : "Esc \(n)/\(panicCount) · \(left) more to release"
+    for f in escFeedback {
+        for (i, d) in f.dots.enumerated() {
+            d.backgroundColor = i < n ? NSColor.black.cgColor : NSColor.clear.cgColor
+        }
+        f.hint.string = NSAttributedString(string: hintText, attributes: [
+            .font: hintFont, .foregroundColor: NSColor(srgbRed: 1, green: 0.6, blue: 0.15, alpha: 1),
+            .strokeColor: NSColor.black, .strokeWidth: -3,
+        ])
+        f.hint.opacity = n > 0 ? 1 : 0
+        if n > 0 {
+            let pop = CABasicAnimation(keyPath: "transform.scale")
+            pop.fromValue = 1.08; pop.toValue = 1; pop.duration = 0.18
+            pop.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            f.pill.add(pop, forKey: "esc")
+            if n - 1 < f.dots.count {
+                let dp = CABasicAnimation(keyPath: "transform.scale")
+                dp.fromValue = 1.8; dp.toValue = 1; dp.duration = 0.2
+                f.dots[n - 1].add(dp, forKey: "esc")
+            }
+        }
+    }
+    CATransaction.commit()
+}
+
 func showLockOverlay(until: Date) {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     app.finishLaunching()
     let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
-    let message = "the-eye is testing — trackpad & keyboard locked until \(f.string(from: until)) · Esc ×3 releases"
+    let message = "the-eye is testing — trackpad & keyboard locked until \(f.string(from: until)) · Esc ×\(panicCount) releases"
     let orange = NSColor(srgbRed: 1, green: 0.55, blue: 0.1, alpha: 0.95).cgColor
     for screen in NSScreen.screens {
         let fr = screen.frame
@@ -1088,7 +1132,8 @@ func showLockOverlay(until: Date) {
         let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         let textW = (message as NSString).size(withAttributes: [.font: font]).width
         let pill = CALayer()
-        pill.frame = CGRect(x: (fr.width - textW - 56) / 2, y: 22, width: textW + 56, height: 32)
+        let escW = CGFloat(panicCount) * escDotPitch + 4
+        pill.frame = CGRect(x: (fr.width - textW - 56 - escW) / 2, y: 22, width: textW + 56 + escW, height: 32)
         pill.backgroundColor = orange; pill.cornerRadius = 16
         pill.shadowColor = tint(1); pill.shadowOpacity = 0.8; pill.shadowRadius = 14; pill.shadowOffset = .zero
         pill.shadowPath = CGPath(roundedRect: pill.bounds, cornerWidth: 16, cornerHeight: 16, transform: nil)
@@ -1107,7 +1152,23 @@ func showLockOverlay(until: Date) {
         text.alignmentMode = .center
         text.frame = CGRect(x: 30, y: 8, width: textW + 14, height: 18)
         pill.addSublayer(text)
+        // Emergency-release progress: one ring per Esc press needed, filled as the streak grows.
+        var dots: [CALayer] = []
+        for i in 0..<panicCount {
+            let d = CALayer()
+            d.frame = CGRect(x: textW + 50 + CGFloat(i) * escDotPitch, y: 11.5, width: 9, height: 9)
+            d.cornerRadius = 4.5; d.borderWidth = 1.5; d.borderColor = NSColor.black.cgColor
+            pill.addSublayer(d)
+            dots.append(d)
+        }
+        let hint = CATextLayer()
+        hint.contentsScale = screen.backingScaleFactor
+        hint.alignmentMode = .center
+        hint.frame = CGRect(x: 0, y: pill.frame.maxY + 10, width: fr.width, height: 22)
+        hint.opacity = 0
+        root.addSublayer(hint)
         root.addSublayer(pill)
+        escFeedback.append((pill, dots, hint))
         w.contentView = v
         w.orderFrontRegardless()
         lockOverlayWindows.append(w)
