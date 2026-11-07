@@ -1,0 +1,11 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+const client = new Client({ name: "t", version: "1" });
+await client.connect(new StdioClientTransport({ command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname] }));
+const call = async (name, args = {}) => { const r = await client.callTool({ name, arguments: args }); return (r.isError ? "ERROR: " : "") + r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n"); };
+console.log(await call("eye_snapshot", { rect: { x: 410, y: 0, w: 700, h: 220 } }));
+console.log(await call("eye_start", { rect: { x: 540, y: 0, w: 122, h: 122 }, label: "t", max_seconds: 40, keyframe_ms: 25, cursor: false }));
+await new Promise(r => setTimeout(r, 1000));
+console.log(await call("eye_status"));
+console.log((await call("eye_stop")).slice(0, 400));
+await client.close();
