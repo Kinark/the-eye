@@ -120,7 +120,19 @@ changed extent, `p` is the pointer and `h` the element under it.
 
 Interactive loop: `eye_inspect` (find targets) → `eye_record` → repeat `eye_act` (act → read numbers + element → decide) → `eye_stop`.
 
-### Input lock and drivers
+### One at a time
+
+- **One driving session.** Every MCP client starts its own the-eye server, but there is one screen and one pointer.
+  `eye_act`, `eye_lock`, `eye_record` and `eye_probe` take a lease in `~/Library/Caches/the-eye/driver.json`. It is
+  renewed by each driving call, kept while a recording, lock or probe runs, and released when the session ends or 60s
+  after its last driving call. Another server's driving call fails with `BUSY` and names the holder; read-only tools
+  (`eye_inspect`, `eye_snapshot`, `eye_status`, `eye_report`, `eye_peek`, `eye_stop`) always work.
+- **One copy of the app under test.** `eye_act` (its `target_process`, or the probe's target), `eye_probe` and
+  `eye_record {process}` refuse when that app runs more than once (same executable name), listing every copy.
+  `duplicates: "quit_others"` keeps the pid you named, or else the newest launch, and quits the rest;
+  `duplicates: "allow"` skips the check. Test: `test/single.mjs`.
+
+## Input lock and drivers
 
 Every lock (`eye_act`'s automatic one, `eye_record lock_input`, `eye_lock`) taps every event type and drops
 all physical input whose source process ID is 0: pointer, scroll, trackpad gestures, force touch, keys, modifiers and

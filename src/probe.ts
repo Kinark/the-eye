@@ -7,6 +7,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileS
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
+import { claimDriver, duplicatesSchemaDescription, ensureSingleInstance } from "./single.ts";
 
 type Deps = {
   root: string;
@@ -332,9 +333,14 @@ export function registerProbeTools(server: any, d: Deps) {
       max_seconds: z.number().positive().max(600).optional().describe("Safety stop (default 60)."),
       max_layers: z.number().int().positive().optional().describe("Max layers walked per frame (default 6000)."),
       full_walk: z.boolean().optional().describe("Walk the whole layer tree every frame. Default false when match is given (the tree is re-walked every 30 frames; new layers can take up to 30 frames to appear)."),
+      duplicates: z.enum(["refuse", "quit_others", "allow"]).optional().describe(duplicatesSchemaDescription),
     },
   }, async (p: any) => {
     try {
+      const busy = claimDriver("eye_probe");
+      if (busy) return fail(busy);
+      const dup = ensureSingleInstance(p.process, p.duplicates);
+      if (dup) return fail(dup);
       const t = await resolveTarget(p.process);
       const built = await buildProbe();
       const v = built.v;

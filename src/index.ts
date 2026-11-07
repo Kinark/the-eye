@@ -17,6 +17,7 @@ import {
   activeProbeLive, activeProbeTarget, analyzeProbe, describeProbeLive, isProbeRun, peekProbe, probeRunIds, probeRunsStatus,
   registerProbeTools, resolvePid, stopProbes,
 } from "./probe.ts";
+import { claimDriver, driverStatus, duplicatesSchemaDescription, ensureSingleInstance, releaseDriver, startLeaseHeartbeat } from "./single.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = join(ROOT, "bin", "eye-capture");
@@ -469,6 +470,8 @@ KNOW THESE
 - The pointer position in live data / cursor.csv comes from the window server. An app whose event tap swallows mouse moves (e.g. NOOTCH!'s hover shield over the notch) freezes it, so live hover can lag; eye_act's p is the position it actually posted.
 - The measured extent (a, e) is a pixel difference. Translucent glass over a similar background can measure smaller than the real view: for true bounds use AX frames (eye_inspect, h.frame), and keep wait_until thresholds loose.
 - eye_act safety: presses only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. Every lock (eye_act's automatic one, eye_record lock_input, eye_lock) blocks ALL physical input: trackpad, mouse, gestures, keyboard, media keys, and it pins the cursor. Each lock starts with a 1.5s on-screen 3·2·1 warning (0.5s per number); calls wait for it, so budget ~1.5s per eye_act call that takes its own lock (a session eye_lock pays it once). The orange overlay shows exactly while one is held. The user's only way out is Esc 6× in a row, ≤1s apart (emergency; the overlay shows the count). Never lock while the user should be acting.
+- ONE AT A TIME. Only one agent session drives the screen: eye_act, eye_lock, eye_record and eye_probe take a shared lease (renewed by each call, kept while a recording/lock/probe runs, released 60s after your last driving call or when your session ends). Another session gets "BUSY …": wait and retry, don't fight it. Read-only tools always work. eye_status shows who holds it.
+- ONE APP COPY. eye_act (target_process / probe target), eye_probe and eye_record {process} refuse when the target app runs more than once (an Xcode run + an \`open\`, a stale launch): presses and measurements could hit the wrong copy. Pass duplicates:"quit_others" to keep the newest (or the pid you named) and quit the rest. Before launching the app yourself, check it isn't already running.
 - Needs Screen Recording (capture) and Accessibility (AX, input, lock) permission for the host app.
 - Run files live in ~/Library/Caches/the-eye/runs/<time>_<label>/: frames.csv, cursor.csv, hover.jsonl, ax_tree_start.txt/.json, actions.jsonl, keyframes/.
 
@@ -488,6 +491,7 @@ server.registerTool("eye_status", {
   return text([
     d.code === 0 ? d.stdout.trim() : `displays: ${(d.stdout + d.stderr).trim()}`,
     `runs dir: ${RUNS}`,
+    driverStatus(),
     ...[...jobs.values()].filter(running).map((j) => `${j.id} "${j.label}" ${j.state} (${((now - j.started) / 1000).toFixed(0)}s)${j.ax ? " · ax on" : ""} → ${j.capture.csv}`),
     ...[...locks.values()].map((l) => `${l.id} locked, ${Math.max(0, (l.until - now) / 1000).toFixed(0)}s left`),
     ...finishedLocks.slice(0, 3).map((r) => `ended ${r}`),
@@ -601,10 +605,14 @@ server.registerTool("eye_record", {
     fps: z.number().optional(),
     keyframe_ms: z.number().optional().describe("Also save a PNG every N ms (eye_snapshot {csv, t_s}). Omit to save none."),
     profile: profileSchema,
+    duplicates: z.enum(["refuse", "quit_others", "allow"]).optional().describe(duplicatesSchemaDescription + " Checked when `process` is given."),
     ...axOpts,
     ...analysisOpts,
   },
 }, async (p) => {
+  const busy = claimDriver("eye_record");
+  if (busy) return fail(busy);
+  if (p.process) { const dup = ensureSingleInstance(p.process, p.duplicates); if (dup) return fail(dup); }
   const job = startJob(p);
   const blocking = p.background === undefined ? !!(p.command || p.seconds) : !p.background;
   if (blocking) {
@@ -770,8 +778,13 @@ server.registerTool("eye_act", {
     ax: z.boolean().optional().describe("Report the element under the pointer after each step (default: the recording's ax setting, true without a recording)."),
     tree: treeSchema.optional().describe("After the steps, also dump the AX tree of the recorded region (or the window under the pointer). Default none."),
     lock: z.boolean().optional().describe("Block all physical input for exactly the duration of these steps (default true)."),
+    duplicates: z.enum(["refuse", "quit_others", "allow"]).optional().describe(duplicatesSchemaDescription),
   },
 }, async (p) => {
+  const busy = claimDriver("eye_act");
+  if (busy) return fail(busy);
+  const named = p.target_process ?? activeProbeTarget()?.pid;
+  if (named !== undefined) { const dup = ensureSingleInstance(named, p.duplicates); if (dup) return fail(dup); }
   let target: { pid: number; name: string } | null = null;
   try { target = p.target_process !== undefined ? await resolvePid(p.target_process) : activeProbeTarget(); }
   catch (e: any) { return fail(e.message); }
@@ -970,6 +983,8 @@ server.registerTool("eye_lock", {
     }
     return text(out.join("\n"));
   }
+  const busy = claimDriver("eye_lock");
+  if (busy) return fail(busy);
   const l = startLock(p.seconds, p.allow ?? "synthetic");
   if (!(await l.ready)) return fail(await l.done);
   return text(`${l.id}: physical pointer AND keyboard locked for ${p.seconds}s (Esc ×6 = user's emergency release). eye_lock {release:true} when done.`);
@@ -978,11 +993,13 @@ server.registerTool("eye_lock", {
 registerProbeTools(server, { root: ROOT, runDir, text, fail });
 
 function cleanup() {
+  releaseDriver();
   actor?.child.kill("SIGTERM");
   for (const j of jobs.values()) j.cmd?.kill("SIGTERM");
   for (const l of locks.values()) l.child.kill("SIGTERM");
   for (const c of captures.values()) c.child.kill("SIGTERM");
 }
+startLeaseHeartbeat(() => [...jobs.values()].some(running) || locks.size > 0 || activeProbeTarget() !== null);
 process.on("exit", cleanup);
 for (const s of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(s, () => { cleanup(); process.exit(0); });
 process.stdin.on("close", () => { cleanup(); process.exit(0); });
