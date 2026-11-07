@@ -9,7 +9,7 @@ import { z } from "zod";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { analyze, compare, formatAnalysis, loadRun, timeline, type Options } from "./analyze.ts";
 import { explain } from "./explain.ts";
@@ -17,7 +17,10 @@ import {
   activeProbeLive, activeProbeTarget, analyzeProbe, describeProbeLive, isProbeRun, peekProbe, probeRunIds, probeRunsStatus,
   registerProbeTools, resolvePid, stopProbes,
 } from "./probe.ts";
-import { claimDriver, driverStatus, duplicatesSchemaDescription, ensureSingleInstance, releaseDriver, startLeaseHeartbeat } from "./single.ts";
+import {
+  checkInstances, claimDriver, driverStatus, duplicatesSchemaDescription, familyOf, freshEvents, launch, listFamily, quitPids, releaseDriver,
+  startLeaseHeartbeat, watchedStatus, watchPid,
+} from "./single.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = join(ROOT, "bin", "eye-capture");
@@ -214,6 +217,35 @@ function report(csv: string, label: string, opts: Options, maxSegments?: number)
 const text = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
 const fail = (t: string) => ({ content: [{ type: "text" as const, text: t }], isError: true });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Append instance notes and fresh launch warnings to a tool result. */
+function withNotes<T extends { content: { type: "text"; text: string }[] }>(r: T, ...notes: string[]): T {
+  const extra = [...notes, ...freshEvents()].filter(Boolean);
+  if (extra.length) r.content.push({ type: "text", text: extra.join("\n") });
+  return r;
+}
+/**
+ * Apps on screen in a recording's rect (from its AX tree, else AX hit-tests at a 3×3 grid of points): each one
+ * gets watched, and a warning comes back when one of them runs more than once (another build counts too).
+ */
+async function observedConflicts(job: { treeFile?: string }, rect: Rect): Promise<string[]> {
+  const pids = new Set<number>();
+  try { for (const w of JSON.parse(readFileSync(job.treeFile!, "utf8")).windows ?? []) if (w.pid) pids.add(Number(w.pid)); } catch {}
+  if (!pids.size) {
+    for (const fx of [0.2, 0.5, 0.8]) for (const fy of [0.2, 0.5, 0.8]) {
+      // AX hit-test, not the topmost CG window: transparent full-screen windows (the Dock's) sit above everything.
+      const o = await actorSend({ op: "inspect", x: rect.x + rect.w * fx, y: rect.y + rect.h * fy, brief: true });
+      if (o?.ok !== false && o?.element?.pid) pids.add(Number(o.element.pid));
+    }
+  }
+  const out: string[] = [];
+  for (const pid of pids) {
+    const f = familyOf(pid);
+    if (!f) continue;
+    watchPid(pid);
+    if (f.others.length) out.push(`⚠ ${f.target.name} (on screen in this rect) runs ${f.others.length + 1}× (${[f.target, ...f.others].map((p) => `${p.name} pid ${p.pid}`).join(", ")}). Measurements may mix them: eye_app {app:${pid}} for the choices.`);
+  }
+  return out;
+}
 
 // ---- input + AX actor: one persistent native process (eye-capture input), JSON lines in/out
 
@@ -370,7 +402,9 @@ function startJob(p: RecordParams): Job {
     // are on disk. The helper itself gives up after 8s.
     for (let i = 0; i < 95 && c.child.exitCode === null && !(existsSync(c.csv) && statSync(c.csv).size > 200); i++) await sleep(100);
     if (c.child.exitCode === null && !existsSync(c.csv)) { c.child.kill("SIGTERM"); await c.done; }
-    if (c.child.exitCode !== null || c.child.signalCode !== null) {
+    // A short `seconds` run can finish before frames were seen here: exit 0 with a CSV is a complete run, not a failure.
+    const finishedClean = c.child.exitCode === 0 && existsSync(c.csv);
+    if (!finishedClean && (c.child.exitCode !== null || c.child.signalCode !== null)) {
       if (job.lock) job.lockResult = await stopLock(job.lock);
       job.state = "done"; job.final = `capture failed: ${await c.done}`;
       return job.final;
@@ -471,11 +505,11 @@ KNOW THESE
 - The measured extent (a, e) is a pixel difference. Translucent glass over a similar background can measure smaller than the real view: for true bounds use AX frames (eye_inspect, h.frame), and keep wait_until thresholds loose.
 - eye_act safety: presses only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. Every lock (eye_act's automatic one, eye_record lock_input, eye_lock) blocks ALL physical input: trackpad, mouse, gestures, keyboard, media keys, and it pins the cursor. Each lock starts with a 1.5s on-screen 3·2·1 warning (0.5s per number); calls wait for it, so budget ~1.5s per eye_act call that takes its own lock (a session eye_lock pays it once). The orange overlay shows exactly while one is held. The user's only way out is Esc 6× in a row, ≤1s apart (emergency; the overlay shows the count). Never lock while the user should be acting.
 - ONE AT A TIME. Only one agent session drives the screen: eye_act, eye_lock, eye_record and eye_probe take a shared lease (renewed by each call, kept while a recording/lock/probe runs, released 60s after your last driving call or when your session ends). Another session gets "BUSY …": wait and retry, don't fight it. Read-only tools always work. eye_status shows who holds it.
-- ONE APP COPY. eye_act (target_process / probe target), eye_probe and eye_record {process} refuse when the target app runs more than once (an Xcode run + an \`open\`, a stale launch): presses and measurements could hit the wrong copy. Pass duplicates:"quit_others" to keep the newest (or the pid you named) and quit the rest. Before launching the app yourself, check it isn't already running.
+- ONE APP COPY, checked by the server itself. An app counts every copy AND every other build of it (NOOTCH!-Dev, NOOTCH!, a Setapp build…): they all draw and answer AX. Before eye_act (target_process or the probe's target), eye_probe and eye_record {process} it checks and, if several run, STOPS with the list and the choices: duplicates:"quit_others" (keep the target), "relaunch" (quit all, start the target's .app fresh, or app_path = the build you just made), "allow", or stop and ask the user (one may be theirs). Recordings also flag duplicated apps found in their rect. Once it has seen an app it watches it: a copy launched later (by you, Xcode or the user) shows up as ⚠ in the next tool result and in eye_status. To start the app, prefer eye_app {action:"launch", app_path}: it never makes a second copy.
 - Needs Screen Recording (capture) and Accessibility (AX, input, lock) permission for the host app.
 - Run files live in ~/Library/Caches/the-eye/runs/<time>_<label>/: frames.csv, cursor.csv, hover.jsonl, ax_tree_start.txt/.json, actions.jsonl, keyframes/.
 
-TOOLS: eye_status · eye_inspect · eye_snapshot · eye_record · eye_peek · eye_act · eye_stop · eye_report · eye_lock · eye_probe
+TOOLS: eye_status · eye_inspect · eye_snapshot · eye_record · eye_peek · eye_act · eye_stop · eye_report · eye_lock · eye_probe · eye_app
 `.trim();
 
 const server = new McpServer({ name: "the-eye", version: "0.2.0" }, { instructions: INSTRUCTIONS });
@@ -492,6 +526,8 @@ server.registerTool("eye_status", {
     d.code === 0 ? d.stdout.trim() : `displays: ${(d.stdout + d.stderr).trim()}`,
     `runs dir: ${RUNS}`,
     driverStatus(),
+    ...watchedStatus(),
+    ...freshEvents(),
     ...[...jobs.values()].filter(running).map((j) => `${j.id} "${j.label}" ${j.state} (${((now - j.started) / 1000).toFixed(0)}s)${j.ax ? " · ax on" : ""} → ${j.capture.csv}`),
     ...[...locks.values()].map((l) => `${l.id} locked, ${Math.max(0, (l.until - now) / 1000).toFixed(0)}s left`),
     ...finishedLocks.slice(0, 3).map((r) => `ended ${r}`),
@@ -535,7 +571,7 @@ server.registerTool("eye_inspect", {
     if (t.ok) writeFileSync(join(dir, "ax_tree.txt"), t.text);
     out.push(`element tree (${mode}, ${t.nodes} nodes; global points):\n${t.text}${t.ok ? `\nfull JSON: ${file}` : ""}`);
   }
-  return text(out.join("\n\n"));
+  return withNotes(text(out.join("\n\n")));
 });
 
 server.registerTool("eye_snapshot", {
@@ -605,20 +641,27 @@ server.registerTool("eye_record", {
     fps: z.number().optional(),
     keyframe_ms: z.number().optional().describe("Also save a PNG every N ms (eye_snapshot {csv, t_s}). Omit to save none."),
     profile: profileSchema,
-    duplicates: z.enum(["refuse", "quit_others", "allow"]).optional().describe(duplicatesSchemaDescription + " Checked when `process` is given."),
+    duplicates: z.enum(["ask", "quit_others", "relaunch", "allow"]).optional().describe(duplicatesSchemaDescription),
+    app_path: z.string().optional().describe("For duplicates:\"relaunch\": the .app to start instead of the target's own (e.g. the build you just made)."),
     ...axOpts,
     ...analysisOpts,
   },
 }, async (p) => {
   const busy = claimDriver("eye_record");
   if (busy) return fail(busy);
-  if (p.process) { const dup = ensureSingleInstance(p.process, p.duplicates); if (dup) return fail(dup); }
+  let instNote = "";
+  if (p.process) {
+    const c = await checkInstances(p.process, p.duplicates, p.app_path);
+    if (!c.ok) return fail(c.error);
+    instNote = c.note ?? "";
+    if (c.pid && c.note?.startsWith("relaunched")) p.process = String(c.pid);
+  }
   const job = startJob(p);
   const blocking = p.background === undefined ? !!(p.command || p.seconds) : !p.background;
   if (blocking) {
     const final = await job.finished;
     const tree = job.tree ? `\n\nobserved windows at start (AX tree, global points):\n${capLines(job.tree, 60, `full tree: ${join(job.capture.dir, "ax_tree_start.txt")}`)}` : "";
-    return text(`${job.id} done\n\n${final}${tree}`);
+    return text([instNote, ...(await observedConflicts(job, p.rect)), `${job.id} done\n\n${final}${tree}`, ...freshEvents()].filter(Boolean).join("\n"));
   }
   for (let i = 0; i < 100 && job.state === "starting"; i++) await sleep(50);
   if (job.state === "done") return fail(job.final ?? "capture failed");
@@ -630,6 +673,7 @@ server.registerTool("eye_record", {
     describeLive(live),
     job.tree ? `observed windows (AX tree, global points):\n${capLines(job.tree, 120, `full tree: ${join(job.capture.dir, "ax_tree_start.txt")}`)}` : "",
     `next: eye_act {steps, target_process} · eye_peek {id:"${job.id}"} · eye_stop {id:"${job.id}"}`,
+    instNote, ...(await observedConflicts(job, p.rect)), ...freshEvents(),
   ].filter(Boolean).join("\n"));
 });
 
@@ -677,7 +721,7 @@ server.registerTool("eye_peek", {
   }
   const pl = activeProbeLive();
   if (pl) lines.push(describeProbeLive(pl, p.max_layers ?? 5));
-  return text(lines.join("\n"));
+  return withNotes(text(lines.join("\n")));
 });
 
 server.registerTool("eye_stop", {
@@ -778,13 +822,20 @@ server.registerTool("eye_act", {
     ax: z.boolean().optional().describe("Report the element under the pointer after each step (default: the recording's ax setting, true without a recording)."),
     tree: treeSchema.optional().describe("After the steps, also dump the AX tree of the recorded region (or the window under the pointer). Default none."),
     lock: z.boolean().optional().describe("Block all physical input for exactly the duration of these steps (default true)."),
-    duplicates: z.enum(["refuse", "quit_others", "allow"]).optional().describe(duplicatesSchemaDescription),
+    duplicates: z.enum(["ask", "quit_others", "relaunch", "allow"]).optional().describe(duplicatesSchemaDescription),
+    app_path: z.string().optional().describe("For duplicates:\"relaunch\": the .app to start instead of the target's own (e.g. the build you just made)."),
   },
 }, async (p) => {
   const busy = claimDriver("eye_act");
   if (busy) return fail(busy);
   const named = p.target_process ?? activeProbeTarget()?.pid;
-  if (named !== undefined) { const dup = ensureSingleInstance(named, p.duplicates); if (dup) return fail(dup); }
+  let instNote = "";
+  if (named !== undefined) {
+    const c = await checkInstances(named, p.duplicates, p.app_path);
+    if (!c.ok) return fail(c.error);
+    instNote = c.note ?? "";
+    if (c.pid) p.target_process = c.pid;
+  }
   let target: { pid: number; name: string } | null = null;
   try { target = p.target_process !== undefined ? await resolvePid(p.target_process) : activeProbeTarget(); }
   catch (e: any) { return fail(e.message); }
@@ -797,7 +848,7 @@ server.registerTool("eye_act", {
     strictLock = startLock(Math.min(300, Math.ceil(budget / 1000) + 15), "tagged");
     if (!(await strictLock.ready)) return fail(`could not take the input lock: ${await strictLock.done}`);
   }
-  try { return await actSteps(p, target); }
+  try { return withNotes(await actSteps(p, target), instNote); }
   finally { if (strictLock) await stopLock(strictLock); }
 });
 
@@ -988,6 +1039,55 @@ server.registerTool("eye_lock", {
   const l = startLock(p.seconds, p.allow ?? "synthetic");
   if (!(await l.ready)) return fail(await l.done);
   return text(`${l.id}: physical pointer AND keyboard locked for ${p.seconds}s (Esc ×6 = user's emergency release). eye_lock {release:true} when done.`);
+});
+
+server.registerTool("eye_app", {
+  title: "Copies of the app under test",
+  description: [
+    "List, quit, launch or relaunch the app you test, counting every copy and every other build of it (Dev/Release/Setapp…):",
+    "two of them on screen at once both draw and both answer accessibility. the-eye already checks this itself before eye_act /",
+    "eye_probe / eye_record {process} and stops with the choices; use this to act on them, or to start the app without ever",
+    "making a second copy. list (default): every running copy. quit: the given pid, or every copy except keep. launch: start",
+    "app_path (or the app's last known .app) — refused while a copy runs unless duplicates says what to do. relaunch: quit",
+    "every copy and start app_path (or the target's .app) fresh.",
+  ].join(" "),
+  inputSchema: {
+    app: z.union([z.string(), z.number()]).optional().describe("App name (any build, e.g. 'NOOTCH'), pid, or nothing when app_path is given."),
+    action: z.enum(["list", "quit", "launch", "relaunch"]).optional(),
+    pid: z.number().int().optional().describe("quit: only this pid."),
+    keep: z.number().int().optional().describe("quit: quit every copy except this pid."),
+    app_path: z.string().optional().describe("launch/relaunch: the .app to start (e.g. the build you just made in DerivedData)."),
+    duplicates: z.enum(["ask", "quit_others", "relaunch", "allow"]).optional().describe("launch while a copy runs: ask (default), quit_others/relaunch (quit them, then launch), allow (launch anyway; `open` still won't start a second copy of the same .app)."),
+  },
+}, async (p) => {
+  const action = p.action ?? "list";
+  const ref = p.app ?? (p.app_path ? basename(p.app_path).replace(/\.app\/?$/, "") : undefined);
+  if (ref === undefined) return fail("pass app (name or pid) or app_path");
+  if (action === "list") { const f = familyOf(ref); if (f) watchPid(f.target.pid); return withNotes(text(listFamily(ref))); }
+  const busy = claimDriver(`eye_app ${action}`);
+  if (busy) return fail(busy);
+  const fam = familyOf(ref);
+  if (action === "quit") {
+    if (!fam) return text(`no running app matches "${ref}"`);
+    const all = [fam.target, ...fam.others];
+    const pids = p.pid ? all.filter((x) => x.pid === p.pid).map((x) => x.pid) : all.filter((x) => x.pid !== p.keep).map((x) => x.pid);
+    if (!pids.length) return fail(`nothing to quit (running: ${all.map((x) => x.pid).join(", ")})`);
+    const left = await quitPids(pids);
+    return left.length ? fail(`could not quit pid ${left.join(", ")}`) : withNotes(text(`quit pid ${pids.join(", ")}\n${listFamily(ref)}`));
+  }
+  const appPath = p.app_path ?? fam?.target.app;
+  if (!appPath) return fail(`no app_path, and no running copy of "${ref}" to take it from`);
+  if (action === "launch" && fam && (p.duplicates ?? "ask") === "ask") {
+    return fail(`not launched: ${fam.others.length + 1} cop${fam.others.length ? "ies" : "y"} already running\n${listFamily(ref)}\nCall again with duplicates:"quit_others"/"relaunch" (quit them first), or "allow", or use the running one.`);
+  }
+  if (fam && (action === "relaunch" || p.duplicates === "quit_others" || p.duplicates === "relaunch")) {
+    const left = await quitPids([fam.target.pid, ...fam.others.map((x) => x.pid)]);
+    if (left.length) return fail(`could not quit pid ${left.join(", ")}`);
+  }
+  const l = await launch(appPath);
+  if (typeof l === "string") return fail(l);
+  watchPid(l.pid);
+  return withNotes(text(`started ${l.name} pid ${l.pid} (${appPath})\n${listFamily(l.pid)}`));
 });
 
 registerProbeTools(server, { root: ROOT, runDir, text, fail });

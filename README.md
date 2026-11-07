@@ -53,6 +53,7 @@ Ten tools. The server's MCP `instructions` carry the full "what / when / how" gu
 | `eye_act` | **interactive driving**: `move`, `click`, `down`/`up`, `scroll`, `wait`, `wait_until`, `assert`. After **every** step: pointer, element under it, visible state. Expressions get `h` (the element). Presses only on `target_process`; scrolls only inside the open area or `scroll_zones` |
 | `eye_stop` | end a recording and/or probe run (all if no id), kill a running command, return the report(s); the probe report is aligned to the capture |
 | `eye_report` | re-analyze: `summary`, `timeline`, `explain` (worst gaps × cursor × element × eye_act step × main thread), `hover` (element-under-pointer changes), `compare` (runs), `probe` (probe.ndjson / one layer) |
+| `eye_app` | list / quit / launch / relaunch the app under test, counting every copy and build of it |
 | `eye_lock` | block all physical input, trackpad and keyboard (`seconds`), or `release:true` |
 | `eye_probe` | load the layer probe into an app if needed and start recording layer geometry (see below) |
 
@@ -127,10 +128,14 @@ Interactive loop: `eye_inspect` (find targets) → `eye_record` → repeat `eye_
   renewed by each driving call, kept while a recording, lock or probe runs, and released when the session ends or 60s
   after its last driving call. Another server's driving call fails with `BUSY` and names the holder; read-only tools
   (`eye_inspect`, `eye_snapshot`, `eye_status`, `eye_report`, `eye_peek`, `eye_stop`) always work.
-- **One copy of the app under test.** `eye_act` (its `target_process`, or the probe's target), `eye_probe` and
-  `eye_record {process}` refuse when that app runs more than once (same executable name), listing every copy.
-  `duplicates: "quit_others"` keeps the pid you named, or else the newest launch, and quits the rest;
-  `duplicates: "allow"` skips the check. Test: `test/single.mjs`.
+- **One copy of the app under test, checked by the server.** A family is every copy and every build of an app: same
+  executable name, or the same stem once build-variant words are dropped (`NOOTCH!-Dev`, `NOOTCH!`; also the bundle-id
+  stem). Before `eye_act` (its `target_process`, or the probe's target), `eye_probe` and `eye_record {process}` the
+  server checks the family; if more than one runs it stops with the list and the choices: `duplicates: "quit_others"`
+  (keep the pid you named, else the newest launch), `"relaunch"` (quit all, start the target's `.app` fresh, or
+  `app_path`), `"allow"`, or stop and ask the user. Recordings without `process` flag duplicated apps found in their
+  rect. Every app it has seen is watched (every 2s): a copy launched later shows up as a ⚠ line in the next tool result
+  and in `eye_status`. `eye_app` lists, quits, launches (never a second copy) and relaunches. Test: `test/single.mjs`.
 
 ## Input lock and drivers
 
