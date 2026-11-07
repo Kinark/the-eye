@@ -328,10 +328,10 @@ export function registerProbeTools(server: any, d: Deps) {
       display: z.number().int().optional().describe("Display id (eye_status). Default: the main display."),
       rect: z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() }).optional().describe("Only log layers intersecting this display-local rect (points)."),
       match: z.array(z.string()).optional().describe("Only log layers whose label (layer class, view class, name) contains one of these."),
-      watch: z.array(z.string()).optional().describe("Always show these layers in the live summary, moving or not (label substrings, e.g. 'NSGlassEffectView')."),
+      watch: z.array(z.string()).optional().describe("Always show these layers in the live summary, moving or not (label substrings, e.g. 'NSGlassEffectView'). Never limits what is logged; use match for that."),
       max_seconds: z.number().positive().max(600).optional().describe("Safety stop (default 60)."),
       max_layers: z.number().int().positive().optional().describe("Max layers walked per frame (default 6000)."),
-      full_walk: z.boolean().optional().describe("Walk the whole layer tree every frame. Default false when match/watch is given (the tree is re-walked every 30 frames; new layers can take up to 30 frames to appear)."),
+      full_walk: z.boolean().optional().describe("Walk the whole layer tree every frame. Default false when match is given (the tree is re-walked every 30 frames; new layers can take up to 30 frames to appear)."),
     },
   }, async (p: any) => {
     try {

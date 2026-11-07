@@ -49,9 +49,9 @@ final class EyeProbeRecording: NSObject {
     private var last: [Int: [Double]] = [:]
     private var nextId = 1
     private var wantedCache: [Int: Bool] = [:]
-    /// Focus mode (match or watch given): a full tree walk only every `rescanEvery` ticks to (re)discover the
-    /// labelled layers; the ticks in between re-measure just those, so the probe's main-thread cost stays tiny
-    /// however big the app's layer tree is.
+    /// Focus mode (match given): a full tree walk only every `rescanEvery` ticks to (re)discover the
+    /// labelled layers (match ∪ watch); the ticks in between re-measure just those, so the probe's main-thread
+    /// cost stays tiny however big the app's layer tree is. `watch` alone never narrows what is logged.
     let focus: Bool
     private let rescanEvery = 30
     private struct Tracked { weak var layer: CALayer?; let id: Int; let window: Int }
@@ -74,7 +74,7 @@ final class EyeProbeRecording: NSObject {
         FileManager.default.createFile(atPath: path, contents: nil)
         guard let h = FileHandle(forWritingAtPath: path) else { return nil }
         self.id = id; self.path = path; self.screen = screen; self.rect = rect; self.match = match; self.watch = watch
-        self.focus = !(match.isEmpty && watch.isEmpty) && !fullWalk
+        self.focus = !match.isEmpty && !fullWalk
         self.t0 = CACurrentMediaTime()
         self.stopAt = t0 + maxSeconds; self.maxVisits = maxVisits
         self.onFinish = onFinish; self.handle = h
