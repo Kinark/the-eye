@@ -50,7 +50,7 @@ Ten tools. The server's MCP `instructions` carry the full "what / when / how" gu
 | `eye_snapshot` | one PNG of a region (`rect`), or a recording's keyframes near a time (`csv`, `t_s`) |
 | `eye_record` | record a region. No command/seconds → background, returns an id at once (with the AX tree). `seconds` → blocking. `command` → runs your input driver while recording, optional `lock_input`, returns output + report. `background:true` for long runs |
 | `eye_peek` | live state of a running recording or probe: moving, extent, recent fps/hitches, **element under the pointer** (`hover:"full"` for every attribute), command output, probe layers, optional fresh AX `tree` |
-| `eye_act` | **interactive driving**: `move`, `click`, `down`/`up`, `scroll`, `wait`, `wait_until`, `assert`. After **every** step: pointer, element under it, visible state. Expressions get `h` (the element). Presses only on `target_process`; scrolls only inside the open area or `scroll_zones` |
+| `eye_act` | **interactive driving**: `move`, `click`, `down`/`up`, `scroll` (two-finger, optional `momentum` fling), two-finger gestures `pinch {scale}`, `rotate {degrees}`, `smart_zoom`, `swipe {direction}`, Force Touch `press {force:[…]}` / `force_click`, `wait`, `wait_until`, `assert`. After **every** step: pointer, element under it, visible state. Expressions get `h` (the element). Presses and gestures only on `target_process`; scrolls only inside the open area or `scroll_zones` |
 | `eye_stop` | end a recording and/or probe run (all if no id), kill a running command, return the report(s); the probe report is aligned to the capture |
 | `eye_report` | re-analyze: `summary`, `timeline`, `explain` (worst gaps × cursor × element × eye_act step × main thread), `hover` (element-under-pointer changes), `compare` (runs), `probe` (probe.ndjson / one layer) |
 | `eye_app` | list / quit / launch / relaunch the app under test, counting every copy and build of it |
@@ -141,14 +141,43 @@ Interactive loop: `eye_inspect` (find targets) → `eye_record` → repeat `eye_
 
 Every lock (`eye_act`'s automatic one, `eye_record lock_input`, `eye_lock`) taps every event type and drops
 all physical input whose source process ID is 0: pointer, scroll, trackpad gestures, force touch, keys, modifiers and
-media keys. It also pins the cursor. Before blocking, it shows a 3·2·1 countdown in the middle of every screen (0.5s per
-number, 1.5s total) while input is still free; the tools wait for it. The orange overlay is shown exactly while a lock is held, so orange on screen
+media keys. It also pins the cursor: physical motion is disconnected from it (`CGAssociateMouseAndMouseCursorPosition`), so it doesn't move even 1pt, while posted moves still drive it. An 8ms re-pin timer is the backstop, and the report's `max_cursor_drift_pt` says how far it ever got. Before blocking, it shows a 3·2·1 countdown in the middle of every screen (0.5s per
+number, 1.5s total) while input is still free (the tap is not armed until it ends; `test/lock.mjs` checks this); the tools wait for it. The orange overlay is shown exactly while a lock is held, so orange on screen
 means no physical input gets through. The user's emergency release is Esc six times in a row, each within 1s of the
 previous (those presses are swallowed too; dots on the overlay pill fill up and a hint shows how many are left). Its result includes `pointer_events_by_source_pid` and `blocked_by_event_type`, so you can
 check what it saw. Keystrokes typed while macOS Secure Input is on (a focused password field) bypass every event
 tap, this one included. Events posted by any process pass through,
 including Peekaboo, `cliclick` and your own CGEvent drivers. With `allow: "tagged"`, only events carrying
 `eventSourceUserData == 0x45594521` ("EYE!") pass.
+
+### Two-finger gestures
+
+`pinch`, `rotate`, `smart_zoom` and `swipe` are `NSEventTypeGesture` CGEvents carrying undocumented CGS fields:
+110 is the IOHID type (8 zoom, 5 rotation, 22 zoom toggle, 16 navigation swipe), 113 and 114 are the magnification
+and rotation deltas, 115 is the swipe direction and 132 is the phase. The field map comes from Calf Trail's
+TouchSynthesis by way of Mac Mouse Fix. They must be posted at the session tap: AppKit never sees them from the HID tap.
+They therefore bypass the input lock's tap, which is fine because they are ours. AppKit turns them into real `magnify`,
+`rotate`, `smartMagnify` and `swipe` events with began/changed/ended phases. A pinch's per-event deltas multiply to
+exactly `scale`, and rotation deltas sum to `degrees` (with clockwise positive; AppKit's sign is the opposite).
+`scroll {momentum:true}` adds the coasting tail after the fingers lift (momentum began/changed/ended). Check with
+`swiftc test/gesture-target.swift -o /tmp/gt`: a window that logs every gesture event it receives as JSON.
+
+### Force Touch
+
+`press {force:[0, 0.4, 0.8, 0], ms}` is a mouse down, a pressure curve, then a mouse up. `force` is a single axis of
+keyframes, spread over `ms` and eased between them. 0…1 is stage 1 (a normal click's `NSEvent.pressure`), crossing 1 is
+the force click (stage 2) and 1…2 is pressure inside stage 2. `force_click` is a ready-made curve,
+`[0, 0.9, 1.5, 1.5, 0.9, 0]` over 700ms. A pressure event is a gesture CGEvent with IOHID type 32 (kIOHIDEventTypeForce).
+Its field layout was read off a real trackpad with a listen-only tap: 132 phase, 143 stage, 144 pressure behavior
+(5 = deep click), pressure in 119/139/148 plus float32 bits in 123/165, and stageTransition in 113/114/116/118/147
+plus 115/117/164. It also follows the real order: the pressure gesture begins just before mouse down and ends just
+before mouse up. Apps receive a real `pressureChange(with:)` sequence with `stage`, `pressure`, `stageTransition` and
+`pressureBehavior`. They do **not** receive `quickLook(with:)` (Look up): a real trackpad's comes from lower in the
+system, not from the pressure stream. `test/gestures.mjs` checks every gesture and press against a real window under
+the input lock.
+
+Press safety checks the pid of the AX element under the point first. CG's topmost window is often click-through: the
+Dock keeps a full-screen window at layer 20 over every normal app.
 
 ### Hang protection
 

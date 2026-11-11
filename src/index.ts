@@ -201,6 +201,8 @@ function startLock(seconds: number, allow: "synthetic" | "tagged"): Lock {
   });
   const l: Lock = { id, child, done: collect(child), ready, until: Date.now() + LOCK_COUNTDOWN_MS + seconds * 1000 };
   locks.set(id, l);
+  // Killed before it could restore the pointer↔cursor link (SIGKILL, crash): restore it from outside.
+  child.on("exit", (_code, sig) => { if (sig === "SIGKILL" || sig === "SIGSEGV" || sig === "SIGABRT") spawn(BIN, ["release-cursor"], { stdio: "ignore" }); });
   l.done.then((r) => { finishedLocks.unshift(`${id}: ${r}`); finishedLocks.length = Math.min(finishedLocks.length, 10); })
     .finally(() => locks.delete(id));
   return l;
@@ -239,9 +241,15 @@ async function observedConflicts(job: { treeFile?: string }, rect: Rect): Promis
   }
   const out: string[] = [];
   for (const pid of pids) {
-    const f = familyOf(pid);
+    let f = familyOf(pid);
     if (!f) continue;
     watchPid(pid);
+    if (f.others.length) {
+      // Stale copies (older launches of the same build) are quit on the spot; only real choices are left to report.
+      const c = await checkInstances(pid, "ask");
+      if (c.note) out.push(`⚠ ${c.note}`);
+      f = familyOf(c.pid ?? pid) ?? f;
+    }
     if (f.others.length) out.push(`⚠ ${f.target.name} (on screen in this rect) runs ${f.others.length + 1}× (${[f.target, ...f.others].map((p) => `${p.name} pid ${p.pid}`).join(", ")}). Measurements may mix them: eye_app {app:${pid}} for the choices.`);
   }
   return out;
@@ -520,10 +528,10 @@ WHEN TO USE WHAT
 KNOW THESE
 - Coordinates are POINTS, top-left origin. rect is display-local (eye_status lists displays). Pointer, AX frames and eye_act x/y are global; on the main display both are the same.
 - AX costs performance: an AX client makes SwiftUI apps rebuild their accessibility graph (~18% more main-thread time, up to −25% fps). eye_record has ax on by default (off with profile). For final fps numbers or A/B comparisons use ax:false, and compare runs recorded the same way. Reports say when AX was on.
-- eye_act input is synthetic. It reaches apps through a different path than a physical trackpad (event taps, hover shields and pointer-location APIs can see it differently). If a bug doesn't reproduce with eye_act, vary it yourself (speeds, phased vs unphased scroll, hover paths, a CGEvent driver via eye_record command) and report what you tried and what each run measured.
+- eye_act input is synthetic. It reaches apps through a different path than a physical trackpad (event taps, hover shields and pointer-location APIs can see it differently). If a bug doesn't reproduce with eye_act, vary it yourself (speeds, phased vs unphased scroll, scroll with momentum, hover paths, a CGEvent driver via eye_record command) and report what you tried and what each run measured.
 - The pointer position in live data / cursor.csv comes from the window server. An app whose event tap swallows mouse moves (e.g. NOOTCH!'s hover shield over the notch) freezes it, so live hover can lag; eye_act's p is the position it actually posted.
 - The measured extent (a, e) is a pixel difference. Translucent glass over a similar background can measure smaller than the real view: for true bounds use AX frames (eye_inspect, h.frame), and keep wait_until thresholds loose.
-- eye_act safety: presses only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. Every lock (eye_act's automatic one, eye_record lock_input, eye_lock) blocks ALL physical input: trackpad, mouse, gestures, keyboard, media keys, and it pins the cursor. Each lock starts with a 1.5s on-screen 3·2·1 warning (0.5s per number); calls wait for it, so budget ~1.5s per eye_act call that takes its own lock (a session eye_lock pays it once). The orange overlay shows exactly while one is held. The user's only way out is Esc 6× in a row, ≤1s apart (emergency; the overlay shows the count). Never lock while the user should be acting.
+- eye_act safety: presses and two-finger gestures (pinch, rotate, smart_zoom, swipe) only land on target_process (name or pid, or the app of a running eye_probe); scrolls only inside the measured open area or a scroll_zones rect. Every lock (eye_act's automatic one, eye_record lock_input, eye_lock) blocks ALL physical input: trackpad, mouse, gestures, keyboard, media keys, and it pins the cursor. Each lock starts with a 1.5s on-screen 3·2·1 warning (0.5s per number); calls wait for it, so budget ~1.5s per eye_act call that takes its own lock (a session eye_lock pays it once). The orange overlay shows exactly while one is held. The user's only way out is Esc 6× in a row, ≤1s apart (emergency; the overlay shows the count). Never lock while the user should be acting.
 - ONE AT A TIME. Only one agent session drives the screen: eye_act, eye_lock, eye_record and eye_probe take a shared lease (renewed by each call, kept while a recording/lock/probe runs, released 60s after your last driving call or when your session ends). Another session gets "BUSY …": wait and retry, don't fight it. Read-only tools always work. eye_status shows who holds it.
 - ONE APP COPY, checked by the server itself. An app counts every copy AND every other build of it (NOOTCH!-Dev, NOOTCH!, a Setapp build…): they all draw and answer AX. Before eye_act (target_process or the probe's target), eye_probe and eye_record {process} it checks and, if several run, STOPS with the list and the choices: duplicates:"quit_others" (keep the target), "relaunch" (quit all, start the target's .app fresh, or app_path = the build you just made), "allow", or stop and ask the user (one may be theirs). Recordings also flag duplicated apps found in their rect. Once it has seen an app it watches it: a copy launched later (by you, Xcode or the user) shows up as ⚠ in the next tool result and in eye_status. To start the app, prefer eye_app {action:"launch", app_path}: it never makes a second copy.
 - Needs Screen Recording (capture) and Accessibility (AX, input, lock) permission for the host app.
@@ -674,7 +682,7 @@ server.registerTool("eye_record", {
     const c = await checkInstances(p.process, p.duplicates, p.app_path);
     if (!c.ok) return fail(c.error);
     instNote = c.note ?? "";
-    if (c.pid && c.note?.startsWith("relaunched")) p.process = String(c.pid);
+    if (c.pid && (c.note?.startsWith("relaunched") || /^\d+$/.test(String(p.process)))) p.process = String(c.pid);
   }
   const job = startJob(p);
   const blocking = p.background === undefined ? !!(p.command || p.seconds) : !p.background;
@@ -807,12 +815,19 @@ function short(live: any): string {
 }
 
 const stepSchema = z.object({
-  op: z.enum(["move", "click", "down", "up", "scroll", "wait", "wait_until", "assert"]),
+  op: z.enum(["move", "click", "down", "up", "scroll", "pinch", "rotate", "smart_zoom", "swipe", "press", "force_click", "wait", "wait_until", "assert"]),
   x: z.number().optional(), y: z.number().optional(),
-  ms: z.number().optional().describe("move: glide duration (0 = jump); wait: duration"),
+  ms: z.number().optional().describe("move: glide duration (0 = jump); wait: duration; pinch/rotate: gesture duration (default 300); press/force_click: whole press (default 400/700)"),
+  force: z.array(z.number().min(0).max(2)).min(2).optional().describe("press/force_click: Force Touch pressure keyframes spread over ms, eased between. 0…1 = stage 1 (normal click pressure), crossing 1 = the force click (stage 2), 1…2 = pressure inside stage 2. press default [0,0.5,0]; force_click default [0,0.9,1.5,1.5,0.9,0]"),
+  behavior: z.number().int().optional().describe("press/force_click: NSPressureBehavior the events claim (default 5, deep click: the system default)"),
   button: z.enum(["left", "right"]).optional(), count: z.number().int().optional(), hold_ms: z.number().optional(),
   dy: z.number().optional(), dx: z.number().optional(), events: z.number().int().optional(),
   interval_ms: z.number().optional(), phased: z.boolean().optional().describe("scroll: trackpad phases (default true)"),
+  momentum: z.boolean().optional().describe("scroll: after the fingers lift, coast like a trackpad fling (momentum phases, decaying deltas)"),
+  decay: z.number().min(0.5).max(0.99).optional().describe("scroll momentum: per-event velocity factor (default 0.94; higher coasts longer)"),
+  scale: z.number().positive().optional().describe("pinch: total zoom factor (2 = spread to double, 0.5 = pinch to half)"),
+  degrees: z.number().optional().describe("rotate: total rotation, + = clockwise"),
+  direction: z.enum(["left", "right", "up", "down"]).optional().describe("swipe: navigation swipe direction (left = back in browsers)"),
   expr: z.string().optional().describe("wait_until/assert: JS expression over a, e, moving, fps1, gap1, p, h, live, pr, L()"),
   timeout_ms: z.number().optional().describe("wait_until timeout (default 2000)"),
   guard: z.string().optional().describe("Expression that must hold BEFORE this step runs, else the sequence stops."),
@@ -826,11 +841,14 @@ server.registerTool("eye_act", {
   description: [
     "Drive the pointer step by step and get, after EVERY step, the pointer position, the accessibility element under it, and the",
     "measured visible state — so you can think and react between calls. Steps: move {x,y,ms}, click {x?,y?,button,count},",
-    "down/up {button} (drag = down, move, up), scroll {dy,dx,events,phased}, wait {ms}, wait_until {expr,timeout_ms}, assert {expr}.",
+    "down/up {button} (drag = down, move, up), scroll {dy,dx,events,phased,momentum} (two-finger scroll; momentum = fling),",
+    "two-finger trackpad gestures at x,y or the pointer: pinch {scale,ms}, rotate {degrees,ms}, smart_zoom (double-tap), swipe {direction};",
+    "Force Touch at x,y or the pointer: press {force:[keyframes 0…2],ms} (mouse down → pressure curve → up; past 1 = stage 2), force_click {ms};",
+    "wait {ms}, wait_until {expr,timeout_ms}, assert {expr}.",
     "Any step may carry `guard`. Expressions see: a = top-anchored open extent {x0,x1,w,h,cx} or null, e = bbox of all change,",
     "moving, fps1, gap1 (ms), p = pointer {x,y}, h = element under the pointer (role, title, description, identifier, value, frame,",
     "path, app, enabled, focused, selected, actions) or null, live = raw live JSON, pr / L('label') = probe layers.",
-    "e.g. wait_until {expr:\"h?.identifier=='close'\"}. Find targets first with eye_inspect. SAFETY: presses only on target_process;",
+    "e.g. wait_until {expr:\"h?.identifier=='close'\"}. Find targets first with eye_inspect. SAFETY: presses and gestures only on target_process;",
     "scroll only inside `a` or scroll_zones unless force. Blocks ALL the user's physical input (trackpad + keyboard) while it runs.",
     "Live visible state needs a running eye_record. Input is synthetic (see the guide if a bug won't reproduce with it).",
   ].join(" "),
@@ -903,6 +921,7 @@ async function actSteps(p: any, target: { pid: number; name: string } | null) {
     const tag = `#${i} ${s.op}${s.note ? ` (${s.note})` : ""}`;
     const wall0 = wallNow();
     const stoppedBefore = stopped;
+    let pressNote = "";
     try {
       if (s.guard && !evalExpr(s.guard, scope(readNow(), ptr, hover))) { stopped = `${tag}: guard failed: ${s.guard}`; break; }
       if (s.op === "wait") { await sleep(s.ms ?? 300); await look(); }
@@ -936,9 +955,10 @@ async function actSteps(p: any, target: { pid: number; name: string } | null) {
           aimed = hit.shape ?? hit.rect;
           cmd.x = aimed![0] + aimed![2] / 2; cmd.y = aimed![1] + aimed![3] / 2;
         }
-        if (s.op === "click" || s.op === "down") {
-          // Presses can never land outside the target app: no force, both checks always run.
-          if (!target) { stopped = `${tag}: REFUSED press — no target app (pass target_process, or run eye_probe)`; break; }
+        const gesture = ["pinch", "rotate", "smart_zoom", "swipe", "press", "force_click"].includes(s.op);
+        if (s.op === "click" || s.op === "down" || gesture) {
+          // Presses and gestures can never land outside the target app: no force, both checks always run.
+          if (!target) { stopped = `${tag}: REFUSED ${gesture ? "gesture" : "press"} — no target app (pass target_process, or run eye_probe)`; break; }
           const at = { x: cmd.x ?? ptr.x, y: cmd.y ?? ptr.y };
           const pl = activeProbeLive();
           if (pl) {
@@ -955,9 +975,10 @@ async function actSteps(p: any, target: { pid: number; name: string } | null) {
         const r = await actorSend(cmd);
         if (!r.ok) { stopped = `${tag}: ${r.error}`; break; }
         ptr = { x: r.x, y: r.y };
+        if (r.peak_force !== undefined) pressNote = ` · peak force ${r.peak_force}${r.force_clicked ? " (force click: reached stage 2)" : " (stage 1 only)"}`;
         await look();
       }
-      lines.push(`${stamp()} ${tag} → p(${ptr.x.toFixed(0)},${ptr.y.toFixed(0)}) · ${short(readNow())}${over()}`);
+      lines.push(`${stamp()} ${tag}${pressNote} → p(${ptr.x.toFixed(0)},${ptr.y.toFixed(0)}) · ${short(readNow())}${over()}`);
     } catch (err: any) { stopped = `${tag}: ${err.message}`; break; }
     finally { if (s.op !== "assert") logAction(s, wall0, stopped === stoppedBefore); }
   }

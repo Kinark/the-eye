@@ -893,15 +893,24 @@ var pidCounts: [Int64: Int] = [:] // source pid → pointer events seen (diagnos
 var blockedTypes: [UInt32: Int] = [:]
 /// Where the cursor must stay (lock start, then wherever allowed events last put it).
 var heldCursor: CGPoint?
+/// True once the countdown is over. Until then the tap stays off: disabling a fresh tap delivers a
+/// tapDisabledByUserInput callback, and re-enabling on that used to arm the lock in the middle of the 3·2·1.
+var lockEngaged = false
+/// Largest distance (pt) the cursor got away from where it was pinned, as seen by the pin timer.
+var maxDrift = 0.0
+/// Physical pointer motion is cut off from the cursor while locked (posted events still move it). Restored on every
+/// exit path; `eye-capture release-cursor` restores it from outside if this process was killed.
+func pinCursor(_ on: Bool) { CGAssociateMouseAndMouseCursorPosition(on ? 0 : 1) }
 func lockReport(_ why: String) -> String {
-    json(["ended": why, "blocked": blocked, "passed": passed,
+    pinCursor(false)
+    return json(["ended": why, "blocked": blocked, "passed": passed, "max_cursor_drift_pt": (maxDrift * 10).rounded() / 10,
           "blocked_by_event_type": Dictionary(uniqueKeysWithValues: blockedTypes.map { (String($0.key), $0.value) }),
           "pointer_events_by_source_pid": Dictionary(uniqueKeysWithValues: pidCounts.map { (String($0.key), $0.value) })])
 }
 
 let lockCallback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if let t = lockTap { CGEvent.tapEnable(tap: t, enable: true) }
+        if lockEngaged, let t = lockTap { CGEvent.tapEnable(tap: t, enable: true) }
         return Unmanaged.passUnretained(event)
     }
     // EVERY event type is tapped (trackpad gesture phases, force touch, keys, media keys, …).
@@ -957,13 +966,16 @@ func cmdLock() {
     onTerminate { end("signal") }
     let engage = {
         heldCursor = CGEvent(source: nil)?.location
+        lockEngaged = true
+        pinCursor(true)
         CGEvent.tapEnable(tap: tap, enable: true)
         // The overlay is only ever shown together with this full lock: orange on screen = no physical input gets through.
         showLockOverlay(until: Date().addingTimeInterval(seconds))
         // Backstop for movement that reaches the cursor without a tappable event: re-pin it every 8 ms.
         let pin = Timer(timeInterval: 0.008, repeats: true) { _ in
             guard let want = heldCursor, let now = CGEvent(source: nil)?.location else { return }
-            if abs(now.x - want.x) > 0.5 || abs(now.y - want.y) > 0.5 { CGWarpMouseCursorPosition(want) }
+            let d = hypot(now.x - want.x, now.y - want.y)
+            if d > 0.5 { maxDrift = max(maxDrift, d); CGWarpMouseCursorPosition(want) }
         }
         RunLoop.main.add(pin, forMode: .common)
         // The TS side waits for this line before it drives anything.
@@ -1190,14 +1202,19 @@ func showLockOverlay(until: Date) {
 //   {"op":"click","x"?,"y"?,"button":"left|right","count":1,"hold_ms":60}
 //   {"op":"down"|"up","button":"left"}             press / release (drag = down, move, up)
 //   {"op":"scroll","dy":-5,"dx":0,"events":30,"interval_ms":8,"phased":true}
-//                                                   phased = trackpad-style began/changed/ended
+//                                                   phased = trackpad-style began/changed/ended; "momentum":true
+//                                                   adds the coasting tail after the fingers lift ("decay" 0.94)
+//   {"op":"pinch","scale":1.5,"ms":300}             two-finger pinch (scale > 1 spreads / zooms in)
+//   {"op":"rotate","degrees":45,"ms":300}           two-finger rotation (+ = clockwise)
+//   {"op":"smart_zoom"}                              two-finger double-tap
+//   {"op":"swipe","direction":"left|right|up|down"}  navigation swipe (back / forward)
 //   {"op":"pos"}                                    current pointer position
 //   {"op":"owner","x"?,"y"?}                         topmost window under a point {pid, owner, layer, number}
 //   {"op":"inspect","x"?,"y"?,"brief"?}              AX element under a point (everything it exposes) + its window
 //   {"op":"tree","rect"?:[x,y,w,h],"display"?,"x"?,"y"?,"process"?,"mode":"basic|full","depth"?,"max_nodes"?,"limit"?,"clip"?,"out"?}
 //                                                   AX element tree (with frames) of the windows in a display-local rect,
 //                                                   or of the single window under a point; full JSON to `out`
-// click/down accept "require_pid": the press is refused unless that pid owns the topmost window there.
+// click/down and the gestures accept "require_pid": the press is refused unless that pid owns the topmost window there.
 // All events carry eventSourceUserData 0x45594521 so they pass eye-capture's input lock.
 func cmdInput() {
     setvbuf(stdout, nil, _IOLBF, 0)
@@ -1220,6 +1237,14 @@ func cmdInput() {
     /// A press with `require_pid` is only posted when that process owns the topmost window at the point.
     func pressAllowed(_ c: [String: Any], at p: CGPoint) -> String? {
         guard let want = (c["require_pid"] as? NSNumber)?.intValue else { return nil }
+        // AX hit-test first: it follows real click routing. CG's topmost window is often a click-through one (the Dock
+        // keeps a full-screen layer-20 window over every normal app), which would refuse every press on a normal window.
+        if AXIsProcessTrusted(), let el = AXI.hit(p) {
+            let got = Int(AXI.pid(el))
+            if got == want { return nil }
+            let name = NSRunningApplication(processIdentifier: pid_t(got))?.localizedName ?? "pid \(got)"
+            return "REFUSED press at \(Int(p.x)),\(Int(p.y)): the element there belongs to \(name) (pid \(got)), not pid \(want)"
+        }
         let o = topWindow(at: p)
         let got = (o?["pid"] as? NSNumber)?.intValue ?? (o?["pid"] as? Int) ?? -1
         return got == want ? nil : "REFUSED press at \(Int(p.x)),\(Int(p.y)): topmost window belongs to \(o?["owner"] ?? "nothing") (pid \(got)), not pid \(want)"
@@ -1278,6 +1303,149 @@ func cmdInput() {
             if phased { post(1, 0, 0); usleep(iv) }
             for _ in 0..<n { post(2, dy, dx); usleep(iv) }
             if phased { post(4, 0, 0) }
+            // Fingers lifted mid-flick: the trackpad keeps going on its own with decaying momentum events
+            // (momentum phase 1 begin, 2 continue, 3 end; scroll phase 0), which is what flings, rubber-banding
+            // and page swipes react to.
+            if phased, (c["momentum"] as? Bool) == true {
+                func mom(_ phase: Int64, _ y: Int32, _ x: Int32) {
+                    guard let e = CGEvent(scrollWheelEvent2Source: src, units: .pixel, wheelCount: 2, wheel1: y, wheel2: x, wheel3: 0) else { return }
+                    e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+                    e.setIntegerValueField(.scrollWheelEventMomentumPhase, value: phase)
+                    e.location = pointer()
+                    send(e)
+                }
+                var vy = Double(dy), vx = Double(dx), first = true
+                let decay = num("decay", 0.94)
+                while abs(vy) >= 1 || abs(vx) >= 1 {
+                    vy *= decay; vx *= decay
+                    mom(first ? 1 : 2, Int32(vy.rounded()), Int32(vx.rounded())); first = false
+                    usleep(8333)
+                }
+                mom(3, 0, 0)
+            }
+        case "pinch", "rotate", "smart_zoom", "swipe":
+            // Trackpad gestures. Not in any public header: an NSEventTypeGesture (29) CGEvent whose CGS field 110
+            // carries the IOHID event type (8 zoom, 5 rotation, 22 zoom toggle, 16 navigation swipe), 113/114 the
+            // magnification / rotation delta, 115 the swipe direction, 132 the IOHID phase (1 began, 2 changed,
+            // 4 ended). Field map from Calf Trail's TouchSynthesis via Mac Mouse Fix's TouchSimulator.
+            // They have to enter at the session tap: posted at the HID tap AppKit never sees them.
+            // Gestures route to the window under the cursor, and the window server takes a few ms to notice that
+            // a pointer which just jumped in is now over a new window: the first gesture after a jump is dropped.
+            // Re-assert the position and let it settle first.
+            let at = c["x"] != nil || c["y"] != nil ? CGPoint(x: num("x", pointer().x), y: num("y", pointer().y)) : pointer()
+            moveEvent(at); usleep(40000)
+            if let why = pressAllowed(c, at: pointer()) { reply(["ok": false, "error": why]); continue }
+            func gesture(_ type: Int64, _ phase: Int64, _ set: (CGEvent) -> Void = { _ in }) {
+                guard let e = CGEvent(source: src) else { return }
+                e.type = CGEventType(rawValue: 29)!
+                e.location = pointer()
+                e.setIntegerValueField(CGEventField(rawValue: 110)!, value: type)
+                e.setIntegerValueField(CGEventField(rawValue: 132)!, value: phase)
+                set(e)
+                e.setIntegerValueField(.eventSourceUserData, value: eyeTag)
+                e.post(tap: .cgSessionEventTap)
+            }
+            let frame: useconds_t = 8333
+            let steps = max(2, Int(num("ms", 300) / 8.333))
+            // Smoothstep weights: fingers accelerate in and settle out, like a hand does, instead of a constant rate.
+            func weights() -> [Double] {
+                let s = (0...steps).map { i -> Double in let t = Double(i) / Double(steps); return t * t * (3 - 2 * t) }
+                return (1...steps).map { s[$0] - s[$0 - 1] }
+            }
+            switch op {
+            case "pinch":
+                // scale 2 = spread to twice the size, 0.5 = pinch to half. NSEvent.magnification is a per-event
+                // delta that apps accumulate as product(1 + m) — split ln(scale) so the product lands exactly.
+                let scale = num("scale", 1.5)
+                guard scale > 0 else { reply(["ok": false, "error": "pinch: scale must be > 0"]); continue }
+                gesture(8, 1) { $0.setDoubleValueField(CGEventField(rawValue: 113)!, value: 0) }
+                for w in weights() {
+                    usleep(frame)
+                    let m = exp(log(scale) * w) - 1
+                    gesture(8, 2) { $0.setDoubleValueField(CGEventField(rawValue: 113)!, value: m) }
+                }
+                usleep(frame)
+                gesture(8, 4) { $0.setDoubleValueField(CGEventField(rawValue: 113)!, value: 0) }
+            case "rotate":
+                // degrees > 0 turns clockwise on screen. AppKit's NSEvent.rotation is the opposite (counter-clockwise
+                // positive), so the sign flips on the way in.
+                let deg = num("degrees", 45)
+                gesture(5, 1)
+                for w in weights() {
+                    usleep(frame)
+                    gesture(5, 2) { $0.setDoubleValueField(CGEventField(rawValue: 114)!, value: -deg * w) }
+                }
+                usleep(frame)
+                gesture(5, 4)
+            case "smart_zoom":
+                gesture(22, 0) // two-finger double-tap
+            default:
+                // Navigation swipe (back/forward, NSEvent.swipe): direction left/right/up/down.
+                let dirs: [String: Int64] = ["up": 1, "down": 2, "left": 4, "right": 8]
+                guard let d = dirs[(c["direction"] as? String) ?? "left"] else { reply(["ok": false, "error": "swipe: direction must be left|right|up|down"]); continue }
+                gesture(16, 1) { $0.setIntegerValueField(CGEventField(rawValue: 115)!, value: d) }
+                usleep(frame)
+                gesture(16, 4) { $0.setIntegerValueField(CGEventField(rawValue: 115)!, value: 0) }
+            }
+        case "press", "force_click":
+            // A Force Touch press: mouse down, a pressure curve, mouse up. `force` is one continuous axis of keyframes:
+            // 0…1 is stage 1 (an ordinary click, NSEvent.pressure 0…1), crossing 1 is the force click (stage 2),
+            // 1…2 is pressure inside stage 2. Keyframes are spread evenly over `ms`, eased between.
+            // Pressure events are NSEventTypeGesture CGEvents with IOHID type 32 (kIOHIDEventTypeForce). The field
+            // layout below is read off a real trackpad's events (listen-only tap): 132 phase (1 began, 2 changed,
+            // 4 ended), 143 stage, 144 pressure behavior (5 = deep click, the default), pressure mirrored as a double
+            // in 119/139/148 and as float32 bits in 123/165, stageTransition the same way in 113/114/116/118/147
+            // and 115/117/164. A real press starts the pressure gesture just before mouse down and ends it just before
+            // mouse up, like this one.
+            if c["x"] != nil || c["y"] != nil {
+                let p0 = pointer()
+                moveEvent(CGPoint(x: num("x", p0.x), y: num("y", p0.y))); usleep(40000)
+            }
+            if let why = pressAllowed(c, at: pointer()) { reply(["ok": false, "error": why]); continue }
+            let curve = ((c["force"] as? [NSNumber])?.map { max(0, min(2, $0.doubleValue)) })
+                ?? (op == "force_click" ? [0, 0.9, 1.5, 1.5, 0.9, 0] : [0, 0.5, 0])
+            guard curve.count >= 2 else { reply(["ok": false, "error": "press: force needs at least 2 keyframes, e.g. [0, 0.5, 0]"]); continue }
+            func setF(_ e: CGEvent, _ dbl: [UInt32], _ bits: [UInt32], _ v: Double) {
+                for k in dbl { e.setDoubleValueField(CGEventField(rawValue: k)!, value: v) }
+                for k in bits { e.setIntegerValueField(CGEventField(rawValue: k)!, value: Int64(Float(v).bitPattern)) }
+            }
+            var maxStage = 1
+            func force(_ phase: Int64, _ f: Double) {
+                guard let e = CGEvent(source: src) else { return }
+                e.type = CGEventType(rawValue: 29)!
+                e.location = pointer()
+                let stage = phase == 4 ? 0 : f >= 1 ? 2 : 1
+                maxStage = max(maxStage, stage)
+                let pressure = phase == 4 ? 0 : stage == 2 ? min(1, f - 1) : f
+                // Positive while closing in on the force click; negative while easing back out of it.
+                let transition = stage == 1 ? max(0, (f - 0.7) / 0.3) : stage == 2 ? -max(0, 1 - (f - 1) / 0.25) : 0
+                e.setIntegerValueField(CGEventField(rawValue: 110)!, value: 32)
+                e.setIntegerValueField(CGEventField(rawValue: 132)!, value: phase)
+                e.setIntegerValueField(CGEventField(rawValue: 143)!, value: Int64(stage))
+                e.setIntegerValueField(CGEventField(rawValue: 144)!, value: Int64(num("behavior", 5)))
+                setF(e, [119, 139, 148], [123, 165], pressure)
+                setF(e, [113, 114, 116, 118, 147], [115, 117, 164], transition)
+                e.setIntegerValueField(.eventSourceUserData, value: eyeTag)
+                e.post(tap: .cgSessionEventTap)
+            }
+            let frame: useconds_t = 8333
+            let steps = max(curve.count, Int(num("ms", op == "force_click" ? 700 : 400) / 8.333))
+            func at(_ i: Int) -> Double {
+                let x = Double(i) / Double(steps) * Double(curve.count - 1)
+                let k = min(curve.count - 2, Int(x)), t = x - Double(k), s = t * t * (3 - 2 * t)
+                return curve[k] + (curve[k + 1] - curve[k]) * s
+            }
+            let p = pointer()
+            force(1, 0)
+            let dn = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: p, mouseButton: .left)
+            dn?.setIntegerValueField(.mouseEventClickState, value: 1); send(dn)
+            for i in 1...steps { usleep(frame); force(2, at(i)) }
+            usleep(frame)
+            force(4, 0)
+            let upE = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: p, mouseButton: .left)
+            upE?.setIntegerValueField(.mouseEventClickState, value: 1); send(upE)
+            reply(["ok": true, "op": op, "x": p.x, "y": p.y, "ms": Int(Date().timeIntervalSince(t0) * 1000),
+                   "peak_force": curve.max() ?? 0, "force_clicked": maxStage == 2]); continue
         case "pos": break
         case "inspect":
             // The element under a point (default: the pointer) — everything it exposes — plus the window there.
@@ -1337,6 +1505,7 @@ case "displays": Task { await cmdDisplays() }
 case "snapshot": Task { await cmdSnapshot() }
 case "capture": Task { await cmdCapture() }
 case "lock": cmdLock()
+case "release-cursor": CGAssociateMouseAndMouseCursorPosition(1); exit(0)
 default:
     print("usage: eye-capture displays | capture --rect x,y,w,h --out f.csv [--seconds N] | snapshot --rect x,y,w,h --out f.png | lock [--seconds N]")
     exit(sub.isEmpty ? 1 : 2)

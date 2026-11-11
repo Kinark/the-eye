@@ -112,6 +112,33 @@ function apps(): Proc[] {
 }
 const related = (a: Proc, b: Proc) => a.keys.some((k) => b.keys.includes(k));
 const newest = (l: Proc[]) => [...l].sort((a, b) => a.elapsed - b.elapsed)[0];
+const isBuild = (p: Proc) => !!p.app && /\/(DerivedData|Build\/Products)\//.test(p.app) && !/^(\/System|\/Applications|\/Users\/[^/]+\/Applications)\//.test(p.app);
+/**
+ * An older copy is stale, and safe to quit without asking, when a newer copy of the same thing has started: the same
+ * .app relaunched (Xcode Run without stopping the old run, `open -n`), or a newer build product of the family while
+ * the older one is a build product too. Copies the user may be using (anything outside build folders, e.g.
+ * /Applications) are never stale: those still go through `duplicates`.
+ */
+const stale = (old: Proc, fresh: Proc) => old.elapsed >= fresh.elapsed && old.pid !== fresh.pid && (old.app === fresh.app || (isBuild(old) && isBuild(fresh)));
+/** pid quit as stale → the pid that replaced it, so calls naming the old pid follow the new launch. */
+const replaced = new Map<number, number>();
+function successor(pid: number): number | undefined {
+  let p = pid, seen = 0;
+  while (replaced.has(p) && seen++ < 20) p = replaced.get(p)!;
+  return p !== pid && aliveP(p) ? p : undefined;
+}
+/** Quit every stale family member older than `fresh`. Returns a line for the tool output, or "". */
+async function retireStale(fresh: Proc, members: Proc[]): Promise<string> {
+  const old = members.filter((p) => stale(p, fresh));
+  if (!old.length) return "";
+  const left = await quit(old.map((p) => p.pid));
+  for (const p of old) if (!left.includes(p.pid)) replaced.set(p.pid, fresh.pid);
+  const gone = old.filter((p) => !left.includes(p.pid));
+  return [
+    gone.length ? `quit stale ${gone.map((p) => `${p.name} pid ${p.pid} (started ${fmtAge(p.elapsed)} ago)`).join(", ")}: a newer launch of the same build is running, ${fresh.name} pid ${fresh.pid}, which is the one to test now` : "",
+    left.length ? `could NOT quit stale pid ${left.join(", ")}, so two copies are still running` : "",
+  ].filter(Boolean).join("; ");
+}
 
 function pick(all: Proc[], proc: string | number): Proc | undefined {
   if (typeof proc === "number" || /^\d+$/.test(String(proc))) return all.find((p) => p.pid === Number(proc));
@@ -161,6 +188,16 @@ export async function launch(app: string, settleMs = 1500): Promise<Proc | strin
  * every other family member; relaunch quits the whole family and starts the target's .app fresh (or `app_path`).
  */
 export async function checkInstances(proc: string | number, policy: InstancePolicy = "ask", appPath?: string): Promise<InstanceCheck> {
+  let redirect = "";
+  if (/^\d+$/.test(String(proc)) && !aliveP(Number(proc))) {
+    const next = successor(Number(proc));
+    if (next) { redirect = `pid ${proc} was a stale copy, quit when pid ${next} launched: using pid ${next}`; proc = next; }
+  }
+  const r = await checkFamily(proc, policy, appPath);
+  return redirect ? { ...r, note: [redirect, r.note].filter(Boolean).join("; ") } : r;
+}
+
+async function checkFamily(proc: string | number, policy: InstancePolicy, appPath?: string): Promise<InstanceCheck> {
   const fam = familyOf(proc);
   if (!fam) {
     if (policy === "relaunch" && appPath) {
@@ -182,6 +219,16 @@ export async function checkInstances(proc: string | number, policy: InstancePoli
     return { ok: true, pid: l.pid, note: `relaunched ${l.name}: pid ${l.pid} (quit ${[target, ...others].map((p) => p.pid).join(", ")})` };
   }
   if (!others.length) return { ok: true, pid: target.pid };
+  if (policy === "ask") {
+    // Stale copies (older launches of the same build) never need a decision: the newest launch wins.
+    const all = [target, ...others], fresh = newest(all);
+    const note = await retireStale(fresh, all);
+    if (note) {
+      const left = familyOf(fresh.pid);
+      if (left && !left.others.length) return { ok: true, pid: fresh.pid, note: target.pid !== fresh.pid ? `${note}; using pid ${fresh.pid}, not pid ${target.pid}` : note };
+      if (left) return { ok: false, error: `${note}\n${conflictText(left.target, left.others)}` };
+    }
+  }
   if (policy === "quit_others") {
     const left = await quit(others.map((p) => p.pid));
     if (left.length) return { ok: false, error: `could not quit pid ${left.join(", ")}` };
@@ -216,17 +263,27 @@ export function watch(p: Proc) {
   for (const q of apps()) if (q.keys.some((k) => w.keys.includes(k))) w.pids.add(q.pid);
   watched.set(key, w);
   if (!watcher) {
-    watcher = setInterval(() => {
-      const now = apps();
-      for (const w of watched.values()) {
-        const fam = now.filter((q) => q.keys.some((k) => w.keys.includes(k)));
-        for (const q of fam) if (!w.pids.has(q.pid)) {
-          w.pids.add(q.pid);
-          if (fam.length > 1) events.push({ t: Date.now(), text: `another copy of ${w.name}'s app launched: ${q.name} pid ${q.pid} (${fam.length} running now: ${fam.map((f) => f.pid).join(", ")})` });
+    let busy = false;
+    watcher = setInterval(async () => {
+      if (busy) return; // a quit in progress takes up to ~3.5s
+      busy = true;
+      try {
+        const now = apps();
+        for (const w of watched.values()) {
+          const fam = now.filter((q) => q.keys.some((k) => w.keys.includes(k)));
+          for (const q of fam) if (!w.pids.has(q.pid)) {
+            w.pids.add(q.pid);
+            if (fam.length < 2) continue;
+            // A newer launch of the same build: the old copy is stale, quit it now instead of leaving two on screen.
+            const note = await retireStale(q, fam);
+            const left = familyOf(q.pid);
+            if (note) events.push({ t: Date.now(), text: note });
+            if (left?.others.length) events.push({ t: Date.now(), text: `another copy of ${w.name}'s app launched: ${q.name} pid ${q.pid} (${left.others.length + 1} running now: ${[left.target, ...left.others].map((f) => f.pid).join(", ")})` });
+          }
+          for (const pid of [...w.pids]) if (!fam.some((q) => q.pid === pid) && !aliveP(pid)) w.pids.delete(pid);
         }
-        for (const pid of [...w.pids]) if (!fam.some((q) => q.pid === pid)) w.pids.delete(pid);
-      }
-    }, 2000);
+      } finally { busy = false; }
+    }, 750);
     watcher.unref();
   }
 }
@@ -236,7 +293,7 @@ export function instanceEvents(since: number) { return events.filter((e) => e.t 
 let reported = 0;
 /** Launch warnings not shown yet; every tool output appends them, so the agent hears about a new copy right away. */
 export function freshEvents(): string[] {
-  const out = events.slice(reported).map((e) => `⚠ ${new Date(e.t).toLocaleTimeString()} ${e.text} — eye_app {app:"${e.text.split("'s app")[0].replace("another copy of ", "")}"} for the choices`);
+  const out = events.slice(reported).map((e) => `⚠ ${new Date(e.t).toLocaleTimeString()} ${e.text}${e.text.startsWith("another copy of ") ? ` — eye_app {app:"${e.text.split("'s app")[0].replace("another copy of ", "")}"} for the choices` : ""}`);
   reported = events.length;
   return out;
 }
