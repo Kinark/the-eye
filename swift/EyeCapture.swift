@@ -20,6 +20,7 @@
 import AppKit
 import CoreMedia
 import ImageIO
+import IOKit.hid
 import ScreenCaptureKit
 import UniformTypeIdentifiers
 
@@ -891,19 +892,46 @@ var escLast = 0.0
 var blocked = 0, passed = 0
 var pidCounts: [Int64: Int] = [:] // source pid → pointer events seen (diagnostics: physical = 0)
 var blockedTypes: [UInt32: Int] = [:]
-/// Where the cursor must stay (lock start, then wherever allowed events last put it).
+/// Where the cursor should be (lock start, then wherever allowed events last put it). Read-only: only used to
+/// measure `max_cursor_drift_pt`, the cursor is never warped back.
 var heldCursor: CGPoint?
 /// True once the countdown is over. Until then the tap stays off: disabling a fresh tap delivers a
 /// tapDisabledByUserInput callback, and re-enabling on that used to arm the lock in the middle of the 3·2·1.
 var lockEngaged = false
-/// Largest distance (pt) the cursor got away from where it was pinned, as seen by the pin timer.
+/// Largest distance (pt) the cursor got from where it should be, sampled on every blocked physical move.
 var maxDrift = 0.0
-/// Physical pointer motion is cut off from the cursor while locked (posted events still move it). Restored on every
-/// exit path; `eye-capture release-cursor` restores it from outside if this process was killed.
-func pinCursor(_ on: Bool) { CGAssociateMouseAndMouseCursorPosition(on ? 0 : 1) }
+/// The window server moves the arrow before any event tap sees the motion, so the tap alone stops clicks but not
+/// the cursor. The lock therefore seizes every pointing device at the HID level: the device's reports go to us
+/// instead of the window server, and the arrow never hears about the finger. Trackpad gesture/touch events come
+/// through a separate multitouch path (exclusively held by the system) and are dropped by the tap as before.
+/// The kernel releases a seize when the process dies, so a killed lock can't strand the trackpad.
+let pointerHID = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+var seizedDevices: [IOHIDDevice] = []
+let seizeOption = IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
+func seizePointers() {
+    IOHIDManagerSetDeviceMatchingMultiple(pointerHID, [
+        [kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop, kIOHIDDeviceUsageKey: kHIDUsage_GD_Mouse],
+        [kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop, kIOHIDDeviceUsageKey: kHIDUsage_GD_Pointer],
+        [kIOHIDDeviceUsagePageKey: kHIDPage_Digitizer],
+    ] as CFArray)
+    // Fires for every device present now and for any mouse plugged in or paired mid-lock.
+    IOHIDManagerRegisterDeviceMatchingCallback(pointerHID, { _, _, _, device in
+        guard !seizedDevices.contains(device), IOHIDDeviceOpen(device, seizeOption) == kIOReturnSuccess else { return }
+        seizedDevices.append(device)
+    }, nil)
+    IOHIDManagerScheduleWithRunLoop(pointerHID, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+}
+func releasePointers() {
+    IOHIDManagerUnscheduleFromRunLoop(pointerHID, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+    for d in seizedDevices { IOHIDDeviceClose(d, seizeOption) }
+    seizedDevices.removeAll()
+}
 func lockReport(_ why: String) -> String {
-    pinCursor(false)
-    return json(["ended": why, "blocked": blocked, "passed": passed, "max_cursor_drift_pt": (maxDrift * 10).rounded() / 10,
+    let seized = seizedDevices.count
+    releasePointers()
+    CGAssociateMouseAndMouseCursorPosition(1) // older builds disassociated the cursor; never leave it cut off
+    return json(["ended": why, "blocked": blocked, "passed": passed, "pointer_devices_seized": seized,
+          "max_cursor_drift_pt": (maxDrift * 1000).rounded() / 1000,
           "blocked_by_event_type": Dictionary(uniqueKeysWithValues: blockedTypes.map { (String($0.key), $0.value) }),
           "pointer_events_by_source_pid": Dictionary(uniqueKeysWithValues: pidCounts.map { (String($0.key), $0.value) })])
 }
@@ -940,9 +968,9 @@ let lockCallback: CGEventTapCallBack = { _, type, event, _ in
             if CACurrentMediaTime() - escLast >= panicGap - 0.01 { escStreak = 0; showEscStreak(0) }
         }
     }
-    // The window server moves the cursor itself before any tap sees the event: dropping the event stops clicks,
-    // not the arrow. Put it straight back where the test left it.
-    if isMove, let p = heldCursor { CGWarpMouseCursorPosition(p) }
+    if isMove, let want = heldCursor, let now = CGEvent(source: nil)?.location {
+        maxDrift = max(maxDrift, hypot(now.x - want.x, now.y - want.y))
+    }
     return nil
 }
 
@@ -967,17 +995,10 @@ func cmdLock() {
     let engage = {
         heldCursor = CGEvent(source: nil)?.location
         lockEngaged = true
-        pinCursor(true)
+        seizePointers()
         CGEvent.tapEnable(tap: tap, enable: true)
         // The overlay is only ever shown together with this full lock: orange on screen = no physical input gets through.
         showLockOverlay(until: Date().addingTimeInterval(seconds))
-        // Backstop for movement that reaches the cursor without a tappable event: re-pin it every 8 ms.
-        let pin = Timer(timeInterval: 0.008, repeats: true) { _ in
-            guard let want = heldCursor, let now = CGEvent(source: nil)?.location else { return }
-            let d = hypot(now.x - want.x, now.y - want.y)
-            if d > 0.5 { maxDrift = max(maxDrift, d); CGWarpMouseCursorPosition(want) }
-        }
-        RunLoop.main.add(pin, forMode: .common)
         // The TS side waits for this line before it drives anything.
         FileHandle.standardError.write("eye-capture: physical pointer + keyboard locked for \(seconds)s (Esc ×6 = emergency release)\n"
             .data(using: .utf8)!)

@@ -1,7 +1,7 @@
 // node test/lock.mjs — the lock's countdown and cursor pin. Takes the real lock (3·2·1 first, ~3s locked; Esc ×6 releases).
 // 1. The tap must stay off during the countdown: an untagged event posted mid-countdown is never seen by it, one
 //    posted after engaging is (and is blocked). Before the fix, disabling the fresh tap re-armed it mid-countdown.
-// 2. Move your trackpad/mouse while it's locked: max_cursor_drift_pt reports how far the cursor got (should be 0).
+// 2. Move your trackpad/mouse while it's locked: the trackpad is seized, so the cursor must not move; max_cursor_drift_pt reports how far it got (should be 0).
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 

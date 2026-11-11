@@ -141,7 +141,7 @@ Interactive loop: `eye_inspect` (find targets) → `eye_record` → repeat `eye_
 
 Every lock (`eye_act`'s automatic one, `eye_record lock_input`, `eye_lock`) taps every event type and drops
 all physical input whose source process ID is 0: pointer, scroll, trackpad gestures, force touch, keys, modifiers and
-media keys. It also pins the cursor: physical motion is disconnected from it (`CGAssociateMouseAndMouseCursorPosition`), so it doesn't move even 1pt, while posted moves still drive it. An 8ms re-pin timer is the backstop, and the report's `max_cursor_drift_pt` says how far it ever got. Before blocking, it shows a 3·2·1 countdown in the middle of every screen (0.5s per
+media keys. It also seizes every pointing device at the HID level (`IOHIDDeviceOpen` with `kIOHIDOptionsTypeSeizeDevice`, including mice connected mid-lock), so the trackpad never reaches the window server and the cursor doesn't move at all, while posted moves still drive it. The kernel drops the seize if the process dies. The report has `pointer_devices_seized`, and `max_cursor_drift_pt` says how far the cursor ever got from where it should be (should be 0). Before blocking, it shows a 3·2·1 countdown in the middle of every screen (0.5s per
 number, 1.5s total) while input is still free (the tap is not armed until it ends; `test/lock.mjs` checks this); the tools wait for it. The orange overlay is shown exactly while a lock is held, so orange on screen
 means no physical input gets through. The user's emergency release is Esc six times in a row, each within 1s of the
 previous (those presses are swallowed too; dots on the overlay pill fill up and a hint shows how many are left). Its result includes `pointer_events_by_source_pid` and `blocked_by_event_type`, so you can
