@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node src/index.ts",
+    "show-off": "node show-off/serve.mjs",
     "typecheck": "tsc -p .",
     "build:native": "mkdir -p bin && swiftc -O -swift-version 5 swift/EyeCapture.swift -o bin/eye-capture"
   },

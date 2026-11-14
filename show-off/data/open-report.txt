@@ -1,0 +1,24 @@
+LOOKED MOSTLY SMOOTH: 1 low-rate motion, 2 main-thread stalls (visible only if you look for it) · 68.6 fps of 120 while moving.
+~ the main thread stalled 25.5ms at 2.43s, around the motion, without a matching gap on screen
+    why: NOOTCH!-Dev's main thread was blocked 25.5ms from 2.43s · 3 stack samples
+      in app code: Nootch.NativeGlassPillView.ContourSDFBaker.()(_: Nootch.NativeGlassPillView.ContourSDFBaker.Request, pipeline: __C.MTLCo (67%)
+~ the motion ran at a steady 60 fps on a 120Hz display (evenly every 2.0 refreshes): something drives it at that rate — a timer, a 60Hz display link, video, or ProMotion throttling — rather than frames being dropped
+~ the main thread stalled 64.5ms at 2.46s, around the motion, without a matching gap on screen
+    why: NOOTCH!-Dev's main thread was blocked 64.5ms from 2.46s · 15 stack samples
+      in app code: Nootch.NativeGlassPillView.ContourSDFBaker.()(_: Nootch.NativeGlassPillView.ContourSDFBaker.Request, pipeline: __C.MTLCo (13%) · Nootch.Note.updatedAt.setter : Foundation.Date (7%) · static Nootch.GlassGooLink.contour() (7%)
+· answered 95.9ms after click "open" at 2.37s (from the moment the step was sent)
+    the screen changed first: the app told accessibility 142ms after the step (window-opened dialog), 46.5ms after the first visible change
+· the motion: 2.46s–4.27s (1808ms) · what moved grew 269pt×68pt → 835pt×158pt · 68.6 fps of 120
+    moved by: a SPRING, damping ratio 0.57, response 0.77s — in code: .spring(duration: 0.77, bounce: 0.43), or stiffness 66 damping 9.25 at mass 1, launched already moving (-4.51× its travel per second); lively: one clear overshoot, then home
+      it settled 750ms after it began, overshot 65.0pt (11%), fastest 4349pt/s at 33% of the way through · fit off by 2.8% of the travel over 185 frames · read from the width of what moved, frame by frame
+what the app told accessibility (same clock):
+  2.51s window-opened dialog · 142ms after click "open" · 3% into the motion (1808ms long)
+under the pixels (as root: dtrace, powermetrics · no root: signposts, rusage, SkyLight):
+  the motion: the app committed 229× (127/s, longest 58.0ms on its main thread): it drives the motion frame by frame · the display got 125 frames (69/s, longest wait 21.2ms)
+    this app's share: 100 of those frames carried a change of its windows, each on the display 10.0ms after the window server learned of it (worst 15.3ms)
+    inside the app: 163 AppKit update cycles (median 3.2ms, longest 62.7ms), 77 of them flagged as stalls by AppKit · Core Animation flagged 76 commits as stalled (longest 58.0ms) · 2 events handled (longest 3.2ms)
+    the window server: rendered each frame in 5.6ms (longest 9.3ms), 0.7ms of GPU work; it marked 94 of 124 as stalled (90.9ms from scheduled to on the glass, 3.3ms of it rendering: it was waiting, not working)
+  cost while moving: app 601 ms/s CPU · window server 674 ms/s CPU · whole machine: GPU 9416 mW, CPU 6151 mW
+  cost at rest:      app 206 ms/s CPU · window server 499 ms/s CPU · whole machine: GPU 2332 mW, CPU 4057 mW
+  the app's own energy while moving: 2163 mW (99% on performance cores), 603 ms/s CPU, 543 wakeups/s · 3892.6 mJ in all (rusage)
+  the app's own energy at rest:      72 mW (0% on performance cores), 207 ms/s CPU, 565 wakeups/s
