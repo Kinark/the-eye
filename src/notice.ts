@@ -22,7 +22,7 @@ export type Said = { t: number; last: number; n: number; event: string; text: st
 export type Heard = { from: number; app: string; events: Said[] };
 
 /** One main-thread stall measured inside the app by the probe's watchdog (mach seconds). */
-import { loadUnder, underLines, whoWasLate } from "./under.ts";
+import { loadUnder, underLines, underTitle, whoWasLate } from "./under.ts";
 
 export type Stall = { t: number; ms: number; n: number; ongoing?: boolean; app: [string, number][]; leaf: [string, number][]; stack: string[] };
 export type Stalls = { name: string; pid: number; from: number; to: number; threshold_ms: number; stacks: boolean; stalls: Stall[] };
@@ -138,7 +138,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
   const actions = o.dir ? loadActions(o.dir, t0Wall).filter((x) => inWin({ t: x.t0 } as Row)) : [];
   const heard = o.dir ? loadSaid(o.dir, t0Wall) : null;
   const said = heard ? heard.events.filter((e) => inWin({ t: e.t } as Row)) : [];
-  const under = o.dir ? loadUnder(o.dir, t0Wall) : null;
+  const under = o.dir ? loadUnder(o.dir, t0Wall, t0Mach) : null;
   /** The probe says what held the main thread; the root readings say whether it was the app or the window server. */
   const whyFroze = (from: number, to: number) => { const w = whyGap(stalls, t0Mach, from, to), late = under ? whoWasLate(under, from, to, period) : undefined; return late ? [...w, late] : w; };
   const P: Percept[] = [];
@@ -422,7 +422,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
       ? `${heard.app || "the app"} told accessibility nothing while this happened (no value, focus, window, sheet, menu or announcement event): whatever the steps changed, assistive technology was not told` : undefined,
   } : undefined;
   const told = under ? underLines(under, a.segments, period) : [];
-  return { grade, verdict, percepts: P, said: toldOf, under: told.length ? told : undefined };
+  return { grade, verdict, percepts: P, said: toldOf, under: under && told.length ? [underTitle(under), ...told] : undefined };
 }
 
 /** Verdict, then what was noticed (worst first, causes indented under each), then the plain facts. */
@@ -444,6 +444,6 @@ export function formatSeen(s: Seen, max = 10): string {
     for (const l of s.said.lines.slice(0, n)) L.push(`  ${l}`);
     if (s.said.lines.length > n) L.push(`  … ${s.said.lines.length - n} more (events.jsonl in the run folder; eye_report view:"explain" lists them all)`);
   } else if (s.said?.silent) L.push(`· ${s.said.silent}`);
-  if (s.under?.length) { L.push("under the pixels (as root: dtrace, powermetrics):"); for (const l of s.under) L.push(`  ${l}`); }
+  if (s.under?.length) { L.push(s.under[0]); for (const l of s.under.slice(1)) L.push(`  ${l}`); }
   return L.join("\n");
 }

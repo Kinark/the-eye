@@ -96,7 +96,7 @@ type Capture = {
   trace?: Trace; profileNote?: string; stopping?: boolean;
   /** `eye-capture watch --exact` on the recorded app, writing events.jsonl beside the frames. */
   events?: ChildProcess;
-  /** dtrace + powermetrics on the recorded app and the window server (only when sudo needs no password). */
+  /** Signposts and vitals of the recorded app, plus dtrace + powermetrics when sudo needs no password (under.ts). */
   under?: Under | null;
 };
 const captures = new Map<string, Capture>();
@@ -502,7 +502,7 @@ type RecordParams = {
   only_pid?: number;
   /** The recorded app: its accessibility events go on the recording's clock (events.jsonl). `events: false` = don't listen. */
   events_pid?: number; events?: boolean;
-  /** `root: false` = no dtrace / powermetrics beside the recording. */
+  /** `root: false` = no dtrace / powermetrics beside the recording (signposts and vitals need no root and stay). */
   root?: boolean;
 } & Options;
 
@@ -552,7 +552,7 @@ function startJob(p: RecordParams): Job {
       return job.final;
     }
     if (p.events_pid && p.events !== false && !job.stopped) startEvents(c, p.events_pid, capOpts.seconds + 5);
-    if (p.events_pid && p.root !== false && !job.stopped) c.under = startUnder(c.dir, p.events_pid, capOpts.seconds + 5);
+    if (p.events_pid && !job.stopped) c.under = startUnder(c.dir, p.events_pid, capOpts.seconds + 5, { root: p.root !== false, helper: BIN });
     if (retried.length) job.startNote = (`capture retried ${retried.length}× (ScreenCaptureKit refused to start: ${retried[0]})`);
     const treeMode = p.tree ?? (ax ? "basic" : "none");
     if (treeMode !== "none" && !job.stopped) {
@@ -642,7 +642,7 @@ WHAT MOVED IT. Under each motion, "moved by:" names the physics behind the frame
 
 WHY IT HAPPENED. eye_probe {process} once (a Debug build; with System Integrity Protection off, any app at all, Apple's included) puts a watchdog inside the app. From then on every freeze in every report carries its cause as "why:" lines: how long the app's main thread was blocked, the app function that was running (share of stack samples) and the stack — or that the main thread was free, so the frames were lost after the app (render server, GPU, window server). No Instruments, nothing to set up per run. eye_report {view:"explain"} joins the worst frames with pointer, element, step and main thread. For a whole-run CPU profile add profile:{process} to eye_record (Instruments; takes seconds to start).
 WHAT THE APP SAID. A recording of an app (eye_act's own, eye_record {process}) also listens to what the app tells accessibility: a value changed, focus moved, a window, sheet or menu came or went, an announcement. Each is put on the recording's clock under "what the app told accessibility": how long after the step, and how far into which motion. Under each "answered …" line, who was first: "the app knew first" (it told accessibility N ms before the screen began to change: the wait was in drawing, not deciding), "the screen changed first", or "yet the app reported a change" when nothing visible answered. If it says the app told accessibility nothing, assistive technology was not told what the steps changed. events:false does not listen.
-UNDER THE PIXELS. When sudo runs dtrace and powermetrics without a password, a recording of an app also reads, as root: each Core Animation commit of the app (when, and how long it held the main thread), each frame the window server handed to the display, and the CPU time, GPU time and power of both, ten times a second. The report then says under a freeze WHO WAS LATE (the app committed nothing / one commit ran long / the app was on time and the window server was not), per motion how often the app committed and how many frames reached the display ("committed nothing" = the animation runs in the window server, not in the app), and what moving cost against rest. root:false leaves them out. Without the sudoers rule nothing is asked and nothing is read: ${ROOT_HINT}.
+UNDER THE PIXELS. A recording of an app also reads what no screen recording can. WITHOUT ROOT, always: SIGNPOSTS, what AppKit, Core Animation and the window server say of themselves (each update cycle of the app, each event it handled, each commit, and the ones the frameworks flag as stalls; each frame of the window server, how long it rendered and spent on the GPU, and the ones it marks as stalled), and VITALS twenty times a second: the energy, CPU time and wakeups the kernel billed to the app alone, the window server's own count of display updates and the display's refresh period right now. AS ROOT, when sudo runs dtrace and powermetrics without a password: each commit timed in the app, each frame swap, each time the window server learned that one of THIS APP's windows changed, and CPU time plus whole-machine GPU and CPU power. The report then says under a freeze WHO WAS LATE (the app committed nothing, and where its update cycle spent the time: handling an event, in the commit, or in its own per-frame code / the app was on time and the window server was not / both were on time and what was drawn did not change), and per motion: how often the app committed ("committed nothing" = the animation runs in the window server), how many frames reached the display and, as root, "this app's share" = how many of them carried a change of its windows and how long each took to reach the display; "inside the app" = its update cycles and what AppKit flagged; how long the window server rendered each frame; what moving cost against rest, for the whole machine and for the app alone (mW, share on performance cores, wakeups). A frame the window server marks as stalled is told with its rendering time: "it was waiting, not working" means a client kept it waiting. root:false leaves out only the root readers. Nothing ever asks for a password: ${ROOT_HINT}.
 
 USE IT BY DEFAULT: this is how you test a macOS app's UI (SwiftUI or AppKit) yourself. After a UI change builds, launch the app and verify it here: find the element, drive it, read what it looked like. Don't hand the check to the user ("try it and tell me"). Only skip the-eye when the user says they'll drive the test.
 
@@ -805,7 +805,7 @@ server.registerTool("eye_record", {
     rect: rectSchema.optional().describe("Region to record, display-local points. Omit it and pass `process` to record that app's window, wherever it is."),
     window: z.string().optional().describe("Without rect: which of the app's windows (title substring). Default its main window, else the largest."),
     events: z.boolean().optional().describe("With a process: also listen to what the app tells accessibility while it is recorded (values, focus, windows, sheets, menus, announcements) and place each on the recording's clock, next to the motion and the steps (default true; false = don't attach an observer)."),
-    root: z.boolean().optional().describe("With an app recording, when sudo runs dtrace and powermetrics without a password: also record the app's Core Animation commits, the window server's frame swaps, and CPU/GPU time and power, so the report can say who was late and what the motion cost. Default true; false = leave them out."),
+    root: z.boolean().optional().describe("With an app recording, when sudo runs dtrace and powermetrics without a password: also time the app's commits and the window server's frame swaps as root, count which display frames carried a change of THIS app's windows, and read whole-machine GPU/CPU power. Default true; false = leave them out (the signposts and the app's own energy need no root and are always read)."),
     isolate: z.boolean().optional().describe("With process and no rect: record that app's own windows only, over mid grey, so nothing behind a see-through window or over the app is mistaken for its motion (default true). false = the screen as it is, other apps included."),
     label: z.string().optional().describe("Name for this run (used in the run folder and reports)."),
     display: z.number().int().optional().describe("Display id from eye_status (default main)."),
@@ -1022,7 +1022,7 @@ server.registerTool("eye_act", {
     ax: z.boolean().optional().describe("Report the element under the pointer after each step (default: the recording's ax setting, true without a recording)."),
     tree: treeSchema.optional().describe("After the steps, also dump the AX tree of the recorded region (or the window under the pointer). Default none."),
     events: z.boolean().optional().describe("With its own recording: also listen to what the app tells accessibility while it is recorded (values, focus, windows, sheets, menus, announcements) and place each on the recording's clock, next to the motion and the steps (default true; false = don't attach an observer)."),
-    root: z.boolean().optional().describe("With an app recording, when sudo runs dtrace and powermetrics without a password: also record the app's Core Animation commits, the window server's frame swaps, and CPU/GPU time and power, so the report can say who was late and what the motion cost. Default true; false = leave them out."),
+    root: z.boolean().optional().describe("With an app recording, when sudo runs dtrace and powermetrics without a password: also time the app's commits and the window server's frame swaps as root, count which display frames carried a change of THIS app's windows, and read whole-machine GPU/CPU power. Default true; false = leave them out (the signposts and the app's own energy need no root and are always read)."),
     see: z.boolean().optional().describe("With no eye_record running: record target_process's window for these steps and report what it looked like (default true; costs ~0.3s before the first step and up to 1.5s after the last, while motion settles)."),
     lock: z.boolean().optional().describe("Block all physical input for exactly the duration of these steps (default true)."),
     lock_style: z.enum(["full", "quick"]).optional().describe("full: 1.5s 3·2·1 warning, orange overlay. quick: \"Just a sec…\" — no countdown, small pill. Default: quick when front:true and the steps take ≤5s, else full."),

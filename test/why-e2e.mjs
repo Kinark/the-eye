@@ -8,7 +8,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-const AS_ROOT = spawnSync("/usr/bin/sudo", ["-n", "-l", "/usr/sbin/dtrace"], { stdio: "ignore" }).status === 0;
+const AS_ROOT = process.env.THE_EYE_ROOT !== "0" && spawnSync("/usr/bin/sudo", ["-n", "-l", "/usr/sbin/dtrace"], { stdio: "ignore" }).status === 0;
 import { join } from "node:path";
 
 const ROOT = new URL("..", import.meta.url).pathname;
@@ -27,7 +27,7 @@ sh("codesign", ["-f", "-s", "-", "--entitlements", ent, appDir]);
 
 const app = spawn(exe, [], { stdio: "ignore", env: { ...process.env, JANK_MS: jank } });
 const client = new Client({ name: "why-e2e", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [join(ROOT, "src", "index.ts")] }));
+await client.connect(new StdioClientTransport({ command: "node", args: [join(ROOT, "src", "index.ts")], env: process.env }));
 const call = async (name, args) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 120_000 });
   const t = r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
@@ -53,10 +53,18 @@ try {
     want("the freeze was noticed", /(FROZE|HUNG) \d/.test(act.t));
     want("the cause is the main thread", /main thread was blocked/.test(act.t));
     want("the culprit is named", /Model\.reload/.test(act.t));
-    // As root (only when sudo runs dtrace without a password): the same freeze, read from the app's commits alone.
+    // Without the probe and without root: the same freeze, read from what AppKit and Core Animation say of themselves.
+    const [, quiet, by] = act.t.match(/the app was late: it committed nothing to Core Animation for ([\d.]+)ms \((dtrace|signposts)\)/) ?? [];
+    want(`${by} agrees without the probe: no commit for ${quiet}ms of the 150ms block`, Math.abs(Number(quiet) - 150) <= 25 && by === (AS_ROOT ? "dtrace" : "signposts"));
+    const cycle = Number(act.t.match(/AppKit's update cycle ran ([\d.]+)ms and AppKit flagged it a stall/)?.[1]);
+    want(`AppKit's own signposts name the stalled update cycle (${cycle}ms)`, Math.abs(cycle - 150) <= 25);
+    want("the time is placed outside event handling and the commit", /so it went to the app's own per-frame code/.test(act.t));
+    want("the window server's frames are timed", /the window server: rendered each frame in [\d.]+ms/.test(act.t));
+    want("the app's own energy is priced against rest", /the app's own energy while moving: \d+ mW[\s\S]*the app's own energy at rest/.test(act.t));
+    // As root (only when sudo runs dtrace without a password): which of the display's frames were this app's.
     if (AS_ROOT) {
-      const quiet = Number(act.t.match(/the app was late: it committed nothing to Core Animation for ([\d.]+)ms/)?.[1]);
-      want(`dtrace agrees without the probe: no commit for ${quiet}ms of the 150ms block`, Math.abs(quiet - 150) <= 25);
+      const [, mine, wait] = act.t.match(/this app's share: (\d+) of those frames carried a change of its windows, each on the display ([\d.]+)ms after/) ?? [];
+      want(`the app's own share of the display's frames is counted (${mine} frames, ${wait}ms to the display)`, Number(mine) > 10 && Number(wait) < 17);
       want("commits and display frames are counted for the motion", /under the pixels[\s\S]*the app committed \d+×[\s\S]*the display got \d+ frames/.test(act.t));
       want("moving is priced against rest", /cost while moving: app \d+ ms\/s CPU[\s\S]*cost at rest/.test(act.t));
     } else console.log("skip root readings (sudo -n dtrace is not allowed here)");

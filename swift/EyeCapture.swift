@@ -17,6 +17,9 @@
 //            event posted by a process (sourceUnixProcessID != 0).
 //   watch    [--app NAME]... [--until TEXT]... [--seconds N] [--values] [--json]
 //            One line per UI event (AXObserver + NSWorkspace) until killed or --until matches; see watch --help.
+//   vitals   --pid PID --out FILE [--seconds N] [--every 0.05]
+//            One JSON line per tick: the energy, CPU time and wakeups billed to the process (proc_pid_rusage),
+//            the window server's display-update count and the display's refresh period (SkyLight). No root.
 //
 // Coordinates: display-local POINTS, top-left origin.
 import AppKit
@@ -2423,9 +2426,69 @@ func cmdWatch() {
     watcher.start()
 }
 
+// MARK: - vitals
+
+/// What one process spent, and what the window server put on the display, twenty times a second. No root:
+///   proc_pid_rusage   energy billed to the process (nJ, and the share spent on performance cores), CPU time,
+///                     instructions, cycles, wakeups
+///   SkyLight (private, looked up at run time; a symbol that is gone is simply not reported)
+///                     the window server's count of display updates, and the display's refresh period right now
+var vitalsTimer: DispatchSourceTimer?
+func cmdVitals() {
+    guard let pid = opt("pid").flatMap(Int32.init), let outPath = opt("out") else { fail("vitals --pid PID --out FILE [--seconds N] [--every 0.05]") }
+    FileManager.default.createFile(atPath: outPath, contents: nil)
+    guard let out = FileHandle(forWritingAtPath: outPath) else { fail("cannot write \(outPath)") }
+    let every = max(0.01, opt("every").flatMap(Double.init) ?? 0.05)
+
+    typealias MainConnection = @convention(c) () -> Int32
+    typealias UpdateCount = @convention(c) (Int32, UnsafeMutablePointer<UInt32>, UnsafeMutablePointer<Double>) -> Int32
+    typealias VBLDelta = @convention(c) (UInt32) -> UInt64
+    let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY)
+    func symbol<T>(_ name: String, _: T.Type) -> T? { sky.flatMap { dlsym($0, name) }.map { unsafeBitCast($0, to: T.self) } }
+    let connection = symbol("SLSMainConnectionID", MainConnection.self)?() ?? 0
+    let updateCount = symbol("SLSGetPerformanceTotalUpdateCount", UpdateCount.self)
+    let vblDelta = symbol("SLSDisplayGetCurrentVBLDeltaInNanoseconds", VBLDelta.self)
+
+    // The display the app's largest on-screen window is on (the main display when it has none).
+    var display = CGMainDisplayID()
+    if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+        let frames = list.filter { ($0[kCGWindowOwnerPID as String] as? Int32) == pid }
+            .compactMap { ($0[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0) } }
+        if let biggest = frames.max(by: { $0.width * $0.height < $1.width * $1.height }) {
+            var id = CGDirectDisplayID(0), n: UInt32 = 0
+            if CGGetDisplaysWithRect(biggest, 1, &id, &n) == .success, n > 0 { display = id }
+        }
+    }
+
+    onTerminate { exit(0) }
+    let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "eye.vitals", qos: .utility))
+    timer.schedule(deadline: .now(), repeating: every, leeway: .milliseconds(2))
+    timer.setEventHandler {
+        var info = rusage_info_current()
+        let rc = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, $0) }
+        }
+        guard rc == 0 else { exit(0) }   // the process is gone
+        var line = String(format: "{\"t\":%.4f,\"nj\":%llu,\"pnj\":%llu,\"cpu\":%.6f,\"pcpu\":%.6f,\"instr\":%llu,\"cycles\":%llu,\"wk\":%llu",
+                          Date().timeIntervalSince1970, info.ri_energy_nj, info.ri_penergy_nj,
+                          machSeconds(info.ri_user_time + info.ri_system_time), machSeconds(info.ri_user_ptime + info.ri_system_ptime),
+                          info.ri_instructions, info.ri_cycles, info.ri_pkg_idle_wkups + info.ri_interrupt_wkups)
+        if let updateCount, connection != 0 {
+            var count: UInt32 = 0, at = 0.0
+            if updateCount(connection, &count, &at) == 0 { line += ",\"upd\":\(count)" }
+        }
+        if let vblDelta { let ns = vblDelta(display); if ns > 0 { line += String(format: ",\"vbl\":%.3f", Double(ns) / 1e6) } }
+        out.write((line + "}\n").data(using: .utf8)!)
+    }
+    timer.resume()
+    vitalsTimer = timer
+    if let s = opt("seconds").flatMap(Double.init), s > 0 { DispatchQueue.main.asyncAfter(deadline: .now() + s) { exit(0) } }
+}
+
 // MARK: - main
 
 switch sub {
+case "vitals": cmdVitals()
 case "input": cmdInput()
 case "displays": Task { await cmdDisplays() }
 case "snapshot": Task { await cmdSnapshot() }

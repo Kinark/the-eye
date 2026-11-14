@@ -266,18 +266,36 @@ timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` 
   `eye_act` / `eye_record` does not attach the observer; fps on the fixture reads the same with and without it.
   Test: `node test/said-e2e.mjs` (the fixture changes a value in its action and announces 200ms later; both are
   200ms gap between them reads 207–208ms).
-- **Under the pixels, as root.** When `sudo` runs `dtrace` and `powermetrics` without a password, a recording of an
-  app also reads what no screen recording can: every Core Animation commit of the app (when it ended and how long
-  it held the main thread), every frame the window server handed to the display (`under.txt`), and the CPU time of
-  the app and of the window server plus GPU and CPU power, ten times a second (`cost.jsonl`). The report says under
-  a freeze **who was late** (`the app was late: it committed nothing to Core Animation for 149ms`, or the app kept
-  committing and no frame reached the display), tells per motion whether the app drives it frame by frame or
-  committed once and left it to the window server, and prices moving against rest. No probe, any app, release
-  builds included. Nothing asks for a password: without the rule the readings are simply absent. The rule:
-  `<you> ALL=(root) NOPASSWD: /usr/sbin/dtrace, /usr/bin/powermetrics` in `/etc/sudoers.d/the-eye`
-  (`sudo visudo -f /etc/sudoers.d/the-eye`). `root:false` on `eye_record` / `eye_act` leaves them out. The frame
-  count is the whole display's, so it can convict the window server but not clear it for one window; Apple silicon
-  reports no per-process GPU time, so the GPU is told as power for the whole machine.
+- **Under the pixels.** A recording of an app also reads what no screen recording can, from four places. Two need
+  no root and are always on:
+  - **Signposts** (`log stream --signpost` → `signs.txt`): what AppKit, Core Animation and the window server say of
+    themselves. Every update cycle of the app, every event it handled, every commit, and the ones the frameworks
+    flag as stalls; every frame of the window server, how long it rendered and spent on the GPU, and the ones it
+    marks as stalled. So "who was late" works for any app, release builds included, with no probe and no root.
+  - **Vitals** (`eye-capture vitals` → `vitals.jsonl`, twenty times a second): the energy, CPU time and wakeups the
+    kernel billed to the app alone (`proc_pid_rusage`), plus two private SkyLight readings looked up at run time:
+    the window server's own count of display updates (it checks the signpost stream, which is best-effort, and
+    counts frames when the stream is absent) and the display's refresh period right now.
+
+  Two need root, and run only when `sudo` runs them without a password (nothing ever asks for one):
+  - **dtrace** (`under.txt`): every commit timed inside the app, every frame swap, and every time the window server
+    learned that one of *this app's* windows changed and scheduled a frame for it. Pairing each of those with the
+    swap that followed gives **the app's own share of the display's frames** and how long each took to reach the
+    display, which is what clears or convicts the window server for one window.
+  - **powermetrics** (`cost.jsonl`): CPU time of the app and of the window server, GPU and CPU power.
+
+  The report says under a freeze **who was late** and where the time went (`the app was late: it committed nothing
+  to Core Animation for 149ms; AppKit's update cycle ran 145ms and AppKit flagged it a stall: 4.8ms of it handling
+  an event or committing, so it went to the app's own per-frame code`), tells per motion whether the app drives it
+  frame by frame or left it to the window server, how many display frames were its own, how long the window server
+  rendered each, and prices moving against rest for the whole machine and for the app alone. The rule for the root
+  half: `<you> ALL=(root) NOPASSWD: /usr/sbin/dtrace, /usr/bin/powermetrics` in `/etc/sudoers.d/the-eye`
+  (`sudo visudo -f /etc/sudoers.d/the-eye`). `root:false` on `eye_record` / `eye_act` leaves that half out;
+  `THE_EYE_UNDER=0` leaves out everything (to measure what the readers cost: nothing measurable on a 120 fps
+  animation). Limits: no process is billed for the GPU on Apple silicon, so the GPU is power for the whole machine;
+  an animation handed to the window server changes no client window per frame, so its share is every frame the
+  server makes while it runs; the dtrace probes for the app's share read two offsets inside the window server
+  (found on macOS 27.2), and when they do not match the share is simply not reported.
 - **The probe reaches any app when SIP is off.** With System Integrity Protection on, `eye_probe` needs a debuggable
   build signed by a certificate in your keychain. With it off the debugger may attach to anything, and the probe
   (built arm64 + arm64e, signed ad hoc when the app is someone else's) loads into release builds, hardened and
