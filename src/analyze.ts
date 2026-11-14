@@ -34,7 +34,13 @@ export function loadRun(csv: string): { rows: Row[]; meta: Meta } {
       mcx: p.length > 20 ? n(19) : 0, mcy: p.length > 20 ? n(20) : 0 });
   }
   let meta: Meta = {};
-  try { meta = JSON.parse(readFileSync(csv + ".meta.json", "utf8")); } catch { /* still recording or missing */ }
+  try { meta = JSON.parse(readFileSync(csv + ".meta.json", "utf8")); } catch {
+    // Still recording: the live file carries the clocks and the rect, so steps and events can be placed already.
+    try {
+      const l = JSON.parse(readFileSync(csv + ".live.json", "utf8"));
+      meta = { refresh_hz: l.refresh_hz, rect_points: l.rect_points, t0_mach: l.t0_mach, t0_wall: l.t0_wall };
+    } catch { /* missing */ }
+  }
   return { rows, meta };
 }
 

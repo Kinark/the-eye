@@ -6,17 +6,8 @@ import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { z } from "zod";
-import { checkInstances, driving, duplicatesSchemaDescription } from "./single.ts";
 import { whyGap, type Stall, type Stalls } from "./notice.ts";
 import { CURVES, bezierValue, fitMotion, formatFit, type MotionFit, type Sample } from "./physics.ts";
-
-type Deps = {
-  root: string;
-  runDir: (label?: string) => string;
-  text: (t: string) => any;
-  fail: (t: string) => any;
-};
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -163,7 +154,7 @@ export async function resolvePid(proc: string | number): Promise<{ pid: number; 
   const t = await resolveTarget(proc);
   return { pid: t.pid, name: t.name };
 }
-/** Live JSON of the most recent running probe recording (for eye_act / eye_peek). */
+/** Live JSON of the most recent running probe recording (for eye_drive / eye_status). */
 export function activeProbeLive(): any | null {
   const r = [...runs.values()].filter((x) => !x.final).pop();
   return r ? liveOf(r) : null;
@@ -512,7 +503,7 @@ export function analyzeProbe(file: string, o: Opts = {}): string {
   return out.filter((x) => x !== "").join("\n");
 }
 
-// ---- stop (used by eye_stop) / peek (eye_peek)
+// ---- stop (when a session ends) / peek
 
 export function probeRunIds(): string[] { return [...runs.values()].filter((r) => !r.final).map((r) => r.id); }
 export function isProbeRun(id: string) { return runs.has(id); }
@@ -521,7 +512,7 @@ export function peekProbe(id?: string, max = 8): string | null {
   if (!r) return null;
   if (r.final) return r.final;
   const s = readStatus(r.target.dir, r.v);
-  const ended = s && s.state === "idle" && s.last?.id === r.id ? ` · ENDED (${s.last.reason}) — eye_stop for the report` : "";
+  const ended = s && s.state === "idle" && s.last?.id === r.id ? ` · ENDED (${s.last.reason}) — eye_drive {end:true} for the report` : "";
   return `${r.id} "${r.label}" · ${((Date.now() - r.started) / 1000).toFixed(1)}s${ended}\n${describeProbeLive(liveOf(r), max)}`;
 }
 /** Stop probe recordings (one id, or every running one) and return their reports. */
@@ -550,89 +541,70 @@ export async function stopProbes(runDir: (label?: string) => string, id?: string
   return out;
 }
 
-// ---- tool
+// ---- start (eye_drive puts the probe in by itself when a session opens on an app)
 
-export function registerProbeTools(server: any, d: Deps) {
-  root = d.root;
-  const { text, fail } = d;
-  server.registerTool("eye_probe", {
-    title: "Record layer geometry from inside an app",
-    description: [
-      "Load the-eye's layer probe INTO a running app (if not loaded yet) and start recording, on every display refresh, the",
-      "PRESENTATION geometry (live animated values) of the app's layers: frame, opacity, shape/mask bounds, in display-local points.",
-      "No pixels. It also times the app's MAIN THREAD from inside: every run-loop turn longer than a frame is logged with stack",
-      "samples of what was running, and every report of a capture taken meanwhile (eye_act, eye_record, eye_stop, eye_report) then",
-      "says WHY each freeze happened — the blocking function, or that the main thread was free. Use it whenever you need a cause,",
-      "or to know WHICH layer moved/stuttered. Costs ~0.2ms a frame plus nothing while the main thread is healthy. Returns at once;",
-      "eye_peek shows the live state (call ~every 0.5s while acting), eye_act can aim at layers (`on`) and read them (`L('label')`),",
-      "eye_stop ends it and returns the per-layer report (aligned to a running eye_record capture automatically).",
-      "REACH: with System Integrity Protection on, a debuggable target (Debug build, get-task-allow) whose signing certificate is in",
-      "your keychain. With SIP off (csrutil status), ANY app the user runs: release builds, hardened and sandboxed third-party apps,",
-      "and Apple's own (the probe is built arm64 + arm64e and goes in signed ad hoc). If Xcode is already debugging the app, this",
-      "returns lldb commands to send through Xcode's InvokeDebuggerCommand; do that and call eye_probe again.",
-      "LIMIT: effects the window server renders itself (system glass, backdrops) are not in the app's layer tree.",
-    ].join(" "),
-    inputSchema: {
-      process: z.union([z.string(), z.number()]).describe("Target app: process name (e.g. 'NOOTCH!') or pid."),
-      method: z.enum(["auto", "print"]).optional().describe("print = don't run lldb, just return the attach commands (default auto)."),
-      label: z.string().optional(),
-      display: z.number().int().optional().describe("Display id (eye_status). Default: the main display."),
-      rect: z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() }).optional().describe("Only log layers intersecting this display-local rect (points)."),
-      match: z.array(z.string()).optional().describe("Only log layers whose label (layer class, view class, name) contains one of these."),
-      watch: z.array(z.string()).optional().describe("Always show these layers in the live summary, moving or not (label substrings, e.g. 'NSGlassEffectView'). Never limits what is logged; use match for that."),
-      max_seconds: z.number().positive().max(600).optional().describe("Safety stop (default 60)."),
-      max_layers: z.number().int().positive().optional().describe("Max layers walked per frame (default 6000)."),
-      full_walk: z.boolean().optional().describe("Walk the whole layer tree every frame. Default false when match is given (the tree is re-walked every 30 frames; new layers can take up to 30 frames to appear)."),
-      duplicates: z.enum(["ask", "quit_others", "relaunch", "allow"]).optional().describe(duplicatesSchemaDescription),
-      app_path: z.string().optional().describe("For duplicates:\"relaunch\": the .app to start instead of the target's own."),
-    },
-  }, driving("eye_probe", fail, async (p: any) => {
-    try {
-      const c = await checkInstances(p.process, p.duplicates, p.app_path);
-      if (!c.ok) return fail(c.error);
-      const t = await resolveTarget(c.pid ?? p.process);
-      const built = await buildProbe();
-      const v = built.v;
+export function setProbeRoot(r: string) { root = r; }
+export type ProbeOpts = { label?: string; display?: number; rect?: { x: number; y: number; w: number; h: number };
+  match?: string[]; watch?: string[]; max_seconds?: number; max_layers?: number; full_walk?: boolean };
+/** Pids the probe could not be put into, with the one-line reason: tried once per app launch, not again. */
+const refused = new Map<number, string>();
+/** lldb commands that load the probe, for an app Xcode is already debugging (sent through Xcode's own debugger). */
+export async function probeCommands(proc: string | number): Promise<string> {
+  const t = await resolveTarget(proc);
+  const built = await buildProbe();
+  const cmds = injectCommands(await stageFor(t, built), t.dir, built.v);
+  return [`${t.name} pid ${t.pid}: send these through Xcode's debugger (tools.xcode.InvokeDebuggerCommand), in order, then open the session again:`,
+    `  process interrupt`, ...cmds.map((c) => `  ${c}`), `  process continue`,
+    `(If dlopen "couldn't look up symbols", the app was interrupted mid-launch: continue, wait ~2s, retry.)`].join("\n");
+}
+/**
+ * Load the probe into the app (once per launch) and start a probe recording. `why` is one line: the session goes
+ * on without it. `again` = try even though this launch refused before.
+ */
+export async function startProbe(proc: string | number, p: ProbeOpts = {}, again = false): Promise<{ ok: true; id: string; note: string } | { ok: false; why: string }> {
+  try {
+    const t = await resolveTarget(proc);
+    const before = refused.get(t.pid);
+    if (before && !again) return { ok: false, why: before };
+    const no = (why: string) => { refused.set(t.pid, why); return { ok: false as const, why }; };
+    const built = await buildProbe();
+    const v = built.v;
+    let loaded = "";
+    if (!alive(t, v)) {
+      const ppid = (await run("/bin/ps", ["-o", "ppid=", "-p", String(t.pid)], 3000)).stdout.trim();
+      const parent = ppid ? (await run("/bin/ps", ["-o", "comm=", "-p", ppid], 3000)).stdout : "";
+      if (parent.includes("debugserver")) return no(`${t.name} runs under Xcode's debugger, which a second debugger cannot join (probe:"xcode" prints the lldb commands to send through Xcode instead)`);
+      const dylib = await stageFor(t, built);
+      const args = ["--batch", "-p", String(t.pid)];
+      for (const c of injectCommands(dylib, t.dir, v)) args.push("-o", c);
+      args.push("-o", "process detach");
+      const t0 = Date.now();
+      const r = await run("lldb", args, 60_000);
+      for (let i = 0; i < 20 && !alive(t, v); i++) await sleep(150);
       if (!alive(t, v)) {
-        const dylib = await stageFor(t, built);
-        const cmds = injectCommands(dylib, t.dir, v);
-        const viaXcode = [
-          `Send these through Xcode's debugger (tools.xcode.InvokeDebuggerCommand), in order, then call eye_probe again:`,
-          `  process interrupt`, ...cmds.map((c) => `  ${c}`), `  process continue`,
-          `(If dlopen "couldn't look up symbols", the app was interrupted mid-launch: continue, wait ~2s, retry.)`,
-        ].join("\n");
-        if (p.method === "print") return text(`${t.name} pid ${t.pid}\n${viaXcode}`);
-        const ppid = (await run("/bin/ps", ["-o", "ppid=", "-p", String(t.pid)], 3000)).stdout.trim();
-        const parent = ppid ? (await run("/bin/ps", ["-o", "comm=", "-p", ppid], 3000)).stdout : "";
-        if (parent.includes("debugserver")) return text(`${t.name} (pid ${t.pid}) is already under a debugger (Xcode). The probe is NOT loaded yet.\n${viaXcode}`);
-        const args = ["--batch", "-p", String(t.pid)];
-        for (const c of cmds) args.push("-o", c);
-        args.push("-o", "process detach");
-        const r = await run("lldb", args, 60_000);
-        for (let i = 0; i < 20 && !alive(t, v); i++) await sleep(150);
-        if (!alive(t, v)) {
-          const sip = (await run("/usr/bin/csrutil", ["status"], 5000)).stdout.trim();
-          const reach = /disabled/i.test(sip) ? "" : `\n\n${sip} With it on, only debuggable builds (get-task-allow)${t.foreign ? " signed by a certificate in your keychain" : ""} can be probed${t.foreign ? `; ${t.name} is signed by someone else (${t.foreign})` : ""}. With it off, any app can.`;
-          return fail(`lldb could not load the probe.\n${(r.stdout + r.stderr).trim().slice(-1500)}${reach}\n\nIf a debugger owns the process, or attaching needs Developer Tools access:\n${viaXcode}`);
-        }
+        const sip = /disabled/i.test((await run("/usr/bin/csrutil", ["status"], 5000)).stdout);
+        const said = (r.stdout + r.stderr).split("\n").map((l) => l.trim()).filter((l) => /error|denied|not allowed|refus|code sign|library validation/i.test(l)).pop()?.slice(0, 160);
+        return no(sip ? `lldb could not load it into ${t.name}${said ? ` (${said})` : ""}`
+          : `${t.name} is not a debuggable build${t.foreign ? " and is signed by someone else" : ""}: with System Integrity Protection on, the probe goes only into Debug builds (get-task-allow)${said ? ` (${said})` : ""}`);
       }
-      retireOthers(t, v);
-      const id = `probe${++seq}_${Date.now().toString(36)}`;
-      const out = join(t.dir, `${id}.ndjson`);
-      writeFileSync(join(t.dir, "control.json"), JSON.stringify({
-        cmd: "start", version: v, id, out, display: p.display, rect: p.rect ? [p.rect.x, p.rect.y, p.rect.w, p.rect.h] : undefined,
-        match: p.match, watch: p.watch, max_seconds: p.max_seconds ?? 60, max_layers: p.max_layers, full_walk: p.full_walk, nonce: Math.random(),
-      }));
-      const r: ProbeRun = { id, label: p.label ?? id, target: t, v, out, started: Date.now() };
-      for (let i = 0; i < 20; i++) {
-        await sleep(100);
-        const s = readStatus(t.dir, v);
-        if (s?.state === "recording" && s.id === id) { runs.set(id, r); return text(`${id} recording layers in ${t.name} (pid ${t.pid}) → ${out}\neye_peek every ~0.5s while acting; eye_stop {id:"${id}"} for the report.`); }
-        if (s?.last?.error) return fail(`probe refused: ${s.last.error}`);
-      }
-      return fail("the probe did not start within 2s (is the app's main thread blocked?)");
-    } catch (e: any) { return fail(e.message); }
-  }));
+      loaded = ` (loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s, once per launch)`;
+    }
+    retireOthers(t, v);
+    const id = `probe${++seq}_${Date.now().toString(36)}`;
+    const out = join(t.dir, `${id}.ndjson`);
+    writeFileSync(join(t.dir, "control.json"), JSON.stringify({
+      cmd: "start", version: v, id, out, display: p.display, rect: p.rect ? [p.rect.x, p.rect.y, p.rect.w, p.rect.h] : undefined,
+      match: p.match, watch: p.watch, max_seconds: p.max_seconds ?? 600, max_layers: p.max_layers, full_walk: p.full_walk, nonce: Math.random(),
+    }));
+    const r: ProbeRun = { id, label: p.label ?? id, target: t, v, out, started: Date.now() };
+    for (let i = 0; i < 20; i++) {
+      await sleep(100);
+      const s = readStatus(t.dir, v);
+      if (s?.state === "recording" && s.id === id) { runs.set(id, r); return { ok: true, id, note: `probe inside ${t.name}${loaded}: freezes carry their cause, moving layers their declared animation` }; }
+      if (s?.last?.error) return { ok: false, why: `the probe refused: ${s.last.error}` };
+    }
+    return { ok: false, why: "the probe is loaded but did not start within 2s (the app's main thread is blocked?)" };
+  } catch (e: any) { return { ok: false, why: String(e.message).split("\n")[0].slice(0, 200) }; }
 }
 
 export function probeRunsStatus(): string[] {

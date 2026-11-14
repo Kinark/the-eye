@@ -6,5 +6,6 @@ const [tool, args = "{}"] = process.argv.slice(2);
 const client = new Client({ name: "call", version: "1" });
 await client.connect(new StdioClientTransport({ command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname] }));
 const r = await client.callTool({ name: tool, arguments: JSON.parse(args) }, undefined, { timeout: 700_000 });
-console.log(r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n"));
+console.log(r.content.map((c) => (c.type === "text" ? c.text : `[${c.type} ${c.mimeType}, ${Math.round((c.data?.length ?? 0) * 0.75 / 1024)}KB]`)).join("\n"));
+if (r.isError) console.log("(isError)");
 await client.close();

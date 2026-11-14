@@ -7,7 +7,7 @@ refreshes, hitches, frame-gap distribution, and the size/position curve of whate
 
 Built to answer "did this change make the animation smoother?" objectively, and to A/B app builds and settings.
 It's meant to be an agent's default way to test a macOS app's UI (SwiftUI or AppKit) on its own: find the element
-(accessibility tree), drive it (`eye_act`), and measure the result, without asking the user to try it.
+(accessibility tree), drive it (`eye_drive`), and measure the result, without asking the user to try it.
 
 ## How it measures
 
@@ -46,8 +46,8 @@ before (`mv_*`), the measurement that lets a report follow a thing that slides o
 
 ## What a viewer would have noticed
 
-Numbers are for comparing; a person watching just *sees* that something stuck. So every report — `eye_act`,
-`eye_record`, `eye_stop`, `eye_peek`, `eye_report` — opens with a verdict and the things a viewer would have noticed,
+Numbers are for comparing; a person watching just *sees* that something stuck. So every report — each `eye_drive`
+reply, the session's final report, `eye_status` on an open session, `eye_report` — opens with a verdict and the things a viewer would have noticed,
 worst first (`src/notice.ts`), and the table follows for whoever needs it:
 
 ```
@@ -74,10 +74,10 @@ Verdicts: `LOOKED SMOOTH` · `MOSTLY SMOOTH` (visible only if you look for it) �
 | **SNAPPED / jump** | the moving edge leapt ≥12pt and ≥4× its neighbouring frames in one frame, without a freeze to explain it |
 | **FLASH** | the region's mean brightness left for one or two frames and came straight back |
 | **wobble** | the moving edge changed direction 4+ times |
-| **LAGGED / slow** | first visible change more than 300ms / 150ms after a press, scroll or gesture `eye_act` sent |
+| **LAGGED / slow** | first visible change more than 300ms / 150ms after a press, scroll or gesture `eye_drive` sent |
 | facts | each motion's time span, travel (`width 0pt→405pt`), overshoot-and-settle, fps; instant **pops** (a change that took one or two frames, no transition); how fast the screen answered each step; a motion cut off by the end of the recording |
 
-**Why.** With `eye_probe` loaded in the app, each freeze carries `why:` lines from the probe's main-thread watchdog
+**Why.** With the probe in the app (`eye_drive` puts it in by itself), each freeze carries `why:` lines from the probe's main-thread watchdog
 (see below): the stall that overlaps it, the app function that was running and the stack — or the statement that the
 main thread was free the whole time, which puts the lost frames after the app (render server, GPU, window server) or
 means the motion isn't driven from the main thread. A main-thread stall during a motion that no visible gap accounts
@@ -160,7 +160,7 @@ rate, which is what it is), and rotations (no box follows a thing turning in pla
 
 ## What a still frame says
 
-A window that is not moving still has things to measure, and a look at one (`eye_glance`, live `eye_snapshot`) comes
+A window that is not moving still has things to measure, and a look at one (`eye_snapshot` of a `rect` or an `app`) comes
 back with them under `## at rest`, nobody asking. They are read off the one frame: its pixels and the accessibility
 frames of what is in it.
 
@@ -192,44 +192,49 @@ the accessibility tree costs the app frames. Judging what the numbers mean stays
 
 ## Tools
 
-Thirteen tools. The server's MCP `instructions` carry the full "what / when / how" guide agents see on connect.
+Five tools. The server's MCP `instructions` carry the full "what / when / how" guide agents see on connect.
 
 | tool | what |
 |---|---|
-| `eye_status` | displays (id, points, scale, refresh rate), active recordings / probe runs / locks, runs dir |
+| `eye_drive` | **the one that acts: one session on an app.** Its window recorded, the user's input held, a hand on the mouse and, in a Debug build, a probe inside the app. The first call opens it (`app`; `app_path` starts the app), every call may move, `end:true` closes it and returns what the whole of it looked like. Two ways to move, mixed freely: a `wing` (a line of words, one unbroken motion, things by name: `"7" tap "Add" tap "3" tap "Equals" tap settle`) or exact `steps` (`move`, `click`, `down`/`up`, `scroll`, `pinch`, `rotate`, `smart_zoom`, `swipe`, `press {force}` / `force_click`, `wait`, `wait_until`, `assert`). `hands:false` only watches (no hand, no lock): until `end:true`, for `seconds`, or while a `command` runs. `ask:"…"` puts a yes/no to the person at the machine; `quit:true` quits the app; `duplicates` decides what happens when several copies run. See [Driving live](#driving-live-eye_drive) |
+| `eye_snapshot` | one still image. `{rect}`: that screen region as it is. `{app}`: "Just a sec…" lock → raise the window even if covered or minimized → image, element `tree`, `element` at x/y → put everything back exactly → release (the user is held 0.3–0.4s). `{csv, t_s}`: a recording's keyframes near a time. A live image ends with `## at rest` |
 | `eye_inspect` | **accessibility view, no recording**: everything the element under a point exposes (default: the pointer), or the element **tree** of an app (`process`) or of the windows visible in a rect, one line per element with its bounds |
-| `eye_snapshot` | one PNG of a region (`rect`), or a recording's keyframes near a time (`csv`, `t_s`) |
-| `eye_glance` | **a quick look at a window that may be covered**: "Just a sec…" lock → raise the window → `look` (`image`, `tree`, `element` at x/y) and optional short `steps` → put the window back exactly → release. Reports how long the user was held and where the time went (typically 0.3–0.4s) |
-| `eye_record` | record a region (`rect`), or an app's window wherever it is (`process`, optional `window` title; no rect needed). No command/seconds → background, returns an id at once (with the AX tree). `seconds` → blocking. `command` → runs your input driver while recording, optional `lock_input`, returns output + report. `background:true` for long runs |
-| `eye_peek` | live state of a running recording or probe: moving, extent, recent fps/hitches, **element under the pointer** (`hover:"full"` for every attribute), command output, probe layers, optional fresh AX `tree` |
-| `eye_drive` | **a hand that stays on the mouse**: each call flies one *wing*, a line of words that is one unbroken motion (`"7" tap "Add" tap "3" tap "Equals" tap settle`). It aims at things by name, follows them if they move, feels every element it passes over, presses only what is under it. The recording, the lock and the hand stay up between calls, so the agent steers. See [Driving live](#driving-live-eye_drive) |
-| `eye_act` | **interactive driving**: `move`, `click`, `down`/`up`, `scroll` (two-finger, optional `momentum` fling), two-finger gestures `pinch {scale}`, `rotate {degrees}`, `smart_zoom`, `swipe {direction}`, Force Touch `press {force:[…]}` / `force_click`, `wait`, `wait_until`, `assert`. After **every** step: pointer, element under it, visible state. **With no recording running it records the target's window for those steps itself** (`see`, default on: ~0.3s before the first step, up to 1.5s after the last while motion settles, all inside the lock) and ends with what it looked like. Expressions get `h` (the element). Presses and gestures only on `target_process` (the owner of the element under the point is checked right before posting); a press aimed at a probe layer (`on`) must still be inside it; scrolls only inside the open area or `scroll_zones` |
-| `eye_stop` | end a recording and/or probe run (all if no id), kill a running command, return the report(s); the probe report is aligned to the capture |
-| `eye_report` | re-analyze (default: the most recent run; a run folder works as `csv`): `summary`, `timeline`, `explain` (worst gaps × cursor × element × eye_act step × main thread), `hover` (element-under-pointer changes), `compare` (runs), `probe` (probe.ndjson / one layer) |
-| `eye_app` | list / quit / launch / relaunch the app under test, counting every copy and build of it |
-| `eye_lock` | block all physical input, trackpad and keyboard (`seconds`, `style: full\|quick`), or `release:true` |
-| `eye_probe` | load the probe into an app if needed and start recording layer geometry **and main-thread stalls with stack samples** — the cause behind every freeze in later reports (see below) |
+| `eye_report` | re-analyze (default: the most recent run; a run folder works as `csv`): `summary`, `timeline`, `explain` (worst gaps × cursor × element × step × main thread), `hover` (element-under-pointer changes), `compare` (runs), `probe` (probe.ndjson / one layer) |
+| `eye_status` | displays (id, points, scale, refresh rate), who holds the screen, **what the open session sees right now** (moving or still, extent, what a viewer noticed over the last seconds, command output, live probe layers, optional `tree`), and with `app` every running copy and build of it |
 
-Old → new: `eye_displays`→`eye_status` · `eye_start`/`eye_record_while`→`eye_record` · `eye_abort`→`eye_stop` ·
-`eye_analyze`/`eye_timeline`/`eye_compare`/`eye_explain`/`eye_probe_report`→`eye_report` · `eye_frames`→`eye_snapshot` ·
-`eye_lock_input`/`eye_unlock`→`eye_lock` · `eye_probe_attach`/`eye_probe_start`→`eye_probe` · `eye_probe_peek`→`eye_peek` ·
-`eye_probe_stop`→`eye_stop`.
+What a call does without being asked:
+
+- **The probe goes in by itself**, once per app launch, when a session opens on an app. When it cannot (no Debug
+  build, Xcode is debugging the app) one line says why and the session goes on. `probe:false` skips it,
+  `probe:{match, watch}` chooses layers, `probe:"xcode"` prints the commands to send through Xcode's debugger.
+- **Frames come back with the words**: the frame the screen settled on after every call and, with the final report,
+  the recorded frame at each ✗ (`frames:false` to leave them out).
+- **The window comes forward** when a session with a hand opens (also from minimized) and goes back, with everything
+  that was above it, when the session ends (`front:false` leaves it where it is).
+- **A session with a hand ends by itself** after `idle_s` (30) without a call; the next `eye_drive` call hands over
+  its report.
+- A watch session (`hands:false`) runs the passive steps (`wait`, `wait_until`, `assert`) and refuses the rest.
+
+Old → new (thirteen tools became five): `eye_act`, `eye_record`, `eye_stop`, `eye_probe`, `eye_lock`, `eye_app`
+launch / quit / relaunch → `eye_drive` (`steps` · `hands:false` with `seconds` / `command` · `end:true` · `probe` ·
+`ask` · `app_path` / `quit` / `duplicates`) · `eye_glance` → `eye_snapshot {app}` · `eye_peek`, `eye_app list` →
+`eye_status`.
 
 ## Accessibility (AX) context
 
 So an agent knows **what** it is looking at and **where** things are:
 
-- **Hover**: while recording with `ax` (default on, off with `profile`), the capture hit-tests the element under the
+- **Hover**: while recording with `ax` (on with a hand, off when only watching or with `profile`), the capture hit-tests the element under the
   pointer up to `ax_hz` (10) times a second. When the element changes, its full description (every attribute,
   actions, parameterized attributes, ancestors, app, window, readable path) goes to the live JSON (`hover`) and to
   `hover.jsonl`; while it stays the same, its frame/state is refreshed every 0.5s. Reports end with a timeline of
   what the pointer was over; `cursor.csv` keeps role/label columns for `eye_report view:"explain"`.
-- **Tree**: `eye_record` snapshots the element tree of the observed windows at start (`tree: basic|full|none`,
-  saved as `ax_tree_start.txt/.json`); `eye_inspect`, `eye_peek {tree}` and `eye_act {tree}` dump it on demand.
+- **Tree**: a session snapshots the element tree of the observed windows at start (`tree: basic|full|none`,
+  saved as `ax_tree_start.txt/.json`); `eye_inspect`, `eye_status {tree}` and `eye_drive {look:true}` dump it on demand.
   The observed windows are found by AX hit-testing a grid of points in the rect, so only what is actually on top
   counts (occluded windows and transparent full-screen windows are ignored); `process` picks an app explicitly.
   `basic` folds unlabeled layout groups; `full` lists every node and its actions.
-- AX frames are **global** points (same space as the pointer and `eye_act` x/y; equal to display-local on the main display).
+- AX frames are **global** points (same space as the pointer and step x/y; equal to display-local on the main display).
 - **Cost:** any AX client makes SwiftUI apps maintain their accessibility graph (measured ~18% more main-thread time,
   −25% fps on NOOTCH!). Use `ax:false` for final fps numbers and A/B runs; reports say when AX was on.
 
@@ -241,9 +246,10 @@ So an agent knows **what** it is looking at and **where** things are:
 `CAShapeLayer` mask. Everything is in display-local points, top-left origin (the same space as the capture), and
 timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` narrow what is logged and shown.
 
-- **Attach:** `eye_probe {process}` builds the library and signs a copy with the **target's own certificate**
+- **Attach:** a session that opens on an app (`eye_drive {app}`) attaches it by itself, once per app launch
+  (`probe:false` skips it; when it cannot attach, one line says why and the session goes on). It builds the library and signs a copy with the **target's own certificate**
   (needed for library validation; the key must be in your keychain). It stages the copy where the app can read it (its
-  container when sandboxed) and loads it with `lldb -p`. If Xcode already debugs the app, it returns the commands
+  container when sandboxed) and loads it with `lldb -p`. If Xcode already debugs the app, `probe:"xcode"` returns the commands
   to send through Xcode's `InvokeDebuggerCommand` instead. The target must be debuggable (`get-task-allow`, e.g. a Debug build).
 - **What moved each layer, and whether it is what the code asked for.** The probe report fits every moving layer's
   exact presentation values (one per display tick) with the same engines as the screen reading: spring, timing curve,
@@ -264,7 +270,7 @@ timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` 
   response who was first: `the app knew first` (it reported the change before the screen began to show it), `the
   screen changed first`, or `yet the app reported a change` when nothing visible answered. A run in which the steps
   changed the screen and the app said nothing is flagged: assistive technology was not told. `events:false` on
-  `eye_act` / `eye_record` does not attach the observer; fps on the fixture reads the same with and without it.
+  `eye_drive` does not attach the observer; fps on the fixture reads the same with and without it.
   Test: `node test/said-e2e.mjs` (the fixture changes a value in its action and announces 200ms later; both are
   200ms gap between them reads 207–208ms).
 - **Under the pixels.** A recording of an app also reads what no screen recording can, from four places. Two need
@@ -291,19 +297,19 @@ timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` 
   frame by frame or left it to the window server, how many display frames were its own, how long the window server
   rendered each, and prices moving against rest for the whole machine and for the app alone. The rule for the root
   half: `<you> ALL=(root) NOPASSWD: /usr/sbin/dtrace, /usr/bin/powermetrics` in `/etc/sudoers.d/the-eye`
-  (`sudo visudo -f /etc/sudoers.d/the-eye`). `root:false` on `eye_record` / `eye_act` leaves that half out;
+  (`sudo visudo -f /etc/sudoers.d/the-eye`). `root:false` on `eye_drive` leaves that half out;
   `THE_EYE_UNDER=0` leaves out everything (to measure what the readers cost: nothing measurable on a 120 fps
   animation). Limits: no process is billed for the GPU on Apple silicon, so the GPU is power for the whole machine;
   an animation handed to the window server changes no client window per frame, so its share is every frame the
   server makes while it runs; the dtrace probes for the app's share read two offsets inside the window server
   (found on macOS 27.2), and when they do not match the share is simply not reported.
-- **The probe reaches any app when SIP is off.** With System Integrity Protection on, `eye_probe` needs a debuggable
+- **The probe reaches any app when SIP is off.** With System Integrity Protection on, the probe needs a debuggable
   build signed by a certificate in your keychain. With it off the debugger may attach to anything, and the probe
   (built arm64 + arm64e, signed ad hoc when the app is someone else's) loads into release builds, hardened and
   sandboxed third-party apps and Apple's own arm64e apps: layers, main-thread stalls and symbolized stacks included.
-- **Recorded alone.** `eye_act`'s own recording and `eye_record {process}` capture only the target app's windows,
+- **Recorded alone.** A session on an app's window captures only the target app's windows,
   over mid grey (`--only-pid` in the helper): what shows through a see-through overlay window, or sits over the app,
-  is not measured as its motion. `isolate:false` on `eye_record` records the screen as it is.
+  is not measured as its motion. `isolate:false` records the screen as it is (the default for a `rect`).
   Test against the real thing: `node test/nootch-see.mjs` (hover, open, at rest, close on NOOTCH!-Dev, probe loaded).
 - **Main-thread watchdog (the "why").** While a probe recording runs, a run-loop observer on the app's main thread
   marks the start and end of every turn, and a watcher thread polls that mark every 3ms. A turn longer than 1.25
@@ -312,19 +318,20 @@ timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` 
   the first ~100ms and sparsely after, so a multi-second hang stays cheap. Each stall is one `H` line (start on the
   mach clock, duration, samples) with its frames in `F` lines (Swift and C++ names demangled in-process, image, and
   whether the image is the app's own); a hang still in progress is rewritten once a second. A healthy app pays two
-  observer callbacks per run-loop turn. `eye_stop`, the capture reports and `eye_report view:"explain"` join stalls to
+  observer callbacks per run-loop turn. The session's reports and `eye_report view:"explain"` join stalls to
   on-screen gaps through `stalls.json` in the run folder. Stack sampling is arm64-only; on Intel stalls are timed but
   not sampled.
 - **Control** is file based (`control.json` / `status.json` in that directory), so it works inside the sandbox.
 - **Live:** `<recording>.live.json` is rewritten every 0.25s with the last 0.5s: ticks/s, walk cost, the layers that
   moved (updates, coverage = frames changed / frames in its motion, max gap, current rect/shape) and the `watch` layers.
-  `eye_peek` and `eye_act` show it. `eye_act` expressions get `pr` (the JSON) and `L('label')`.
-- **Cost:** about 0.2ms per frame on the app's main thread for a small tree. It's reported in every peek and report.
+  `eye_status` and every `eye_drive` reply show it. Expressions get `pr` (the JSON) and `L('label')`.
+- **Cost:** about 0.2ms per frame on the app's main thread for a small tree. It's reported in every reply and report.
 - **Limit:** it sees what the app hands to the system. Effects the window server renders itself (system glass,
-  backdrops) can still lag on screen. Record an `eye_record` capture of the same moment; `eye_stop` aligns the probe report to it.
+  backdrops) can still lag on screen. The session records the screen at the same moment and aligns the probe report to it.
   Probe rows that update every frame alongside a capture that doesn't change point at the window server.
 
-Test: `node test/probe-e2e.mjs '<process>' [seconds] '<start args json>'`.
+Tests: `node test/probe-feel-e2e.mjs` (the fixture), `node test/nootch-see.mjs ['<process>']` and
+`node test/probe-cost.mjs '<process>'` (a real debuggable app).
 
 Coordinates are **display-local points, top-left origin**. Runs are stored in `~/Library/Caches/the-eye/runs/<time>_<label>/`
 (`frames.csv`, `frames.csv.meta.json`, `cursor.csv`, `hover.jsonl`, `ax_tree_start.*`, `actions.jsonl`, `stalls.json` when a probe ran, `keyframes/`). Override the location with `THE_EYE_DIR`.
@@ -337,39 +344,55 @@ While recording, `frames.csv.live.json` is rewritten 10 times a second with what
 - `anchored_screen`: the top-anchored extent. Its width is measured along a row inside the menu bar, starting from the
   display center; its height is how far the change hangs down. This is the open notch or panel, unaffected by changes elsewhere.
 - `changed_extent_screen`: the bounding box of every change since the first frame
+- `t0_mach`, `t0_wall`: the recording's clocks. The meta file is only written when the capture ends, so these are
+  what lets steps and accessibility events be placed on a recording that is still running.
 
-Commands started by `eye_record` get `THE_EYE_LIVE` (that file's path), `THE_EYE_RECT` and `THE_EYE_RUN_DIR`, so a
-driver script can check state before every action. In `eye_act` expressions, `a` is `anchored_screen`, `e` is the
-changed extent, `p` is the pointer and `h` the element under it.
+Commands started by `eye_drive {command}` get `THE_EYE_LIVE` (that file's path), `THE_EYE_RECT` and `THE_EYE_RUN_DIR`,
+so a driver script can check state before every action. In step expressions (`wait_until`, `assert`, `guard`) and in
+a wing's `until:"…"` / `check:"…"`, `a` is `anchored_screen`, `e` is the changed extent, `p` is the pointer and `h`
+the element under it.
 
-Interactive loop: `eye_inspect` (find targets) → `eye_record` → repeat `eye_act` (act → read numbers + element → decide) → `eye_stop`.
+`eye_status` reads the same file for the open session. For a stream instead of a question there is a CLI:
+
+```
+$ the-eye live                      # = node src/index.ts live [--run DIR] [--seconds N] [--until moving|still]
+3.20s MOVING
+3.95s still · moved 0.75s · 88 new frames (117 fps) · worst gap 9ms
+5.10s HITCH · a gap of 58ms in the last second (3 hitches)
+```
+
+One line each time the recorded screen starts moving, comes to rest or hitches, nothing while nothing happens. It
+only reads the live file of the newest recording (or `--run`), and waits for one when none runs.
+
+Interactive loop: `eye_inspect` (find targets) → `eye_drive {app, wing}` → read, send the next wing or steps → `eye_drive {end:true}`.
 
 ### One at a time
 
 - **One driving session at a time, queued.** Every MCP client starts its own the-eye server, but there is one screen
-  and one pointer. Driving tools (`eye_act`, `eye_glance`, `eye_lock`, `eye_record`, `eye_probe`, `eye_app`
-  launch/quit) take turns through a lease in `~/Library/Caches/the-eye/driver.json`. A call that finds another server
+  and one pointer. Driving calls (`eye_drive`, `eye_snapshot {app}`)
+  take turns through a lease in `~/Library/Caches/the-eye/driver.json`. A call that finds another server
   mid-turn joins a FIFO queue (`queue/<pid>.json`) and waits inside the server, with MCP progress notifications, then
   runs and returns its real result — the agent never has to poll or retry. A holder that is idle between its agent's
   calls hands over at once to whoever waits (with nobody waiting it keeps the turn 60s, so one agent's calls stay
-  together); a call in flight, a lock, a recording or a probe finishes first, and the holder's replies say who is
+  together); a call in flight or an open session finishes first, and the holder's replies say who is
   queued. A wait is capped at 45s (`EYE_QUEUE_WAIT_MS`), below the usual 60s client timeout: the call then answers
   `QUEUED, not run`, and calling again within 20s keeps its place. Servers from older versions (no busy flag) are
-  waited out until their lease expires. Read-only tools (`eye_inspect`, `eye_snapshot`, `eye_status`, `eye_report`,
-  `eye_peek`, `eye_stop`) never queue. `test/queue.mjs` covers it with a private lease dir (`THE_EYE_LEASE_DIR`).
+  waited out until their lease expires. Read-only calls (`eye_inspect`, `eye_snapshot {rect}`, `eye_status`,
+  `eye_report`) never queue. `test/queue.mjs` covers it with a private lease dir (`THE_EYE_LEASE_DIR`).
 - **One copy of the app under test, checked by the server.** A family is every copy and every build of an app: same
   executable name, or the same stem once build-variant words are dropped (`NOOTCH!-Dev`, `NOOTCH!`; also the bundle-id
-  stem). Before `eye_act` (its `target_process`, or the probe's target), `eye_probe` and `eye_record {process}` the
+  stem). Before `eye_drive` or `eye_snapshot {app}` touch an app the
   server checks the family; if more than one runs it stops with the list and the choices: `duplicates: "quit_others"`
   (keep the pid you named, else the newest launch), `"relaunch"` (quit all, start the target's `.app` fresh, or
-  `app_path`), `"allow"`, or stop and ask the user. Recordings without `process` flag duplicated apps found in their
+  `app_path`), `"allow"`, or stop and ask the user. Sessions on a `rect` alone flag duplicated apps found in their
   rect. Every app it has seen is watched (every 2s): a copy launched later shows up as a ⚠ line in the next tool result
-  and in `eye_status`. `eye_app` lists, quits, launches (never a second copy) and relaunches. Test: `test/single.mjs`.
+  and in `eye_status`. `eye_status {app}` lists the family; `eye_drive {app_path}` launches (never a second copy), `duplicates:"relaunch"`
+  relaunches and `{app, quit:true}` quits. Test: `test/single.mjs`.
 
 ### Waiting on the screen: `the-eye watch`
 
 An MCP server can only answer, never wake the agent up later — so waiting for "the dialog", "the build", "the
-window" used to mean polling `eye_glance`. `the-eye watch` is a CLI instead: one line per UI event, as it happens,
+window" used to mean polling screenshots. `the-eye watch` is a CLI instead: one line per UI event, as it happens,
 from AXObserver (every app's windows, sheets, titles, announcements, values) and NSWorkspace (launch, quit, focus).
 It only reads accessibility: no turn in the queue, no lock, no screenshots.
 
@@ -398,11 +421,11 @@ permission prompts, Gatekeeper); `--app NAME|BUNDLE_ID|PID` (repeatable, names m
 - `--json` for one JSON object per line. `EYE_WATCH_RAW=1` echoes every raw AX notification to stderr.
 
 The MCP instructions tell agents to use it, with the absolute command for this checkout. Test:
-`test/watch-events.mjs` (a self-changing fixture app, then TextEdit driven under `eye_lock`).
+`test/watch-events.mjs` (a self-changing fixture app, then TextEdit driven in a watch session that holds the lock).
 
 ## Input lock and drivers
 
-Every lock (`eye_act`'s automatic one, `eye_record lock_input`, `eye_lock`, `eye_glance`) taps every event type and drops
+Every lock (a session with a hand, `eye_drive {hands:false, lock:true}`, `eye_snapshot {app}`, a question) taps every event type and drops
 all physical input whose source process ID is 0: pointer, scroll, trackpad gestures, force touch, keys, modifiers and
 media keys. It also seizes every pointing device at the HID level (`IOHIDDeviceOpen` with `kIOHIDOptionsTypeSeizeDevice`, including mice connected mid-lock), so the trackpad never reaches the window server and the cursor doesn't move at all, while posted moves still drive it. The kernel drops the seize if the process dies. The report has `pointer_devices_seized`, and `max_cursor_drift_pt` says how far the cursor ever got from where it should be (should be 0). One physical trackpad shows up as several HID handles that refuse each other's exclusive open, so
 handles are grouped by physical device and a device counts as held when any of its handles is seized.
@@ -414,7 +437,7 @@ anything appears on screen, and refuses with `preflight: …` at once.
 **Two styles.** `full` shows a 3·2·1 countdown in the middle of every screen (0.5s per number, 1.5s total) while input
 is still free (the tap is not armed until it ends; `test/lock.mjs` checks this), then the orange overlay on every
 screen; the tools wait for it. `quick` ("Just a sec…") has no countdown: a small pill springs down under the menu bar
-and the lock engages in ~0.1–0.2s. `eye_glance` and `eye_act {front}` (when its steps fit in 5s) use it. The overlay
+and the lock engages in ~0.1–0.2s. `eye_snapshot {app}` and a session that opens and ends in one call use it (`lock_style` overrides). The overlay
 or pill is shown exactly while a lock is held, so orange on screen means no physical input gets through.
 
 **Hands on the trackpad.** If the user is mid-drag, mid-scroll, mid-fling or mid-pinch when a lock is due, it waits up to
@@ -422,11 +445,34 @@ or pill is shown exactly while a lock is held, so orange on screen means no phys
 ends each interrupted action with tagged events (button up, scroll end, momentum end) so no app is left stuck in a
 drag loop. The report has `settle_ms` and `interrupted_at_engage`.
 
-**One lock across calls.** The helper reads `extend <seconds>` and `release` on stdin; `eye_act` inside a held lock extends
-it instead of starting a new one (and a new countdown).
+**One lock across calls.** The helper reads `extend <seconds>` and `release` on stdin; a session keeps one lock for all
+its calls and extends it instead of starting a new one (and a new countdown).
 
-**Covered windows.** A press on a window hidden behind another app's window is refused. `eye_act` (`front`, default
-automatic) then raises the target's window and retries once; `eye_glance` raises first. Afterwards the exact z-order,
+**Question mode.** A third style, `question`, puts a yes/no to the person at the machine. In order, with no countdown
+and no settle wait: the lock engages and the orange overlay shows; return / enter, Esc and the left / right arrows are
+ignored for the first 175ms (a key already on its way down cannot answer); a card fills the middle of every screen
+with the question in big type and three big buttons side by side:
+
+| button | means |
+|---|---|
+| **Nope** (left) | no. The user is taken to be using the machine: the-eye refuses every request to quit an app for the next 30s |
+| **Yep** (centre, highlighted) | yes, this once |
+| **Mi casa su casa** (right) | yes, and yes to this same question for the rest of the session (it is not shown again) |
+
+← → move the highlight, return / enter takes it, Esc is Nope. A line along the card's bottom edge runs out in 6s, and
+then the highlighted button is taken. After a question that ran out unanswered, the next one opens with Mi casa su
+casa highlighted (nobody is there), until a question is answered by hand again. The lock is gone with the answer.
+An agent asks with `eye_drive {ask}` (at most 140 characters) and is held until the answer. The server asks by
+itself before it quits something that may be the user's: an app launched by Xcode's Run (`Kill <name>'s Xcode run
+session?`) or a copy outside build folders (`Quit <name>?`), from `duplicates: "quit_others" | "relaunch"` and
+`eye_drive {quit:true}`. A copy this server started itself is quit unasked. A stale older launch of a rebuilt build is still quit unasked, unless it is an Xcode run
+session; the background launch watcher never asks and leaves such a copy running. Over a lock that is already held
+the question is put on that lock (`ask <preselect> <seconds> <text>` on the helper's stdin) and the lock stays. A
+question that cannot be shown (no permission for the lock) is not a no. `THE_EYE_ASK=yep|nope|casa` answers without
+showing anything (tests). The rules live in `src/ask.ts`; `test/question.mjs` checks them, the keys and the timeout.
+
+**Covered windows.** A press on a window hidden behind another app's window is refused. So a session with a hand raises
+the app's window when it opens (`front:false` leaves it), and `eye_snapshot {app}` raises first. Afterwards the exact z-order,
 focus, frame and minimized state are restored (`raise`/`restore` ops of `eye-capture input`, ~50–140ms each).
 
 The user's emergency release is Esc six times in a row, each within 1s of the
@@ -438,15 +484,18 @@ including Peekaboo, `cliclick` and your own CGEvent drivers. With `allow: "tagge
 
 ### Driving live: `eye_drive`
 
-`eye_act` is a list of points with a stop after each. A hand does not move like that, and an agent should not have to
-either. `eye_drive` flies a **wing**: one line of words, one motion, nothing decided between its points.
+A list of points with a stop after each is not how a hand moves, and an agent should not have to move like that
+either. `eye_drive` flies a **wing**: one line of words, one motion, nothing decided between its points. Exact
+`steps` stay beside it for what has to repeat to the millisecond (measuring, A/B); both run in the same session.
 
 ```
-eye_drive {target_process:"Calculator", wing:'"Clear" tap "7" tap "Add" tap "3" tap "Equals" tap settle'}
-eye_drive {wing:'"Volume" down E 80 rest 200 W 30 up'}      a drag, steered
+eye_drive {app:"Calculator", wing:'"Clear" tap "7" tap "Add" tap "3" tap "Equals" tap settle', end:true}   the whole loop in one call
+eye_drive {app:"Calculator", wing:'"Volume" down E 80 rest 200 W 30 up'}    opens a session; a drag, steered
 eye_drive {wing:'slow E'}                                    keep going east…
 eye_drive {wing:'S'}                                         …now bend south, from the speed it has
-eye_drive {end:true}                                         let go, free the input, verdict for the whole drive
+eye_drive {steps:[{op:"scroll", dy:-200, momentum:true}, {op:"wait_until", expr:"!moving"}]}
+eye_drive {end:true}                                         let go, free the input, verdict for the whole session
+eye_drive {rect:{x:356,y:0,w:800,h:300}, hands:false, command:"./drive full", lock:true}   your own driver, watched
 ```
 
 | word | what the hand does |
@@ -455,8 +504,12 @@ eye_drive {end:true}                                         let go, free the in
 | `x,y` | fly to a point (global points) |
 | `N NE E SE S SW W NW` or `↑↗→↘↓↙←↖` | with a distance: that far that way. Without: keep flying that way until the next wing, the window's edge, or `coast_ms` |
 | `tap` `tap2` `tap3` `rtap` `down` `up` | press what is under the finger |
-| `scroll up\|down\|left\|right <px>` | a phased two-finger scroll at the pointer |
+| `scroll up\|down\|left\|right <px>` · `fling …` | a phased two-finger scroll at the pointer · the same with momentum after the fingers lift |
+| `pinch <scale> [ms]` · `rotate <degrees> [ms]` · `zoom` · `swipe left\|right\|up\|down` | trackpad gestures where the hand is (`zoom` = smart zoom) |
+| `press [ms]` · `force [ms]` | Force Touch: stage 1 · a force click |
 | `rest <ms>` · `settle` · `halt` | let time pass (a heading keeps flying) · wait until the screen is still · brake |
+| `until:"expr" [ms]` · `check:"expr"` | wait until the expression holds (default 2000ms) · stop the wing unless it holds |
+| `layer:"label"` | fly to that probe layer, where it is right now |
 | `slow` `walk` `brisk` `fast` `<n>/s` | pace from here on (220 / 450 / 700 / 1200 pt/s) |
 
 How it moves (`Hand` in `swift/EyeCapture.swift`): a thread integrates position and velocity 120 times a second, and
@@ -469,17 +522,24 @@ What it will not do, by construction rather than by a check bolted on: reach for
 that matches nothing ends the wing with the list of what *is* there; a thing with something else over it is not flown
 to ("Button "7" is there but not in sight: Finder's sidebar is over it"); a `tap` after a named thing presses only if
 that thing is what is under the finger at that moment. The hand reads the recording's live file itself and brakes
-where it is when the capture stream drops.
+where it is when the capture stream drops. Presses and gestures from `steps` are held to the same app (the owner of
+the element under the point is checked right before posting), and scrolls to the measured open area or `scroll_zones`.
 
-What comes back: every element the pointer passed over, in order, with the stretch it covered and for how long (a
-second thread hit-tests accessibility about every 2pt travelled); each press where it happened and on what; where the
-hand is now; if it is still flying, what lies ahead on its line and in how many milliseconds; the screen, what a
-viewer noticed during this wing, and what the app told accessibility. The element tree is shown when the drive opens
-(`look:true` shows it again).
+What comes back from every call: every element the pointer passed over, in order, with the stretch it covered and for
+how long (a second thread hit-tests accessibility about every 2pt travelled); each press where it happened and on
+what; after each step the pointer, the element under it and the visible state; where the hand is now; if it is still
+flying, what lies ahead on its line and in how many milliseconds; the screen, what a viewer noticed during this call,
+what the app told accessibility, and the frame it settled on. The element tree is shown when a session with a hand
+opens (`look:true` shows it again).
 
-The drive ends with `end:true`, or by itself after `idle_s` (30) without a wing: a held button is released and the
-user's input is never kept while nobody is steering. The feeling costs the app the same as any accessibility client
-(see [AX context](#accessibility-ax-context)); for final frame-rate numbers use `eye_act` with `ax:false`.
+The end, in this order: the hand lets go, the screen is given time to settle and its frame is taken, the capture
+stops, the window goes back where it was, the lock is released, and then the report is written (the probe's account,
+the analysis, the frame at each ✗). `quit:true` quits the app after that.
+
+The session ends with `end:true`, or by itself after `idle_s` (30) without a call: a held button is released and the
+user's input is never kept while nobody is steering. A watch session (`hands:false`) has no idle end; it stops after
+`max_seconds`. The feeling costs the app the same as any accessibility client (see
+[AX context](#accessibility-ax-context)); for final frame-rate numbers use `steps` with `ax:false` and `probe:false`.
 
 ### Two-finger gestures
 
@@ -516,12 +576,17 @@ ScreenCaptureKit sometimes never calls back. This is common for `SCStream.stopCa
 another SCK screenshot, and occasional for `SCScreenshotManager`. Every helper call therefore has a deadline:
 - capture stop: frames are already on disk, so the meta is written after 2s anyway (`stop_timed_out: true` in the meta)
 - capture start: 8s; snapshot: 4s, then the server falls back to `/usr/sbin/screencapture`; displays: 5s
+- one ScreenCaptureKit client at a time: while a recording runs, a second process that asks ScreenCaptureKit
+  anything (a snapshot, even the list of displays) interrupts the recording's stream for tens of milliseconds
+  (macOS 27.2: "Failed during stream due to application connection being interrupted"). So stills taken during a
+  recording go through `/usr/sbin/screencapture`, `displays` reads CoreGraphics, and a session stops its capture
+  before it puts the window back
 - the server never uses `spawnSync` for helpers. Stopping escalates SIGTERM → SIGKILL, and a wedged input actor is killed and respawned.
 
 Regression test: `node test/stop-hang.mjs [rounds]`.
 
 Recordings started back to back sometimes get a spurious TCC refusal ("The user declined TCCs…") that sticks to the
-helper process, so retrying inside it doesn't help. `eye_record` starts a fresh helper (up to 3 tries, 0.7s/1.4s
+helper process, so retrying inside it doesn't help. `eye_drive` starts a fresh helper (up to 3 tries, 0.7s/1.4s
 apart) and says so in its result ("capture retried 1×…"); only the third refusal is reported as a failure.
 
 ## Install
@@ -561,8 +626,9 @@ notes are in `show-off/MASTER.md`.
 ## Example
 
 ```
-eye_record { rect: {x:356,y:0,w:800,h:300}, command: "./drive full", lock_input: true, ax: false, label: "timer-on" }
+eye_drive  { app: "NOOTCH!-Dev", wing: '"Timer" tap settle', end: true, label: "timer-on" }
+eye_drive  { rect: {x:356,y:0,w:800,h:300}, hands: false, command: "./drive full", lock: true, label: "timer-on-script" }
 eye_report { runs: [{csv: ".../frames.csv", label: "baseline"}, {csv: ".../frames.csv", label: "timer-on"}] }
 ```
 
-Tests: `node test/smoke.mjs` (all non-interactive tools), `node test/ax.mjs` (AX hover/tree path; never moves the pointer), `node test/notice.mjs` (what a viewer would notice, on synthetic recordings), `node test/why-e2e.mjs` (act → see → why on a fixture app; takes the input lock).
+Tests: `node test/smoke.mjs` (all non-interactive tools), `node test/ax.mjs` (AX hover/tree path; never moves the pointer), `node test/notice.mjs` (what a viewer would notice, on synthetic recordings), `node test/why-e2e.mjs` (drive → see → why on a fixture app; takes the input lock).

@@ -1,8 +1,8 @@
 // node test/why-e2e.mjs [jank_ms] — the whole loop on a real screen: act, see, and be told why.
-// Builds test/fixtures/janky.swift as a debuggable app (ad-hoc signed, get-task-allow), loads the probe into it,
-// presses its button with eye_act (NO eye_record: eye_act watches the window by itself) and checks that the
-// reply names the freeze AND the function that blocked the main thread.
-// TAKES THE REAL INPUT LOCK for a few seconds (countdown, orange overlay; Esc ×6 releases).
+// Builds test/fixtures/janky.swift as a debuggable app (ad-hoc signed, get-task-allow) and presses its button by
+// name in ONE eye_drive call (the probe goes in by itself, the window is recorded, the session ends) and checks
+// that the reply names the freeze AND the function that blocked the main thread.
+// TAKES THE REAL INPUT LOCK for a few seconds (a small pill; Esc ×6 releases).
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawn, spawnSync } from "node:child_process";
@@ -38,17 +38,11 @@ let failed = 0;
 const want = (what, ok) => { console.log(`${ok ? "ok  " : "FAIL"} ${what}`); if (!ok) failed++; };
 try {
   await new Promise((r) => setTimeout(r, 1500));
-  const tree = await call("eye_inspect", { process: String(app.pid) });
-  const m = tree.t.match(/Button "Go"[^\[]*\[(-?\d+),(-?\d+) (\d+)×(\d+)\]/);
-  want("found the Go button in the AX tree", !!m);
-  if (!m) throw new Error("no button");
-  const x = Number(m[1]) + Number(m[3]) / 2, y = Number(m[2]) + Number(m[4]) / 2;
-
-  const probe = await call("eye_probe", { process: app.pid, max_seconds: 60 });
-  want("probe loaded and recording", !probe.err && /recording layers/.test(probe.t));
-
-  const act = await call("eye_act", { target_process: app.pid, front: true, steps: [{ op: "click", x, y, note: "Go" }] });
-  want("eye_act watched the window by itself", /WHAT IT LOOKED LIKE/.test(act.t));
+  // One call: the probe goes in by itself, the hand finds Go by its name, the session ends with the report.
+  const act = await call("eye_drive", { app: app.pid, wing: '"Go" tap', steps: [{ op: "wait", ms: 1200 }], end: true });
+  want("the probe went in by itself", /probe inside Janky/.test(act.t));
+  want("the press landed on the button", /● tap at .* on Button "Go"/.test(act.t) && !/WING STOPPED/.test(act.t));
+  want("the session watched the window by itself", /WHAT IT LOOKED LIKE/.test(act.t));
   if (Number(jank) >= 100) {
     want("the freeze was noticed", /(FROZE|HUNG) \d/.test(act.t));
     want("the cause is the main thread", /main thread was blocked/.test(act.t));
@@ -70,9 +64,7 @@ try {
     } else console.log("skip root readings (sudo -n dtrace is not allowed here)");
   } else want("a clean run has no freeze and no blocked main thread", /LOOKED (SMOOTH|MOSTLY SMOOTH)/.test(act.t) && !/FROZE|HUNG|main thread was blocked/.test(act.t));
   want("the press was timed", /answered [\d.]+ms after click "Go"/.test(act.t) || /first visible change/.test(act.t));
-
-  const stop = await call("eye_stop", {});
-  if (Number(jank) >= 100) want("the probe report lists the stall", /main-thread stalls/.test(stop.t) && /Model\.reload/.test(stop.t));
+  if (Number(jank) >= 100) want("the probe report lists the stall", /FROM INSIDE THE APP[\s\S]*main-thread stalls[\s\S]*Model\.reload/.test(act.t));
   const ex = await call("eye_report", { view: "explain" });
   if (Number(jank) >= 100) want("explain (default: the last run) ties the gap to the stall", /main thread was blocked/.test(ex.t));
 } catch (e) { console.error(e); failed++; }

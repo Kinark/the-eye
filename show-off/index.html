@@ -131,21 +131,13 @@
 </section>
 
 <section class="tools" aria-labelledby="h-tools">
-  <h2 id="h-tools">Thirteen tools.</h2>
+  <h2 id="h-tools">Five tools.</h2>
   <dl class="tool-list">
-    <div><dt><code>eye_record</code></dt><dd>Record a region or an app's window, one row per display refresh.</dd></div>
-    <div><dt><code>eye_act</code></dt><dd>Move, click, scroll, pinch, rotate, Force Touch. Records what the app did in answer.</dd></div>
-    <div><dt><code>eye_drive</code></dt><dd>A hand that stays on the mouse. One line of words is one unbroken motion, and it presses only what is under it.</dd></div>
-    <div><dt><code>eye_report</code></dt><dd>What a viewer would have noticed, worst first, with the cause.</dd></div>
-    <div><dt><code>eye_probe</code></dt><dd>Layer geometry and main-thread stalls from inside the app, with stack samples.</dd></div>
-    <div><dt><code>eye_glance</code></dt><dd>A look at a window that may be covered. The user is held for about a third of a second.</dd></div>
+    <div><dt><code>eye_drive</code></dt><dd>One session on an app: its window recorded, a hand on the mouse, a probe inside. One line of words is one unbroken motion, and it presses only what is under it. Ends with what a viewer would have noticed, and why.</dd></div>
+    <div><dt><code>eye_snapshot</code></dt><dd>One picture of a region or of a window that may be covered, plus what the still frame says about text and corners.</dd></div>
     <div><dt><code>eye_inspect</code></dt><dd>The accessibility tree of an app, or everything the element under a point exposes.</dd></div>
-    <div><dt><code>eye_snapshot</code></dt><dd>One picture of a region, plus what the still frame says about text and corners.</dd></div>
-    <div><dt><code>eye_peek</code></dt><dd>The live state of a running recording.</dd></div>
-    <div><dt><code>eye_lock</code></dt><dd>Hold the trackpad and keyboard while it drives. Orange on screen means locked.</dd></div>
-    <div><dt><code>eye_app</code></dt><dd>List, quit, launch or relaunch the app under test.</dd></div>
-    <div><dt><code>eye_stop</code></dt><dd>End a recording and get its report.</dd></div>
-    <div><dt><code>eye_status</code></dt><dd>Displays, refresh rates, and what is running.</dd></div>
+    <div><dt><code>eye_report</code></dt><dd>A finished run read again: timeline, the worst frames with their cause, two runs side by side.</dd></div>
+    <div><dt><code>eye_status</code></dt><dd>Displays, refresh rates, and what the open session sees right now.</dd></div>
   </dl>
 </section>
 

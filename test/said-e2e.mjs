@@ -1,7 +1,7 @@
 // node test/said-e2e.mjs — what the app SAID, on the clock of what it showed.
 // Builds test/fixtures/springy.swift, whose every button also tells accessibility two things without drawing them:
 // its status text becomes "<name> started" inside the button's action, and "<name> at 200" is announced 200ms later.
-// Presses Ease (a 350ms animation) with eye_act and checks that the reply carries both, timed against the click and
+// Presses Ease (a 350ms animation) by name with eye_drive and checks that the reply carries both, timed against the click and
 // placed inside the motion; that events:false leaves them out; and that the explain view lists them.
 // TAKES THE REAL INPUT LOCK for a few seconds per press (countdown, orange overlay; Esc ×6 releases).
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -38,11 +38,7 @@ const near = (x, truth, tol) => Math.abs(x - truth) <= tol;
 
 try {
   await new Promise((r) => setTimeout(r, 1500));
-  const tree = await call("eye_inspect", { process: String(app.pid) });
-  const m = tree.t.match(/Button "Ease"[^\[]*\[(-?\d+),(-?\d+) (\d+)×(\d+)\]/);
-  want("found the Ease button", !!m);
-  const x = Number(m[1]) + Number(m[3]) / 2, y = Number(m[2]) + Number(m[4]) / 2;
-  const press = (extra = {}) => call("eye_act", { target_process: app.pid, front: true, ...extra, steps: [{ op: "click", x, y, note: "Ease" }, { op: "wait", ms: 1600 }] });
+  const press = (extra = {}) => call("eye_drive", { app: app.pid, probe: false, ...extra, wing: '"Ease" tap', steps: [{ op: "wait", ms: 1600 }], end: true });
 
   const { t } = await press();
   const L = t.split("\n");

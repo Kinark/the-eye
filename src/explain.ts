@@ -64,7 +64,7 @@ export function explain(csv: string, o: ExplainOptions = {}): string {
     : "no animation detected");
   const stalls = loadStalls(dir);
   const heard = loadSaid(dir, t0Wall);
-  L.push(`sources: frames ${rows.length} · cursor samples ${cursor.length} · agent actions ${actions.length} · accessibility events ${heard ? heard.events.length : "— (recorded by process: the app's own words go on this clock)"} · main-thread stalls ${stalls ? `${stalls.stalls.length} (probe watchdog in ${stalls.name})` : "— (eye_probe {process} before recording: it times and samples every stall)"} · Instruments samples ${prof?.samples.length ?? "— (profile: {process})"}`);
+  L.push(`sources: frames ${rows.length} · cursor samples ${cursor.length} · agent actions ${actions.length} · accessibility events ${heard ? heard.events.length : "— (recorded by process: the app's own words go on this clock)"} · main-thread stalls ${stalls ? `${stalls.stalls.length} (probe watchdog in ${stalls.name})` : "— (no probe was inside the app: it times and samples every stall)"} · Instruments samples ${prof?.samples.length ?? "— (profile: {process})"}`);
   const stallLines: string[] = [];
   if (stalls?.stalls.length) {
     // Every long stall gets listed, whether or not the screen showed it as one gap: the capture can deliver

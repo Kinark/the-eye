@@ -1,6 +1,6 @@
 // node test/still-e2e.mjs — what a window that holds still says, read off a real screen.
 // Builds test/fixtures/still.swift (text of known sizes and colours, boxes with a 2pt misalignment, uneven gaps, an
-// overlap, a label running off the window, and the four corner shapes), looks at it once with eye_glance and with
+// overlap, a label running off the window, and the four corner shapes), looks at it once with eye_snapshot {app} and with
 // eye_snapshot, and checks that the reply carries the measurements nobody asked for.
 // Holds the real input for a fraction of a second ("Just a sec…").
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -55,7 +55,7 @@ function check(t, how) {
 
 try {
   await new Promise((r) => setTimeout(r, 1500));
-  const g = await call("eye_glance", { app: "Still", return_image: false });
+  const g = await call("eye_snapshot", { app: "Still", return_image: false });
   check(g, "glance");
   const [, x, y, w, h] = g.match(/\[(\d+),(\d+) (\d+)×(\d+)\]/) ?? [];
   want("glance names the window frame", !!w);

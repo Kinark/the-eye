@@ -1,9 +1,9 @@
 // node test/probe-feel-e2e.mjs — what moved it, read from INSIDE the app.
-// Builds test/fixtures/springy.swift as a debuggable app, loads the probe into it (eye_probe), presses each button and
-// checks that the probe report (eye_stop) names, per layer: the animation the code DECLARED (CASpringAnimation mass /
+// Builds test/fixtures/springy.swift as a debuggable app, presses each button by name with eye_drive (the probe goes in by
+// itself) and checks that the probe's part of the reply names, per layer: the animation the code DECLARED (CASpringAnimation mass /
 // stiffness / damping, CABasicAnimation duration + timing function), the engine fitted to the exact presentation
 // values, and that the two agree. The Lerp and Drop buttons declare nothing (display-link driven): only the fit speaks.
-// TAKES THE REAL INPUT LOCK for a few seconds per press (countdown, orange overlay; Esc ×6 releases).
+// TAKES THE REAL INPUT LOCK for a few seconds per press (a small pill; Esc ×6 releases).
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawn, spawnSync } from "node:child_process";
@@ -40,22 +40,15 @@ const near = (x, truth, tol) => Math.abs(x - truth) <= tol;
 
 try {
   await new Promise((r) => setTimeout(r, 1500));
-  const tree = await call("eye_inspect", { process: String(app.pid) });
-  const started = await call("eye_probe", { process: app.pid, label: "probe-feel", max_seconds: 120 });
-  want("the probe loaded and is recording", !started.err && /recording layers/.test(started.t));
-  if (started.err) throw new Error("no probe");
-
-  // One press per engine, one probe run each: every report then holds exactly one motion.
+  // One press per engine, one session each (the probe goes in by itself, once): every report then holds one motion.
+  let first = true;
   const press = async (name, wait) => {
-    const m = tree.t.match(new RegExp(`Button "${name}"[^\\[]*\\[(-?\\d+),(-?\\d+) (\\d+)×(\\d+)\\]`));
-    want(`found the ${name} button`, !!m);
-    if (!m) return "";
-    const x = Number(m[1]) + Number(m[3]) / 2, y = Number(m[2]) + Number(m[4]) / 2;
-    await call("eye_act", { target_process: app.pid, front: true, steps: [{ op: "click", x, y, note: name }, { op: "wait", ms: wait }] });
-    const rep = await call("eye_stop", { top: 6 });
-    const again = await call("eye_probe", { process: app.pid, label: "probe-feel", max_seconds: 120 });
-    if (again.err) throw new Error("probe did not restart");
-    return rep.t;
+    const r = await call("eye_drive", { app: app.pid, wing: `"${name}" tap`, steps: [{ op: "wait", ms: wait }], end: true });
+    if (first) { first = false; want("the probe went in by itself", /probe inside Springy/.test(r.t)); }
+    want(`pressed the ${name} button`, /● tap at .* on Button/.test(r.t) && !/WING STOPPED/.test(r.t));
+    const at = r.t.indexOf("FROM INSIDE THE APP");
+    want(`${name}: the reply carries the probe's report`, at >= 0);
+    return at >= 0 ? r.t.slice(at) : "";
   };
 
   let t = await press("Spring", 1600);
@@ -95,6 +88,6 @@ try {
   want(`Fade: fitted ≈ 400ms (got ${num(t, /TIMING CURVE over (\d+)ms/)})`, near(num(t, /TIMING CURVE over (\d+)ms/), 400, 12));
   want("Fade: ran as declared", /✓ it ran as declared/.test(t));
 } catch (e) { console.error(e); failed++; }
-finally { try { await call("eye_stop", {}); } catch { /* nothing running */ } app.kill("SIGKILL"); await client.close(); }
+finally { app.kill("SIGKILL"); await client.close(); }
 console.log(failed ? `\n${failed} FAILED` : "\nall checks pass");
 process.exit(failed ? 1 : 0);

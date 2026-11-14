@@ -1,7 +1,6 @@
 // One-at-a-time rules.
 // 1. Driver turn: several MCP clients (Claude Code, OpenCode sessions) each start their own the-eye server, but there
-//    is one screen, one pointer and one keyboard. Tools that drive or own them (eye_act, eye_glance, eye_lock,
-//    eye_record, eye_probe, eye_app) take turns through a lease in a shared file. A call that finds another server
+//    is one screen, one pointer and one keyboard. Tools that drive or own them (eye_drive, eye_snapshot {app}) take turns through a lease in a shared file. A call that finds another server
 //    mid-turn joins a FIFO queue and waits inside the server, so the agent gets its real result instead of a "BUSY,
 //    retry" it has to babysit. An idle holder (between its agent's calls) hands over at once when someone is waiting;
 //    a busy one (call in flight, lock, recording, probe) finishes first. Read-only tools never queue.
@@ -11,6 +10,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync, watch as fsWatch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { mayKill } from "./ask.ts";
 
 const DIR = process.env.THE_EYE_LEASE_DIR || join(homedir(), "Library", "Caches", "the-eye");
 const LEASE = join(DIR, "driver.json");
@@ -129,7 +129,7 @@ async function takeTurn(tool: string, extra?: Extra): Promise<string | null> {
         const s = line();
         return `QUEUED, not run: waited ${secs(waited)} for the screen and it is still taken — ${s.holder}. You are #${s.pos || 1} in line; ` +
           `call again within ${secs(KEEP_PLACE_MS)} to keep your place (it waits up to ${secs(MAX_WAIT_MS)} more). Nothing was done. ` +
-          `Read-only tools (eye_inspect, eye_snapshot, eye_status, eye_report, eye_peek) work meanwhile.`;
+          `Read-only tools (eye_inspect, eye_snapshot {rect}, eye_status, eye_report) work meanwhile.`;
       }
       enqueue(); // refresh our place (expires) while we're actually waiting
       if (extra?._meta?.progressToken !== undefined && extra.sendNotification && Date.now() - lastNote >= 2000) {
@@ -161,7 +161,7 @@ function settleLease() {
 /**
  * Wrap a tool handler that drives the screen: it waits its turn (FIFO across every the-eye server), runs, then
  * marks the lease idle so a waiting session can go. `tool` may be a function returning null for calls that only
- * read (e.g. eye_app list, eye_lock release) — those run straight away.
+ * read (e.g. eye_snapshot {rect}) — those run straight away.
  */
 export function driving<P, R extends { content: any[]; isError?: boolean }>(
   tool: string | ((p: P) => string | null), fail: (t: string) => R, fn: (p: P, extra: any) => Promise<R>,
@@ -270,15 +270,16 @@ function successor(pid: number): number | undefined {
   return p !== pid && aliveP(p) ? p : undefined;
 }
 /** Quit every stale family member older than `fresh`. Returns a line for the tool output, or "". */
-async function retireStale(fresh: Proc, members: Proc[]): Promise<string> {
+async function retireStale(fresh: Proc, members: Proc[], background = false): Promise<string> {
   const old = members.filter((p) => stale(p, fresh));
   if (!old.length) return "";
-  const left = await quit(old.map((p) => p.pid));
+  const left = await quit(old.map((p) => p.pid), { stale: true, background });
+  const why = refusal;
   for (const p of old) if (!left.includes(p.pid)) replaced.set(p.pid, fresh.pid);
   const gone = old.filter((p) => !left.includes(p.pid));
   return [
     gone.length ? `quit stale ${gone.map((p) => `${p.name} pid ${p.pid} (started ${fmtAge(p.elapsed)} ago)`).join(", ")}: a newer launch of the same build is running, ${fresh.name} pid ${fresh.pid}, which is the one to test now` : "",
-    left.length ? `could NOT quit stale pid ${left.join(", ")}, so two copies are still running` : "",
+    left.length ? `could NOT quit stale pid ${left.join(", ")}${why ? ` (${why})` : ""}, so two copies are still running` : "",
   ].filter(Boolean).join("; ");
 }
 
@@ -303,7 +304,33 @@ export function familyOf(proc: string | number): { target: Proc; others: Proc[] 
   return { target, others: all.filter((p) => p.pid !== target.pid && related(p, target)) };
 }
 
-async function quit(pids: number[]) {
+/** Launched by Xcode's Run: its parent is the debugger. Killing it ends the user's debug session. */
+function underXcode(pid: number): boolean {
+  const ppid = spawnSync("/bin/ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).stdout?.trim();
+  if (!ppid || !/^\d+$/.test(ppid) || ppid === "1") return false;
+  return (spawnSync("/bin/ps", ["-o", "comm=", "-p", ppid], { encoding: "utf8" }).stdout ?? "").includes("debugserver");
+}
+/** Pids this server started itself (launch): quitting them again when asked to needs no question. */
+const ours = new Set<number>();
+/** Why the last quit was not carried out (the user's "Nope"), for the caller's message. */
+let refusal = "";
+export const notQuit = (left: number[]) => `could not quit pid ${left.join(", ")}${refusal ? `: ${refusal}` : ""}`;
+/**
+ * Quit apps. The user is asked first (question mode, ask.ts) when a pid is an Xcode run session, or a copy outside
+ * build folders that is neither a stale launch nor one this server started: those may be theirs. `stale`: older launches a newer one replaced.
+ * `background`: nobody called for this (the launch watcher), so nothing is asked and such a pid is left running.
+ */
+async function quit(pids: number[], o: { stale?: boolean; background?: boolean } = {}) {
+  pids = pids.filter(aliveP);
+  refusal = "";
+  if (!pids.length) return [];
+  const procs = apps().filter((p) => pids.includes(p.pid));
+  const xcode = pids.filter(underXcode);
+  const theirs = xcode.length > 0 || (!o.stale && procs.some((p) => !isBuild(p) && !(ours.has(p.pid) && !o.background)));
+  const name = procs.find((p) => xcode.includes(p.pid))?.name ?? procs[0]?.name ?? `pid ${pids[0]}`;
+  if (theirs && o.background) { refusal = "it may be in use, and nothing is asked in the background"; return pids; }
+  refusal = await mayKill(!theirs ? undefined : xcode.length ? `Kill ${name}'s Xcode run session?` : `Quit ${name}?`);
+  if (refusal) return pids;
   for (const pid of pids) { try { process.kill(pid, "SIGTERM"); } catch {} }
   for (let i = 0; i < 30 && pids.some(aliveP); i++) await sleep(100);
   for (const pid of pids) if (aliveP(pid)) { try { process.kill(pid, "SIGKILL"); } catch {} }
@@ -318,7 +345,7 @@ export async function launch(app: string, settleMs = 1500): Promise<Proc | strin
   if (r.status !== 0) return `open failed: ${(r.stderr || r.stdout).trim()}`;
   for (let i = 0; i < 200; i++) {
     const hit = apps().find((p) => !before.has(p.pid) && (p.app === app || p.name === exe));
-    if (hit) { await sleep(settleMs); return hit; }
+    if (hit) { ours.add(hit.pid); await sleep(settleMs); return hit; }
     await sleep(100);
   }
   return `${app} did not start within 20s`;
@@ -354,7 +381,7 @@ async function checkFamily(proc: string | number, policy: InstancePolicy, appPat
   if (policy === "relaunch") {
     const app = appPath ?? target.app!;
     const left = await quit([target.pid, ...others.map((p) => p.pid)]);
-    if (left.length) return { ok: false, error: `could not quit pid ${left.join(", ")}` };
+    if (left.length) return { ok: false, error: notQuit(left) };
     const l = await launch(app);
     if (typeof l === "string") return { ok: false, error: l };
     watch(l);
@@ -373,7 +400,7 @@ async function checkFamily(proc: string | number, policy: InstancePolicy, appPat
   }
   if (policy === "quit_others") {
     const left = await quit(others.map((p) => p.pid));
-    if (left.length) return { ok: false, error: `could not quit pid ${left.join(", ")}` };
+    if (left.length) return { ok: false, error: notQuit(left) };
     return { ok: true, pid: target.pid, note: `quit ${others.map((p) => `${p.name} pid ${p.pid}`).join(", ")}; kept pid ${target.pid}` };
   }
   return { ok: false, error: conflictText(target, others) };
@@ -390,7 +417,7 @@ export function conflictText(target: Proc, others: Proc[]) {
     `  duplicates:"quit_others"  keep pid ${target.pid}, quit the other ${others.length}`,
     `  duplicates:"relaunch"     quit all ${n}, start ${target.app} fresh (add app_path to start a different build, e.g. the one you just built)`,
     `  duplicates:"allow"        test with all of them running`,
-    `  or stop the test and ask the user (one of these may be the user's own copy). eye_app {app} lists them; eye_app {action:"quit", pid} quits one.`,
+    `  or stop the test and ask the user (one of these may be the user's own copy). eye_status {app} lists them; eye_drive {app: pid, quit:true} quits one.`,
   ].join("\n");
 }
 
@@ -417,7 +444,7 @@ export function watch(p: Proc) {
             w.pids.add(q.pid);
             if (fam.length < 2) continue;
             // A newer launch of the same build: the old copy is stale, quit it now instead of leaving two on screen.
-            const note = await retireStale(q, fam);
+            const note = await retireStale(q, fam, true);
             const left = familyOf(q.pid);
             if (note) events.push({ t: Date.now(), text: note });
             if (left?.others.length) events.push({ t: Date.now(), text: `another copy of ${w.name}'s app launched: ${q.name} pid ${q.pid} (${left.others.length + 1} running now: ${[left.target, ...left.others].map((f) => f.pid).join(", ")})` });
@@ -435,7 +462,7 @@ export function instanceEvents(since: number) { return events.filter((e) => e.t 
 let reported = 0;
 /** Launch warnings not shown yet; every tool output appends them, so the agent hears about a new copy right away. */
 export function freshEvents(): string[] {
-  const out = events.slice(reported).map((e) => `⚠ ${new Date(e.t).toLocaleTimeString()} ${e.text}${e.text.startsWith("another copy of ") ? ` — eye_app {app:"${e.text.split("'s app")[0].replace("another copy of ", "")}"} for the choices` : ""}`);
+  const out = events.slice(reported).map((e) => `⚠ ${new Date(e.t).toLocaleTimeString()} ${e.text}${e.text.startsWith("another copy of ") ? ` — eye_status {app:"${e.text.split("'s app")[0].replace("another copy of ", "")}"} for the choices` : ""}`);
   reported = events.length;
   return out;
 }

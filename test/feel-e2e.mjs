@@ -1,9 +1,9 @@
 // node test/feel-e2e.mjs — what moved it, read off a real screen.
 // Builds test/fixtures/springy.swift (a bar driven by a known CASpringAnimation, a critically damped one, an
 // easeInEaseOut and a hand-rolled per-frame lerp; a puck that slides without changing size, on a spring and on an
-// easeOut; a tile that grows and shrinks in both dimensions at once), presses each button with eye_act and checks that
+// easeOut; a tile that grows and shrinks in both dimensions at once), presses each button by name with eye_drive and checks that
 // the reply names the engine and recovers its numbers from the captured frames alone: no probe, no source.
-// TAKES THE REAL INPUT LOCK for a few seconds per press (countdown, orange overlay; Esc ×6 releases).
+// TAKES THE REAL INPUT LOCK for a few seconds per press (a small pill; Esc ×6 releases).
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawn, spawnSync } from "node:child_process";
@@ -38,14 +38,11 @@ const near = (x, truth, tol) => Math.abs(x - truth) <= tol;
 
 try {
   await new Promise((r) => setTimeout(r, 1500));
-  const tree = await call("eye_inspect", { process: String(app.pid) });
   const only = process.env.FEEL_ONLY?.split(",");
   for (const name of ["Spring", "Smooth", "Ease", "Lerp", "Slide", "Glide", "Grow", "Grow", "Drop", "Fade"].filter((n) => !only || only.includes(n))) {
-    const m = tree.t.match(new RegExp(`Button "${name}"[^\\[]*\\[(-?\\d+),(-?\\d+) (\\d+)×(\\d+)\\]`));
-    want(`found the ${name} button`, !!m);
-    if (!m) continue;
-    const x = Number(m[1]) + Number(m[3]) / 2, y = Number(m[2]) + Number(m[4]) / 2;
-    const { t } = await call("eye_act", { target_process: app.pid, front: true, steps: [{ op: "click", x, y, note: name }, { op: "wait", ms: name === "Drop" ? 2600 : 1600 }] });
+    // One call: the hand finds the button by its name, presses it, the recording runs on, the session ends.
+    const { t } = await call("eye_drive", { app: app.pid, probe: false, wing: `"${name}" tap`, steps: [{ op: "wait", ms: name === "Drop" ? 2600 : 1600 }], end: true });
+    want(`pressed the ${name} button`, /● tap at .* on Button/.test(t) && !/WING STOPPED/.test(t));
     const line = t.split("\n").find((l) => /moved by:/.test(l)) ?? "";
     if (name === "Spring") {
       want("Spring: called a spring", /moved by: a SPRING/.test(line));

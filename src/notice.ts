@@ -130,12 +130,18 @@ export function whyGap(st: Stalls | null, t0Mach: number, from: number, to: numb
 export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?: string; still_recording?: boolean } = {}): Seen {
   const period = a.period_ms;
   const thr = o.motion_threshold ?? 0.0005;
+  const drift = o.drift_threshold ?? 0.004;
   const split = (o.split_gap_ms ?? 150) / 1000;
   const inWin = (r: Row) => (o.from_s === undefined || r.t >= o.from_s) && (o.to_s === undefined || r.t <= o.to_s);
   const complete = rows.filter((r) => r.s === "c" && inWin(r));
   const t0Mach = Number(meta.t0_mach ?? 0), t0Wall = Number(meta.t0_wall ?? 0);
   const stalls = o.dir ? loadStalls(o.dir) : null;
   const actions = o.dir ? loadActions(o.dir, t0Wall).filter((x) => inWin({ t: x.t0 } as Row)) : [];
+  // A picture that had come to rest and then answered a new press did not freeze: the stillness was rest, the
+  // wait after the press is that press's response time (reported there). A press that lands as the stillness
+  // begins is the opposite: the press is what hung it.
+  const restedUntilInput = (from: number, to: number) => actions.some((x) => RESPONSIVE.has(x.op)
+    && [x.t0, x.t1].some((τ) => τ >= from + 3 * period / 1000 && τ <= to + period / 1000));
   const heard = o.dir ? loadSaid(o.dir, t0Wall) : null;
   const said = heard ? heard.events.filter((e) => inWin({ t: e.t } as Row)) : [];
   const under = o.dir ? loadUnder(o.dir, t0Wall, t0Mach) : null;
@@ -178,7 +184,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
     const gapMs = prevEnd ? (s.start_s - prevEnd.end) * 1000 : 0, startDir = Math.sign(v[Math.min(2, v.length - 1)] - v[0]);
     const starved = prevEnd !== null && fr[0].interval >= 2.9 * period
       && complete.every((r) => r.t <= prevEnd!.end + 1e-6 || r.t >= s.start_s - 1e-6 || r.interval >= 2.9 * period);
-    if (prevEnd && prevEnd.atSpeed && starved && gapMs <= 1500
+    if (prevEnd && prevEnd.atSpeed && starved && gapMs <= 1500 && !restedUntilInput(prevEnd.end, s.start_s)
       && (prevEnd.dir === 0 || (prevEnd.d === d && prevEnd.dir === startDir))) {
       const why = whyFroze(prevEnd.end, s.start_s);
       // Certain when the edge carried on the same way, or when the app's own main thread was blocked right then.
@@ -200,6 +206,10 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
       if (i < 3) continue; // the first frames are start-up, not motion yet
       for (let j = first; j <= i; j++) frozeAt.add(j);
       const sev = sevOf(total), r = fr[i];
+      // A freeze is a motion interrupted: something must move again after it, and by itself. Stillness that lasts
+      // to the end of the motion is the motion ending; stillness that lasts until a press is rest.
+      const resumed = fr.slice(i).find((x) => x.frac > thr || x.diff >= drift);
+      if (!resumed || restedUntilInput(r.t - total / 1000, resumed.t)) continue;
       const jump = steps[i];
       const caught = jump >= 6 && jump > 3 * Math.max(steps[first - 1] ?? 0, steps[i + 1] ?? 0) ? `, then ${dimName[d]} jumped ${pt(jump)} to catch up (${pt(v[i])}→${pt(v[i + 1])})` : "";
       const from = r.t - total / 1000;
@@ -460,7 +470,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
 }
 
 /** Verdict, then what was noticed (worst first, causes indented under each), then the plain facts. */
-export function formatSeen(s: Seen, max = 10): string {
+export function formatSeen(s: Seen, max = 10, probed = false): string {
   const L = [s.verdict];
   const bad = s.percepts.filter((p) => p.sev > 0), facts = s.percepts.filter((p) => p.sev === 0).sort((x, y) => x.t - y.t);
   for (const p of bad.slice(0, max)) {
@@ -469,7 +479,7 @@ export function formatSeen(s: Seen, max = 10): string {
     for (const m of p.more ?? []) L.push(`    ${m}`);
   }
   if (bad.length > max) L.push(`  … ${bad.length - max} more`);
-  if (bad.some((p) => p.kind === "freeze" && !p.why?.length)) L.push("  (cause not measured: eye_probe {process} before recording makes the report name what held the main thread — Debug builds)");
+  if (!probed && bad.some((p) => p.kind === "freeze" && !p.why?.length)) L.push("  (cause not measured: no probe was inside the app. eye_drive puts one in by itself in Debug builds and then names what held the main thread)");
   for (const p of facts.slice(0, max)) { L.push(`· ${p.text}`); for (const m of p.more ?? []) L.push(`    ${m}`); }
   if (facts.length > max) L.push(`  … ${facts.length - max} more`);
   if (s.said?.lines.length) {

@@ -2,9 +2,9 @@
 // 1. A fixture app (test/fixtures/ticker.swift) that changes by itself: value-changed, title-changed, sheet
 //    open/close with its text + buttons, --until on a value, --until on a window already showing, --seconds → 124.
 //    No input is sent, so no lock is needed.
-// 2. TextEdit driven with System Events keystrokes INSIDE eye_lock (taken through the server, so it waits its
+// 2. TextEdit driven with System Events keystrokes inside a session that holds the input (taken through the server, so it waits its
 //    turn in the driver queue): launch, window-opened, ⌘S save sheet, Esc, close, quit.
-// 3. Calculator under eye_lock: results arrive as announcements (attributed-string payload).
+// 3. Calculator with the input held: results arrive as announcements (attributed-string payload).
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
@@ -67,11 +67,12 @@ spawnSync("swiftc", ["-O", join(ROOT, "test", "fixtures", "ticker.swift"), "-o",
 spawnSync("pkill", ["-x", "TextEdit"]); await sleep(800);
 const client = new Client({ name: "watch-events", version: "1" });
 await client.connect(new StdioClientTransport({ command: "node", args: [CLI], stderr: "ignore" }));
-const call = async (name, args) => (await client.callTool({ name, arguments: args }, undefined, { timeout: 120000 })).content.map((c) => c.text).join("\n");
+const call = async (name, args) => (await client.callTool({ name, arguments: args }, undefined, { timeout: 120000 })).content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
 const w = watch(["--app", "TextEdit", "--seconds", "30"]);
 await w.ready;
-const lock = await call("eye_lock", { seconds: 25 });
-check(/locked|lock/i.test(lock) && !/refused|QUEUED/.test(lock), "eye_lock taken for the TextEdit drive", lock.split("\n")[0]);
+// A session that only watches, with the user's input held for this script's own driver (osascript).
+const lock = await call("eye_drive", { rect: { x: 0, y: 0, w: 400, h: 300 }, hands: false, lock: true, ax: false, max_seconds: 30 });
+check(/input is held/.test(lock) && !/refused|QUEUED/.test(lock), "input held for the TextEdit drive", lock.split("\n")[0]);
 const osa = (...lines) => { try { execFileSync("osascript", lines.flatMap((l) => ["-e", l]), { stdio: "pipe" }); } catch (e) { console.log("     osascript: " + String(e.stderr).trim()); } };
 osa('tell application "TextEdit" to activate', "delay 2",
   'tell application "TextEdit" to make new document with properties {text:"watched"}', "delay 1",
@@ -80,8 +81,8 @@ osa('tell application "TextEdit" to activate', "delay 2",
   'tell application "TextEdit" to close every document saving no', "delay 0.5",
   'tell application "TextEdit" to quit');
 await sleep(1500);
-const rel = await call("eye_lock", { release: true });
-check(!/no active lock/.test(rel), "lock released", rel.split("\n")[0]);
+const rel = await call("eye_drive", { end: true });
+check(/SESSION ENDED/.test(rel), "session ended, input given back", rel.split("\n")[0]);
 await sleep(500);
 w.p.kill("SIGTERM");
 const lines = [...w.lines];
@@ -100,13 +101,13 @@ check(!has(lines, /window-focused TextEdit$/), "no untitled focus noise");
   execFileSync("open", ["-a", "Calculator"]); await sleep(2500);
   const c = watch(["--app", "Calculator", "--until", "Result, 92", "--seconds", "25"]);
   await c.ready;
-  const lock3 = await call("eye_lock", { seconds: 20 });
-  check(/lock/i.test(lock3) && !/refused|QUEUED/.test(lock3), "eye_lock taken for the Calculator drive", lock3.split("\n")[0]);
+  const lock3 = await call("eye_drive", { rect: { x: 0, y: 0, w: 400, h: 300 }, hands: false, lock: true, ax: false, max_seconds: 25 });
+  check(/input is held/.test(lock3) && !/refused|QUEUED/.test(lock3), "input held for the Calculator drive", lock3.split("\n")[0]);
   osa('tell application "Calculator" to activate', "delay 1",
     'tell application "System Events" to key code 53', "delay 0.5",
     'tell application "System Events" to keystroke "12+34="', "delay 1.5",
     'tell application "System Events" to keystroke "*2="', "delay 1");
-  await call("eye_lock", { release: true });
+  await call("eye_drive", { end: true });
   const { lines: cl, code: cc } = await c.done;
   console.log(cl.map((l) => "     " + l).join("\n"));
   check(has(cl, /announced Calculator "Result, 46"/), "Calculator result announced (attributed-string payload)");

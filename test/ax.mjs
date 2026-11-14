@@ -1,4 +1,5 @@
-// AX path: background recording with hover + tree, eye_act (wait steps only — never moves the pointer), peek, stop.
+// AX path: a session that only watches (hover + tree), steps that wait on what is under the pointer (nothing is
+// sent, the pointer never moves), eye_status with the tree, end.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -13,11 +14,11 @@ const call = async (name, args = {}, show = 2500) => {
   return t;
 };
 const rect = { x: 0, y: 0, w: 1512, h: 400 };
-const s = await call("eye_record", { rect, label: "ax-test", max_seconds: 30 }, 3000);
-const id = s.match(/^(run\d+)/)?.[1];
-await call("eye_act", { id, lock: false, steps: [{ op: "wait", ms: 300 }, { op: "assert", expr: "h !== undefined" }, { op: "wait_until", expr: "h && h.role", timeout_ms: 1000 }] });
-await call("eye_peek", { id, tree: "basic" }, 1500);
-await call("eye_stop", { id }, 2500);
+await call("eye_drive", { rect, hands: false, label: "ax-test", max_seconds: 30 }, 3000);
+const w = await call("eye_drive", { steps: [{ op: "wait", ms: 300 }, { op: "assert", expr: "h !== undefined" }, { op: "wait_until", expr: "h && h.role", timeout_ms: 1000 }] });
+if (/STOPPED|NOT RUN/.test(w)) { errors++; console.log("FAIL: the waiting steps did not run in a session that only watches"); }
+await call("eye_status", { tree: "basic" }, 1500);
+await call("eye_drive", { end: true }, 2500);
 await client.close();
 console.log(`\n${errors} tool errors`);
 process.exit(errors ? 1 : 0);

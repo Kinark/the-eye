@@ -3,7 +3,7 @@
 // Subcommands (all output is JSON on stdout unless noted):
 //   displays
 //   capture  --rect x,y,w,h [--display ID] [--seconds N] [--fps 120] --out run.csv
-//            [--keyframes-dir DIR --keyframe-ms 100] [--step N]
+//            [--keyframes-dir DIR --keyframe-ms 100 [--keyframe-max PX]] [--step N]
 //            Streams one CSV row per ScreenCaptureKit frame callback until --seconds elapse or
 //            SIGINT/SIGTERM, then writes run.csv.meta.json and prints it.
 //   snapshot --rect x,y,w,h [--display ID] --out shot.png
@@ -137,12 +137,17 @@ var terminateSources: [DispatchSourceSignal] = []
 
 func cmdDisplays() async {
     deadline(5, "displays")
-    let content = await shareable()
-    let list: [[String: Any]] = content.displays.map { d in
-        let b = CGDisplayBounds(d.displayID)
-        return ["id": d.displayID, "name": screenName(d.displayID), "main": d.displayID == CGMainDisplayID(),
+    // CoreGraphics, not ScreenCaptureKit: a second process that asks ScreenCaptureKit anything interrupts a
+    // recording that is running ("application connection being interrupted", some tens of ms blind; macOS 27.2).
+    var n: UInt32 = 0
+    CGGetActiveDisplayList(0, nil, &n)
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+    CGGetActiveDisplayList(n, &ids, &n)
+    let list: [[String: Any]] = ids.prefix(Int(n)).map { id in
+        let b = CGDisplayBounds(id)
+        return ["id": id, "name": screenName(id), "main": id == CGMainDisplayID(),
                 "points": ["x": b.origin.x, "y": b.origin.y, "w": b.width, "h": b.height],
-                "scale": displayScale(d.displayID), "refresh_hz": displayRefresh(d.displayID)]
+                "scale": displayScale(id), "refresh_hz": displayRefresh(id)]
     }
     print(json(["displays": list]))
     exit(0)
@@ -179,6 +184,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     let step: Int
     let keyDir: String?
     let keyEvery: Double
+    /// > 0: keyframes are scaled to fit this many pixels and written off the capture queue (`--keyframe-max`).
+    var keyMax = 0
+    var keyBusy = false
+    let keyQueue = DispatchQueue(label: "eye.keyframes", qos: .utility)
     var buf = ""
     var t0: Double?
     var lastComplete: Double?
@@ -379,8 +388,31 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
         if let keyDir, rel * 1000 - lastKey >= keyEvery {
             lastKey = rel * 1000
-            if let img = cgImage(pb) {
-                let name = String(format: "%@/frame_%08.1fms.png", keyDir, rel * 1000)
+            let name = String(format: "%@/frame_%08.1fms.png", keyDir, rel * 1000)
+            if keyMax > 0 {
+                // Off the capture queue: encoding a PNG here would hold back the very frames being counted.
+                // One at a time; a keyframe that comes while the last is still being written is skipped.
+                if !keyBusy {
+                    keyBusy = true; keyframes += 1
+                    let cap = keyMax
+                    keyQueue.async { [weak self] in
+                        CVPixelBufferLockBaseAddress(pb, .readOnly)
+                        let img = self?.cgImage(pb)
+                        CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+                        if let img {
+                            let k = min(1, Double(cap) / Double(max(img.width, img.height)))
+                            let w = max(1, Int(Double(img.width) * k)), h = max(1, Int(Double(img.height) * k))
+                            if k < 1, let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                                          space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                                ctx.interpolationQuality = .medium
+                                ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+                                if let small = ctx.makeImage() { _ = writePNG(small, name) }
+                            } else { _ = writePNG(img, name) }
+                        }
+                        self?.q.async { self?.keyBusy = false }
+                    }
+                }
+            } else if let img = cgImage(pb) {
                 if writePNG(img, name) { keyframes += 1 }
             }
         }
@@ -402,6 +434,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             "mean_luma": curLuma,
             "rect_points": ["x": rect.origin.x, "y": rect.origin.y, "w": rect.width, "h": rect.height],
             "refresh_hz": refresh,
+            "t0_mach": t0 ?? 0, "t0_wall": t0Wall,   // the clocks, so a run still recording can be read like a finished one
         ]
         if let a = anchored {
             o["anchored_screen"] = ["x0": a.x0, "x1": a.x1, "w": a.x1 - a.x0, "y0": rect.origin.y,
@@ -450,7 +483,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 // Every AX call is answered on the TARGET app's main thread, and a SwiftUI app that sees any AX client starts
 // maintaining its accessibility graph every frame (measured: ~18% more main-thread time, −25% fps). Callers
 // decide when that's acceptable. All frames are GLOBAL points, top-left origin (CG / AX space) — the same
-// space as the pointer and eye_act x/y; on the main display that equals display-local points.
+// space as the pointer and step x/y; on the main display that equals display-local points.
 
 /// Topmost on-screen window under a global top-left point (CGWindowList is front to back), skipping our own
 /// click-through lock overlay.
@@ -865,6 +898,7 @@ func cmdCapture() async {
     if let keyDir { try? FileManager.default.createDirectory(atPath: keyDir, withIntermediateDirectories: true) }
     let rec = Recorder(outPath: outPath, rect: rect, scale: scale, step: step, keyDir: keyDir,
                        keyEvery: opt("keyframe-ms").flatMap(Double.init) ?? 100)
+    rec.keyMax = opt("keyframe-max").flatMap(Int.init) ?? 0
     rec.anchorX = opt("anchor-x").flatMap(Double.init) ?? Double(CGDisplayBounds(d.displayID).width) / 2
     rec.anchorRowPt = opt("anchor-row").flatMap(Double.init) ?? 4
 
@@ -1179,6 +1213,15 @@ let lockCallback: CGEventTapCallBack = { _, type, event, _ in
     }
     blocked += 1
     blockedTypes[type.rawValue, default: 0] += 1
+    // A question is up: return/enter, Esc and the left/right arrows answer it (and never count towards Esc ×6).
+    // The first 175ms are deaf, so a key already on its way down when the question appeared cannot answer it.
+    if questionOpen, type == .keyDown {
+        let code = event.getIntegerValueField(.keyboardEventKeycode)
+        if questionKeys.contains(code) {
+            if event.getIntegerValueField(.keyboardEventAutorepeat) == 0, CACurrentMediaTime() - questionT0 >= questionDeaf { questionKey?(code) }
+            return nil
+        }
+    }
     if type == .keyDown, event.getIntegerValueField(.keyboardEventKeycode) == 53,
        event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
         let now = CACurrentMediaTime()
@@ -1236,8 +1279,15 @@ func endInterruptedActions() {
 func cmdLock() {
     setvbuf(stdout, nil, _IOLBF, 0)
     var seconds = min(opt("seconds").flatMap(Double.init) ?? 60, 600)
-    lockStyle = opt("style") == "quick" ? "quick" : "full"
-    let countdown = max(0, Int(opt("countdown") ?? (lockStyle == "quick" ? "0" : "3")) ?? 3)
+    lockStyle = ["quick", "question"].contains(opt("style") ?? "") ? opt("style")! : "full"
+    // Question mode: the lock, its overlay and the question arrive together, with no countdown and no waiting.
+    let question = String((opt("question") ?? "").prefix(questionMaxChars))
+    let askSeconds = min(max(opt("ask-seconds").flatMap(Double.init) ?? 6, 1), 60)
+    if lockStyle == "question" {
+        if question.isEmpty { fail("--style question needs --question \"…\"") }
+        seconds = askSeconds + 3
+    }
+    let countdown = lockStyle == "question" ? 0 : max(0, Int(opt("countdown") ?? (lockStyle == "quick" ? "0" : "3")) ?? 3)
     // How long to wait (after any countdown) for a drag / scroll / gesture in progress to finish before engaging anyway.
     let settleMax = (opt("settle-ms").flatMap(Double.init) ?? 1200) / 1000
     let message = opt("message") ?? "Just a sec…"
@@ -1281,6 +1331,11 @@ func cmdLock() {
             let parts = line.split(separator: " ")
             DispatchQueue.main.async {
                 if parts.first == "release" { end("released") }
+                // "ask <preselect 0-2> <seconds> <question…>": a question over a lock that is already held.
+                else if parts.first == "ask", parts.count > 3, let pre = Int(parts[1]), let s = Double(parts[2]) {
+                    if !lockEngaged || questionOpen || ended { print(json(["answer": NSNull(), "how": "busy"])); fflush(stdout); return }
+                    presentQuestion(String(parts[3...].joined(separator: " ").prefix(questionMaxChars)), preselect: pre, timeout: min(max(s, 1), 60)) {}
+                }
                 else if parts.first == "extend", parts.count > 1, let s = Double(parts[1]), !ended {
                     seconds = min(s, 600)
                     if lockEngaged { arm(seconds); updateLockMessage(until: Date().addingTimeInterval(seconds)) }
@@ -1296,7 +1351,11 @@ func cmdLock() {
         lockEngaged = true
         endInterruptedActions()
         // The overlay is only ever shown together with the lock: orange on screen = no physical input gets through.
-        if lockStyle == "quick" { showQuickPill(locked: true, message: message) } else { showLockOverlay(until: Date().addingTimeInterval(seconds)) }
+        if lockStyle == "quick" { showQuickPill(locked: true, message: message) }
+        else if lockStyle == "question" {
+            showLockOverlay(until: Date(), custom: "the-eye is asking · trackpad & keyboard locked until you answer")
+            presentQuestion(question, preselect: opt("default") == "casa" ? 2 : opt("default") == "nope" ? 0 : 1, timeout: askSeconds) { end("answered") }
+        } else { showLockOverlay(until: Date().addingTimeInterval(seconds)) }
         // The TS side waits for this line before it drives anything.
         say("physical pointer + keyboard locked for \(seconds)s (\(lockStyle), settle \(settleMs)ms\(interrupted.isEmpty ? "" : ", ended: " + interrupted.joined(separator: ", ")); Esc ×6 = emergency release)")
         arm(seconds)
@@ -1320,13 +1379,14 @@ func cmdLock() {
         }
         poll()
     }
-    if countdown > 0 { showLockCountdown(from: countdown, step: 0.5, then: settle) } else { settle() }
+    if lockStyle == "question" { engage() }
+    else if countdown > 0 { showLockCountdown(from: countdown, step: 0.5, then: settle) } else { settle() }
 }
 
 /// The full overlay's message layers, so `extend` can update the "locked until" time in place.
 var lockMessageLayers: [(layer: CATextLayer, font: NSFont)] = []
 func updateLockMessage(until: Date) {
-    if lockStyle == "quick" { return }
+    if lockStyle != "full" { return }
     let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
     let message = "the-eye is testing — trackpad & keyboard locked until \(f.string(from: until)) · Esc ×\(panicCount) releases"
     for (l, font) in lockMessageLayers {
@@ -1549,12 +1609,14 @@ func showEscStreak(_ n: Int) {
     CATransaction.commit()
 }
 
-func showLockOverlay(until: Date) {
+func showLockOverlay(until: Date, custom: String? = nil) {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     app.finishLaunching()
     let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
-    let message = "the-eye is testing — trackpad & keyboard locked until \(f.string(from: until)) · Esc ×\(panicCount) releases"
+    let message = custom ?? "the-eye is testing — trackpad & keyboard locked until \(f.string(from: until)) · Esc ×\(panicCount) releases"
+    // A question's lock ends on the first Esc (= Nope), so it shows no Esc ×6 dots.
+    let escDots = custom == nil ? panicCount : 0
     let orange = NSColor(srgbRed: 1, green: 0.55, blue: 0.1, alpha: 0.95).cgColor
     for screen in NSScreen.screens {
         let fr = screen.frame
@@ -1607,7 +1669,7 @@ func showLockOverlay(until: Date) {
         let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         let textW = (message as NSString).size(withAttributes: [.font: font]).width
         let pill = CALayer()
-        let escW = CGFloat(panicCount) * escDotPitch + 4
+        let escW = escDots > 0 ? CGFloat(escDots) * escDotPitch + 4 : 0
         pill.frame = CGRect(x: (fr.width - textW - 56 - escW) / 2, y: 22, width: textW + 56 + escW, height: 32)
         pill.backgroundColor = orange; pill.cornerRadius = 16
         pill.shadowColor = tint(1); pill.shadowOpacity = 0.8; pill.shadowRadius = 14; pill.shadowOffset = .zero
@@ -1630,7 +1692,7 @@ func showLockOverlay(until: Date) {
         pill.addSublayer(text)
         // Emergency-release progress: one ring per Esc press needed, filled as the streak grows.
         var dots: [CALayer] = []
-        for i in 0..<panicCount {
+        for i in 0..<escDots {
             let d = CALayer()
             d.frame = CGRect(x: textW + 50 + CGFloat(i) * escDotPitch, y: 11.5, width: 9, height: 9)
             d.cornerRadius = 4.5; d.borderWidth = 1.5; d.borderColor = NSColor.black.cgColor
@@ -1649,6 +1711,150 @@ func showLockOverlay(until: Date) {
         w.orderFrontRegardless()
         lockOverlayWindows.append(w)
     }
+}
+
+// MARK: - lock: question mode
+
+/// A question put to the user over a held lock: big type, three big buttons side by side. Left / right move the
+/// highlight, return / enter take it, Esc is "Nope". It answers itself with the highlighted button after `timeout`.
+/// The answer is one JSON line on stdout: {"answer":"nope|yep|casa","how":"key|escape|timeout","waited_ms":…}.
+let questionMaxChars = 140
+let questionDeaf = 0.175
+let questionKeys: Set<Int64> = [36, 76, 53, 123, 124] // return, enter, esc, left, right
+var questionOpen = false
+var questionT0 = 0.0
+var questionKey: ((Int64) -> Void)?
+
+func presentQuestion(_ text: String, preselect: Int, timeout: Double, then done: @escaping () -> Void) {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    app.finishLaunching()
+    let ids = ["nope", "yep", "casa"]
+    let names = ["Nope", "Yep", "Mi casa su casa"]
+    let subs = ["I'm using it, leave it", "go ahead, this once", "yes, for the rest of this session"]
+    var choice = min(2, max(0, preselect))
+    var windows: [NSWindow] = []
+    var cards: [CALayer] = []
+    var buttons: [[(box: CALayer, label: CATextLayer, sub: CATextLayer)]] = []
+    let qFont = NSFont.systemFont(ofSize: 38, weight: .bold)
+    let bFont = NSFont.systemFont(ofSize: 25, weight: .bold)
+    let sFont = NSFont.systemFont(ofSize: 13, weight: .medium)
+    let hFont = NSFont.systemFont(ofSize: 13, weight: .medium)
+    let para = NSMutableParagraphStyle(); para.alignment = .center; para.lineBreakMode = .byWordWrapping
+
+    func paint(pop: Bool) {
+        CATransaction.begin(); CATransaction.setAnimationDuration(0.12)
+        for row in buttons {
+            for (i, b) in row.enumerated() {
+                let on = i == choice
+                b.box.backgroundColor = (on ? quickOrange : NSColor(white: 1, alpha: 0.08)).cgColor
+                b.box.borderColor = (on ? quickOrange : NSColor(white: 1, alpha: 0.22)).cgColor
+                b.box.shadowOpacity = on ? 0.7 : 0
+                b.label.string = NSAttributedString(string: names[i], attributes: [.font: bFont, .foregroundColor: on ? NSColor.black : NSColor.white])
+                b.sub.string = NSAttributedString(string: subs[i], attributes: [.font: sFont, .foregroundColor: on ? NSColor(white: 0, alpha: 0.72) : NSColor(white: 1, alpha: 0.55)])
+                if on, pop { b.box.add(spring("transform.scale", from: 0.94, to: 1, damping: 13), forKey: "pick") }
+            }
+        }
+        CATransaction.commit()
+    }
+
+    for screen in NSScreen.screens {
+        let fr = screen.frame
+        let pad: CGFloat = 48, gap: CGFloat = 18, bh: CGFloat = 104
+        let cw = min(1040, fr.width - 96), inner = cw - pad * 2
+        let qText = NSAttributedString(string: text, attributes: [.font: qFont, .foregroundColor: NSColor.white, .paragraphStyle: para])
+        let qh = min(ceil(qText.boundingRect(with: CGSize(width: inner, height: 600), options: [.usesLineFragmentOrigin, .usesFontLeading]).height) + 4, 240)
+        let hintY: CGFloat = 30, buttonsY = hintY + 18 + 24, questionY = buttonsY + bh + 40
+        let ch = questionY + qh + pad
+        let w = NSWindow(contentRect: fr, styleMask: [.borderless], backing: .buffered, defer: false)
+        w.isOpaque = false; w.backgroundColor = .clear; w.hasShadow = false
+        w.ignoresMouseEvents = true
+        w.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        w.sharingType = .none
+        w.animationBehavior = .none
+        let v = NSView(frame: NSRect(origin: .zero, size: fr.size)); v.wantsLayer = true
+        let root = v.layer!
+        let dim = CALayer(); dim.frame = CGRect(origin: .zero, size: fr.size); dim.backgroundColor = NSColor(white: 0, alpha: 0.35).cgColor
+        root.addSublayer(dim)
+        let card = CALayer()
+        card.frame = CGRect(x: (fr.width - cw) / 2, y: (fr.height - ch) / 2, width: cw, height: ch)
+        card.cornerRadius = 34; card.cornerCurve = .continuous
+        card.backgroundColor = NSColor(white: 0.07, alpha: 0.96).cgColor
+        card.borderColor = quickOrange.cgColor; card.borderWidth = 2
+        card.shadowColor = quickOrange.cgColor; card.shadowOpacity = 0.5; card.shadowRadius = 40; card.shadowOffset = .zero
+        card.shadowPath = CGPath(roundedRect: card.bounds, cornerWidth: 34, cornerHeight: 34, transform: nil)
+        root.addSublayer(card)
+        let q = CATextLayer(); q.contentsScale = screen.backingScaleFactor; q.isWrapped = true; q.alignmentMode = .center
+        q.frame = CGRect(x: pad, y: questionY, width: inner, height: qh); q.string = qText
+        card.addSublayer(q)
+        let bw = (inner - gap * 2) / 3
+        var row: [(box: CALayer, label: CATextLayer, sub: CATextLayer)] = []
+        for i in 0..<3 {
+            let box = CALayer()
+            box.frame = CGRect(x: pad + CGFloat(i) * (bw + gap), y: buttonsY, width: bw, height: bh)
+            box.cornerRadius = 26; box.cornerCurve = .continuous; box.borderWidth = 1.5
+            box.shadowColor = quickOrange.cgColor; box.shadowRadius = 22; box.shadowOffset = .zero
+            box.shadowPath = CGPath(roundedRect: box.bounds, cornerWidth: 26, cornerHeight: 26, transform: nil)
+            let label = CATextLayer(); label.contentsScale = screen.backingScaleFactor; label.alignmentMode = .center
+            label.frame = CGRect(x: 0, y: 46, width: bw, height: 34)
+            let sub = CATextLayer(); sub.contentsScale = screen.backingScaleFactor; sub.alignmentMode = .center
+            sub.frame = CGRect(x: 6, y: 22, width: bw - 12, height: 18); sub.truncationMode = .end
+            box.addSublayer(label); box.addSublayer(sub)
+            card.addSublayer(box)
+            row.append((box, label, sub))
+        }
+        buttons.append(row)
+        let hint = CATextLayer(); hint.contentsScale = screen.backingScaleFactor; hint.alignmentMode = .center
+        hint.frame = CGRect(x: pad, y: hintY, width: inner, height: 18)
+        hint.string = NSAttributedString(string: "←  →  choose   ·   return  takes it   ·   esc  Nope   ·   left alone, the highlighted answer is taken in \(Int(timeout.rounded()))s",
+                                         attributes: [.font: hFont, .foregroundColor: NSColor(white: 1, alpha: 0.5)])
+        card.addSublayer(hint)
+        // The time left, as a line along the card's bottom edge that runs out.
+        let clip = CALayer(); clip.frame = card.bounds; clip.cornerRadius = 34; clip.cornerCurve = .continuous; clip.masksToBounds = true
+        let bar = CALayer(); bar.anchorPoint = CGPoint(x: 0, y: 0)
+        bar.frame = CGRect(x: 0, y: 0, width: cw, height: 6); bar.backgroundColor = quickOrange.cgColor
+        let run = CABasicAnimation(keyPath: "bounds.size.width")
+        run.fromValue = cw; run.toValue = 0; run.duration = timeout; run.isRemovedOnCompletion = false; run.fillMode = .forwards
+        bar.add(run, forKey: "run")
+        clip.addSublayer(bar); card.addSublayer(clip)
+        w.contentView = v
+        w.orderFrontRegardless()
+        windows.append(w); cards.append(card)
+        card.add(spring("transform.scale", from: 0.9, to: 1, damping: 18), forKey: "in")
+        card.add(spring("opacity", from: 0, to: 1, damping: 30), forKey: "fade")
+        dim.add(spring("opacity", from: 0, to: 1, damping: 30), forKey: "fade")
+    }
+    paint(pop: false)
+
+    let t0 = CACurrentMediaTime()
+    var timer: DispatchWorkItem?
+    func finish(_ how: String) {
+        guard questionOpen else { return }
+        questionOpen = false; questionKey = nil; timer?.cancel()
+        if how == "escape" { choice = 0 }
+        // The answer goes out at once: the caller is not kept waiting for the card to leave.
+        print(json(["answer": ids[choice], "how": how, "waited_ms": Int((CACurrentMediaTime() - t0) * 1000)]))
+        fflush(stdout)
+        paint(pop: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            windows.forEach { $0.orderOut(nil) }
+            done()
+        }
+    }
+    questionKey = { code in
+        switch code {
+        case 123: if choice > 0 { choice -= 1; paint(pop: true) }
+        case 124: if choice < 2 { choice += 1; paint(pop: true) }
+        case 53: finish("escape")
+        default: finish("key")
+        }
+    }
+    questionT0 = t0
+    questionOpen = true
+    let t = DispatchWorkItem { finish("timeout") }
+    timer = t
+    DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: t)
 }
 
 // MARK: - windows: raise one to the front, put everything back afterwards
@@ -1823,7 +2029,7 @@ enum Win {
 
 // MARK: - the hand: one unbroken motion, steered while it flies, feeling what it passes over
 //
-// eye_act's steps are points with a stop and a thought between each. A hand does not work like that: it flies a whole
+// Exact steps are points with a stop and a thought between each. A hand does not work like that: it flies a whole
 // stroke (a "wing"), aims at THINGS rather than coordinates, keeps its momentum from one target to the next, and
 // knows what is under it the whole way. Two threads keep that alive between commands: one integrates position and
 // velocity 120 times a second (velocity eases toward what was asked, so a change of direction is an arc, not a
@@ -2594,7 +2800,7 @@ func cmdInput() {
             if !AXIsProcessTrusted() { o["ok"] = false; o["error"] = "Accessibility permission missing for the host app"; reply(o); continue }
             if let el = AXI.hit(p) {
                 let info = AXI.inspect(el)
-                // brief (eye_act, per step): drop the attribute dump and ancestor list, keep the rest.
+                // brief (per step): drop the attribute dump and ancestor list, keep the rest.
                 o["element"] = (c["brief"] as? Bool) == true ? info.filter { $0.key != "attributes" && $0.key != "ancestors" && $0.key != "parameterized_attributes" } : info
             } else { o["element"] = NSNull() }
             o["cg_window"] = topWindow(at: p) ?? NSNull()
