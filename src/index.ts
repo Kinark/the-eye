@@ -11,7 +11,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { analyze, compare, formatAnalysis, loadRun, timeline, type Options } from "./analyze.ts";
+import { analyze, compare, formatAnalysis, loadRun, timeline, type Options, type Row } from "./analyze.ts";
 import { explain } from "./explain.ts";
 import { formatSeen, notice, type Seen } from "./notice.ts";
 import { ROOT_HINT, endUnder, startUnder, stopUnder, type Under } from "./under.ts";
@@ -103,6 +103,8 @@ type Capture = {
   trace?: Trace; profileNote?: string; stopping?: boolean;
   /** `eye-capture watch --exact` on the recorded app, writing events.jsonl beside the frames. */
   events?: ChildProcess;
+  /** `eye-capture fingers`: the user's own trackpad touches, on fingers.jsonl beside the frames. */
+  fingers?: ChildProcess;
   /** Signposts and vitals of the recorded app, plus dtrace + powermetrics when sudo needs no password (under.ts). */
   under?: Under | null;
 };
@@ -168,6 +170,117 @@ function startCapture(p: {
  * An observer only listens: unlike `ax` (which asks the app what is under the pointer ten times a second) it puts
  * a question to the app only when something changed.
  */
+function startFingers(c: Capture, seconds: number) {
+  try {
+    c.fingers = spawn(BIN, ["fingers", "--out", join(c.dir, "fingers.jsonl"), "--seconds", String(Math.ceil(seconds))], { stdio: "ignore" });
+    c.fingers.on("error", () => {});
+  } catch { /* the recording goes on without it */ }
+}
+type Touch = { t0: number; ms: number; path: number; pts: [number, number, number][]; x: number; y: number; flung: boolean };
+/** The touches in a fingers.jsonl: each from fingers down to fingers up, as [seconds, x, y] from where it began. */
+function loadTouches(file: string): Touch[] {
+  const out: Touch[] = [];
+  let cur: Touch | null = null, first = 0;
+  let lines: string[] = [];
+  try { lines = readFileSync(file, "utf8").split("\n"); } catch { return out; }
+  for (const l of lines) {
+    let e: any; try { e = JSON.parse(l); } catch { continue }
+    first ||= e.t;
+    if (e.ph === 1) cur = { t0: e.t - first, ms: 0, path: 0, pts: [[0, 0, 0]], x: e.x, y: e.y, flung: false };
+    else if (cur && e.ph === 2) {
+      const [, x, y] = cur.pts[cur.pts.length - 1];
+      cur.pts.push([e.t - first - cur.t0, x + e.dx, y + e.dy]); cur.path += Math.hypot(e.dx, e.dy);
+    } else if (cur && (e.ph === 4 || e.ph === 8)) { cur.ms = (e.t - first - cur.t0) * 1000; if (cur.pts.length > 2) out.push(cur); cur = null; }
+    else if (!cur && e.mo === 1 && out.length) out[out.length - 1].flung = true;
+  }
+  return out;
+}
+/**
+ * A touch in numbers, the same for a person's and for the hand's, so the two can be held side by side.
+ * pts = [seconds, x, y] on the trackpad, y down. Speeds, turns and pauses are read off where the fingers were every
+ * 50ms, not off the raw events (7ms apart, and none at all while the fingers rest).
+ */
+function touchLine(pts: number[][]): string {
+  if (pts.length < 3) return "too short to say";
+  const t0 = pts[0][0], dur = pts[pts.length - 1][0] - t0;
+  let path = 0;
+  for (let i = 1; i < pts.length; i++) path += Math.hypot(pts[i][1] - pts[i - 1][1], pts[i][2] - pts[i - 1][2]);
+  const xs = pts.map((p) => p[1]), ys = pts.map((p) => p[2]);
+  const W = 0.05, at: number[][] = [];
+  for (let k = 0, i = 0; k * W <= dur + 1e-9; k++) {
+    const t = t0 + k * W;
+    while (i < pts.length - 2 && pts[i + 1][0] <= t) i++;
+    const a = pts[i], b = pts[i + 1] ?? a, u = b[0] > a[0] ? Math.min(1, Math.max(0, (t - a[0]) / (b[0] - a[0]))) : 0;
+    at.push([a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u]);
+  }
+  const sp: number[] = [];
+  let turns = 0, pa: number | null = null, still = 0, pause = 0, run = 0;
+  for (let k = 1; k < at.length; k++) {
+    const dx = at[k][0] - at[k - 1][0], dy = at[k][1] - at[k - 1][1], d = Math.hypot(dx, dy);
+    sp.push(d / W);
+    if (d / W < 25) { still++; run++; pause = Math.max(pause, run); } else run = 0;
+    if (d >= 3) {
+      const a = Math.atan2(dy, dx);
+      if (pa !== null && Math.abs(Math.atan2(Math.sin(a - pa), Math.cos(a - pa))) > Math.PI / 2) turns++;
+      pa = a;
+    }
+  }
+  const sorted = [...sp].sort((a, b) => a - b), q = (p: number) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.round(p * (sorted.length - 1)))] : 0);
+  return `${dur.toFixed(2)}s · ${path.toFixed(0)}pt of travel inside ${(Math.max(...xs) - Math.min(...xs)).toFixed(0)}×${(Math.max(...ys) - Math.min(...ys)).toFixed(0)}pt · speed median ${q(0.5).toFixed(0)}, p90 ${q(0.9).toFixed(0)}pt/s · turned back ${turns}× · still ${((100 * still) / Math.max(1, sp.length)).toFixed(0)}% of it (longest pause ${(pause * W).toFixed(2)}s)`;
+}
+/** The newest run in which a person's two-finger touches were recorded. */
+/** The newest run in which a PERSON touched the trackpad (a session the hand drove is not one), for at least `minMs`. */
+function lastTouched(minMs = 0): string | null {
+  try {
+    const hit = readdirSync(RUNS).filter((x) => existsSync(join(RUNS, x, "fingers.jsonl")) && !existsSync(join(RUNS, x, "hand.jsonl"))).sort().reverse()
+      .find((x) => loadTouches(join(RUNS, x, "fingers.jsonl")).some((t) => t.ms >= minMs));
+    return hit ? join(RUNS, hit) : null;
+  } catch { return null; }
+}
+function touchesText(dir: string): string[] {
+  const ts = loadTouches(join(dir, "fingers.jsonl"));
+  if (!ts.length) return [];
+  const L = [`YOUR FINGERS (two-finger touches on the trackpad while this was watched): ${ts.length}`];
+  ts.forEach((t, i) => L.push(`  touch ${i + 1}: at ${t.t0.toFixed(2)}s at (${t.x.toFixed(0)},${t.y.toFixed(0)}) · ${touchLine(t.pts)}${t.flung ? " · left with a flick" : ""}`));
+  L.push(`  play one back as it was made: wing 'fingers like:"${dir}" <n>' (or like:"last"; without n, the longest)`);
+  return L;
+}
+/** The touches the hand made in a session (hand.jsonl: [recording seconds, x, y, touch]), and a person's beside them. */
+function handTouchesText(dir: string): string[] {
+  const by = new Map<number, number[][]>();
+  try {
+    for (const l of readFileSync(join(dir, "hand.jsonl"), "utf8").split("\n")) {
+      let e: any; try { e = JSON.parse(l); } catch { continue; }
+      if (!Array.isArray(e) || e.length < 4) continue;
+      if (!by.has(e[3])) by.set(e[3], []);
+      by.get(e[3])!.push([e[0], e[1], e[2]]);
+    }
+  } catch { return []; }
+  const ts = [...by.values()].filter((p) => p.length > 2);
+  if (!ts.length) return [];
+  const L = [`THE HAND'S TOUCHES (two fingers it put on the trackpad, each from landing to lifting): ${ts.length}`];
+  ts.forEach((p, i) => L.push(`  touch ${i + 1}: at ${p[0][0].toFixed(2)}s · ${touchLine(p)}`));
+  const ref = lastTouched(1500);
+  if (ref) {
+    const theirs = loadTouches(join(ref, "fingers.jsonl")).sort((a, b) => b.ms - a.ms).slice(0, 2);
+    L.push(`  a person's, for scale (the longest in ${basename(ref)}):`, ...theirs.map((t) => `    ${touchLine(t.pts)}`));
+  }
+  return L;
+}
+/** `fingers like:"…"` → the recorded touch as a trace the hand plays. A string = why not. */
+function touchFor(like: string, n?: number): { trace: number[][]; what: string } | string {
+  let dir = like;
+  if (like === "last") {
+    const hit = lastTouched();
+    if (!hit) return `no recorded touch: watch the user first (eye_drive {hands:false, seconds:N}) while they move two fingers on the trackpad`;
+    dir = hit;
+  }
+  const ts = loadTouches(dir.endsWith(".jsonl") ? dir : join(dir, "fingers.jsonl"));
+  if (!ts.length) return `no two-finger touch was recorded in ${dir}`;
+  const t = n !== undefined ? ts[n - 1] : [...ts].sort((a, b) => b.ms - a.ms)[0];
+  if (!t) return `${dir} holds ${ts.length} touch${ts.length === 1 ? "" : "es"}; there is no touch ${n}`;
+  return { trace: t.pts, what: `${(t.ms / 1000).toFixed(2)}s, ${t.path.toFixed(0)}pt` };
+}
 function startEvents(c: Capture, pid: number, seconds: number) {
   try {
     const fd = openSync(join(c.dir, "events.jsonl"), "w");
@@ -220,7 +333,7 @@ async function endChild<T>(child: ChildProcess, done: Promise<T>, sig: NodeJS.Si
 
 async function stopCapture(c: Capture) {
   c.stopping = true;
-  c.events?.kill("SIGTERM");
+  c.events?.kill("SIGTERM"); c.fingers?.kill("SIGTERM");
   const underDone = stopUnder(c.under);
   const { out, killed } = await endChild(c.child, c.done, "SIGTERM", 6000);
   await underDone;
@@ -264,9 +377,20 @@ function startLock(seconds: number, allow: "synthetic" | "tagged", style: LockSt
   locks.set(id, l);
   // Killed before it could restore the pointer↔cursor link (SIGKILL, crash): restore it from outside.
   child.on("exit", (_code, sig) => { if (sig === "SIGKILL" || sig === "SIGSEGV" || sig === "SIGABRT") spawn(BIN, ["release-cursor"], { stdio: "ignore" }); });
+  // Esc ×6: the user wants their machine back NOW. The hand stops at once (it may be playing by itself between calls),
+  // and the session that held this lock ends.
+  child.stdout!.on("data", (x) => { if (/"ended":\s*"escape"/.test(String(x))) tookBack(l); });
   l.done.then((r) => { finishedLocks.unshift(`${id}: ${r}`); finishedLocks.length = Math.min(finishedLocks.length, 10); })
     .finally(() => locks.delete(id));
   return l;
+}
+function tookBack(l: Lock) {
+  try { actor?.child.kill("SIGUSR1"); } catch { /* no hand */ }
+  const d = drive;
+  if (!d || d.lock !== l || d.taken) return;
+  d.taken = true;
+  // No call in flight: end it here. One in flight sees `taken` when the hand answers (it answers at once) and ends it.
+  if (!d.busy) { clearTimeout(d.idle); endDrive("the user took their input back with Esc ×6").then((t) => { driveEnded = `(the previous session was ended by the user: Esc ×6)\n${t}`; }).catch(() => {}); }
 }
 /**
  * Question mode (ask.ts decides when, and what the answers mean). Over a lock this server already holds, the
@@ -625,6 +749,7 @@ function startJob(p: RecordParams): Job {
       return job.final;
     }
     if (p.events_pid && p.events !== false && !job.stopped) startEvents(c, p.events_pid, capOpts.seconds + 5);
+    if (!job.stopped) startFingers(c, capOpts.seconds + 5);
     if (p.events_pid && !job.stopped) c.under = startUnder(c.dir, p.events_pid, capOpts.seconds + 5, { root: p.root !== false, helper: BIN });
     if (retried.length) job.startNote = (`capture retried ${retried.length}× (ScreenCaptureKit refused to start: ${retried[0]})`);
     const treeMode = p.tree ?? (ax ? "basic" : "none");
@@ -710,6 +835,9 @@ USE IT BY DEFAULT: this is how you test a macOS app's UI (SwiftUI or AppKit) you
 
 FIVE TOOLS
 - eye_drive: the one that acts. A session on an app: its window recorded, the user's input held, a hand on the mouse, a probe inside the app when it can go in. Open it with app, move with a wing (words, one flowing motion, things by name) or steps (exact coordinates, timings, gestures, Force Touch, waits), end:true for the report. hands:false only watches (the user or your script drives).
+- Two ways to scroll in a wing, and they point opposite ways. "scroll down 300" names where the PAGE goes (further down a list); it lands, travels exactly that far and lifts. "fingers …" names where two FINGERS go on the trackpad, and they stay down: the thing under them follows like a drag (a notch pulled open, a scrubber, anything that rubber-bands or wobbles). Fingers move in TWO dimensions, so do not drive them along one axis unless the thing under them only has one: "fingers 30,18 -22,30 -35,-8 12,-34" is one curved stroke through those offsets, "fingers orbit 28 2" stirs two circles, "fingers wander 30 2000" roams for two seconds differently every time, "fingers down 120 flick" leaves at speed and coasts, "lift" lets go. Fingers left down at the end of a wing stay down while you read the reply (coast_ms, default 1.5s; raise it to think longer), so you can answer what you saw with the next stroke without the app seeing a lift.
+- To PLAY with something that follows the fingers, do not compose it stroke by stroke: put the pointer on it and say fingers play (gentle, lively or wild; a size in points; a way to begin: up, down, left, right), then rest for as long as you want to watch, e.g. wing:'756,14 rest 600 fingers play rest 12000'. The hand sees the screen twenty times a second and plays in phrases the way a person does. The reply lists what they did (pull, further, wave, shake, slide, far, flick then THROWN, LIFT, POP), where the screen gave most, and a film strip with the trackpad drawn beside each frame: look at it, then steer: a stroke you write sends them that way and they play on from there, fingers play wild 90 changes how, fingers calm stops the play with the fingers still down, lift ends the touch. They go on while you think (hold_ms, kept for the session). Esc pressed six times by the user stops the hand as well as the lock.
+- To learn how the user moves, watch them: eye_drive {app, hands:false, seconds:20} while they play. The report ends with YOUR FINGERS (each two-finger touch they made: duration, travel, speed, turns), and "fingers like:\"last\" 3" in a later wing plays touch 3 back exactly as they made it.
 - eye_snapshot: one still image. {rect} of the screen as it is; {app} brings a covered or minimized window forward for a fraction of a second, takes the image and the element tree, and puts everything back.
 - eye_inspect: what UI is here: an app's element tree with frames, or everything about the element at a point. No recording, no lock.
 - eye_report: re-read a finished run: summary, timeline, explain (worst frames joined with pointer, step and main thread), hover, compare (A/B), probe.
@@ -1020,7 +1148,7 @@ async function actSteps(p: any, target: { pid: number; name: string } | null, fr
     const tag = `#${i} ${s.op}${s.note ? ` (${s.note})` : ""}`;
     const wall0 = wallNow();
     const stoppedBefore = stopped;
-    let pressNote = "";
+    let pressNote = "", ownedScroll = false;
     try {
       // The eye first: a step is only sent while the recording is really seeing. A dead stream goes on reading
       // "still", so the steps after it would all look fine and none of them would have been watched.
@@ -1035,6 +1163,13 @@ async function actSteps(p: any, target: { pid: number; name: string } | null, fr
       if (dark) {
         if (heldButton) { await actorSend({ op: "up", button: heldButton }); heldButton = null; wentDark = " The button it was holding was released."; }
         stopped = `${tag}: NOT SENT — the eye went blind: ${dark}. Steps #${i}…#${p.steps.length - 1} were not run (${p.steps.length - i} of ${p.steps.length}); the lines above are what was really seen.${wentDark} End the session, open it again and carry on from here.`;
+        break;
+      }
+      // Esc ×6: the user has their machine back. The helper refuses too (and lets go of what it held); this is the
+      // same check for the steps that send nothing, so a long wait does not run on.
+      if (drive?.taken) {
+        if (heldButton) { await actorSend({ op: "up", button: heldButton }); heldButton = null; }
+        stopped = `${tag}: NOT SENT — the user took their input back (Esc ×6). Steps #${i}…#${p.steps.length - 1} were not run (${p.steps.length - i} of ${p.steps.length})`;
         break;
       }
       if (s.guard && !evalExpr(s.guard, scope(readNow(), ptr, hover))) { stopped = `${tag}: guard failed: ${s.guard}`; break; }
@@ -1055,9 +1190,15 @@ async function actSteps(p: any, target: { pid: number; name: string } | null, fr
           const live = readNow(), a = live?.anchored_screen;
           const inA = a && ptr.x > a.x0 + 10 && ptr.x < a.x1 - 10 && ptr.y < (a.y0 ?? 0) + a.h - 5;
           const inZone = (p.scroll_zones ?? []).some((z: Rect) => ptr.x >= z.x && ptr.x <= z.x + z.w && ptr.y >= z.y && ptr.y <= z.y + z.h);
-          if (!inA && !inZone) { stopped = `${tag}: REFUSED scroll at ${ptr.x.toFixed(0)},${ptr.y.toFixed(0)} — not inside the open area or a scroll_zone`; break; }
+          // Outside both: a session on an app may still scroll where that app owns the window or the element under
+          // the pointer (its closed notch pill, its ordinary window); the actor checks that right before posting.
+          if (!inA && !inZone) {
+            if (!target) { stopped = `${tag}: REFUSED scroll at ${ptr.x.toFixed(0)},${ptr.y.toFixed(0)} — not inside the open area or a scroll_zone, and this session has no app to check the place against`; break; }
+            ownedScroll = true;
+          }
         }
         const { guard, force, note, expr, timeout_ms, on, ...cmd } = s as any;
+        if (ownedScroll) { cmd.require_pid = target!.pid; ownedScroll = false; }
         // Aim at a probe layer: its centre, read from the live probe data right now.
         let aimed: number[] | null = null;
         if (on !== undefined) {
@@ -1144,7 +1285,9 @@ type Drive = {
   job: Job; target?: { pid: number; name: string }; window?: string;
   /** false = the session only watches: the user, or the caller's own driver, moves things. No hand, no idle end. */
   hands: boolean;
-  lock?: Lock; raised?: any; idle?: NodeJS.Timeout; idleS: number; calls: number; evAt: number; what: string;
+  /** scroll_zones, kept from the call that gave them to the end of the session. */
+  zones?: Rect[];
+  lock?: Lock; raised?: any; idle?: NodeJS.Timeout; idleS: number; holdMs?: number; taken?: boolean; busy?: boolean; calls: number; evAt: number; what: string;
   /** The probe recording started inside the app when the session opened. */
   probe?: string;
   /** A session opened on a rect: the room the hand may move in, global points (else the window, read afresh each call). */
@@ -1153,6 +1296,10 @@ type Drive = {
   frames: boolean;
   /** `seconds` / `command`: the opening call waits for the recording to end and returns its report. */
   block: boolean;
+  /** The hand's two-finger touches so far: [recording seconds, x, y, touch number], on the trackpad from where each landed, y down. */
+  hand: number[][];
+  /** The recording's clock at the last reply that left fingers down (else 0): what they kept doing since then is shown with the next one. */
+  seenTo: number;
 };
 let drive: Drive | null = null;
 /** How a session that ended by itself (nobody steering) went: handed over with the next eye_drive call. */
@@ -1204,6 +1351,131 @@ async function defectFrames(csv: string, s: Seen): Promise<any[]> {
   }
   return out;
 }
+/** What the hand's fingers drew since its last reply: kept for the film strip, and in hand.jsonl for the session's report. */
+function keepTouch(d: Drive, r: any) {
+  if (!r?.ftrace?.length) return;
+  const t0 = Number(readLive(d.job.capture)?.t0_mach ?? 0);
+  if (!t0) return;
+  // The hand reports wheel pixels; with Natural scrolling off the fingers went the other way.
+  const sg = r.natural === false ? -1 : 1, r3 = (v: number) => Math.round(v * 1000) / 1000;
+  const rows = (r.ftrace as number[][]).map(([t, x, y, n]) => [r3(t - t0), r3(x * sg), r3(y * sg), n]);
+  d.hand.push(...rows);
+  if (d.hand.length > 40_000) d.hand.splice(0, d.hand.length - 40_000);
+  try { appendFileSync(join(d.job.capture.dir, "hand.jsonl"), rows.map((x) => JSON.stringify(x)).join("\n") + "\n"); } catch { /* run dir gone */ }
+}
+/** The plots the playing fingers made since the last reply, in order, and what they noticed: where to look in the film strip. */
+function plotsText(d: Drive, r: any): string[] {
+  const P = (r?.plots ?? []) as any[];
+  if (!P.length) return [];
+  const t0 = Number(readLive(d.job.capture)?.t0_mach ?? 0);
+  const at = (x: number, y: number) => fingersAt({ fpos: [x, y], natural: r.natural });
+  const strokes = P.filter((p) => p.k !== "pop"), L: string[] = [];
+  if (strokes.length) {
+    // Strokes of one kind in a row are one run; a stillness (held, or lifted to watch) says how long it lasted.
+    const runs: { k: string; n: number; a: number; b: number; t: number; still?: number }[] = [];
+    strokes.forEach((s, i) => {
+      const u = runs[runs.length - 1];
+      if (s.dx === undefined) { runs.push({ k: s.k, n: 1, a: 0, b: 0, t: s.t - t0, still: strokes[i + 1] ? strokes[i + 1].t - s.t : undefined }); return; }
+      const len = Math.hypot(s.dx, s.dy);
+      if (u && u.k === s.k && u.still === undefined) { u.n++; u.b = len; } else runs.push({ k: s.k, n: 1, a: len, b: len, t: s.t - t0 });
+    });
+    const shown = runs.slice(-12);
+    L.push(`what they did${r.playing ? ` (playing ${r.playing})` : ""}: ${strokes.filter((x) => x.dx !== undefined).length} strokes${runs.length > shown.length ? `, the last ${shown.length} runs` : ""} — `
+      + shown.map((u) => u.k === "lift" ? `${u.t.toFixed(1)}s LIFT` : u.k === "fling" ? `${u.t.toFixed(1)}s THROWN` : u.a === 0 ? `${u.t.toFixed(1)}s ${u.k === "watch" ? "up, watching" : "STILL"}${u.still !== undefined ? ` ${u.still.toFixed(1)}s` : " (still so now)"}` : `${u.t.toFixed(1)}s ${u.k}${u.n > 1 ? ` ×${u.n}` : ""} ${u.a.toFixed(0)}${u.n > 1 && Math.abs(u.b - u.a) > 4 ? `→${u.b.toFixed(0)}` : ""}pt`).join(" · ")
+      + ` (pull = one slow stroke to see what the thing does · further = on while it grows · wave = there and back, swelling, and on while it gives more · shake = the same, large · slide = slowly across · far = further than it has been · flick then THROWN = a fast stroke let go at its fastest, so it coasts · cross = slowly back over a pop · STILL = a beat held where they are · LIFT then up, watching = let go to see what it does by itself)`);
+    const best = strokes.reduce((a, b) => (Number(b.per ?? 0) > Number(a.per ?? 0) ? b : a));
+    if (Number(best.per) > 0) L.push(`the screen gave most around ${(best.t - t0).toFixed(1)}s, with the fingers ${at(best.x, best.y)} where they landed`);
+  }
+  for (const p of P.filter((x) => x.k === "pop")) L.push(`POP at ${(p.t - t0).toFixed(2)}s: the screen jumped (${Number(p.w).toFixed(0)}×${Number(p.h).toFixed(0)}pt moved at once) and the fingers had done nothing new; they were ${at(p.x, p.y)} where they landed${r.playing ? ", and went slowly back over that place" : ""}`);
+  return L;
+}
+/** The fingers' samples of the touch that was down at `t` (recording seconds); [] when none was. */
+function touchAt(d: Drive, t: number): number[][] {
+  let n = -1, seen = -Infinity;
+  for (const s of d.hand) { if (s[0] > t + 0.03) break; n = s[3]; seen = s[0]; }
+  return n < 0 || t - seen > 0.3 ? [] : d.hand.filter((s) => s[3] === n);
+}
+/**
+ * A film strip: the frames the recording kept between two moments, side by side, and in the corner of each the
+ * trackpad as it was then (the whole touch grey, its last 0.2s yellow, the fingers red, where they landed cyan).
+ * One picture says what the thing under the fingers did while they moved, without waiting for anything to stop.
+ */
+async function filmStrip(d: Drive, from: number, mid: number, to: number): Promise<{ image: any; n: number; before: number; t0: number; t1: number; crop: string } | null> {
+  const cap = d.job.capture, dir = join(cap.dir, "keyframes");
+  let keys: { f: string; t: number }[];
+  // Not the newest 50ms: that frame may still be on its way to disk.
+  try { keys = readdirSync(dir).filter((f) => f.endsWith(".png")).map((f) => ({ f, t: Number(f.replace(/^frame_|ms\.png$/g, "")) / 1000 })).filter((k) => k.t >= from - 0.02 && k.t <= to - 0.05).sort((a, b) => a.t - b.t); } catch { return null; }
+  if (!keys.length) return null;
+  // Evenly through each part, its last frame always among them: at most a row (3) from before this call, while the
+  // fingers kept going and nobody steered, and three rows (9) from the call itself.
+  const take = (ks: typeof keys, max: number) => { const n = Math.min(max, ks.length); return [...new Set(Array.from({ length: n }, (_, i) => ks[n === 1 ? ks.length - 1 : Math.round((i * (ks.length - 1)) / (n - 1))]))]; };
+  const earlier = take(keys.filter((x) => x.t < mid - 0.02), 3);
+  const pick = [...earlier, ...take(keys.filter((x) => x.t >= mid - 0.02), 9)];
+  const cols = Math.min(3, pick.length), rowsN = Math.ceil(pick.length / cols), G = 3;
+  // Every frame cut to the part of the region where something moved in this time (with a margin, and never smaller
+  // than 200×120pt): the thing fills the tile however large the window around it is.
+  const R = d.job.rect;
+  let c = { x: 0, y: 0, w: R.w, h: R.h }, crop = "";
+  try {
+    const mv = loadRun(cap.csv).rows.filter((r) => r.t >= from && r.t <= to && r.mx1 > r.mx0 && r.my1 > r.my0);
+    if (mv.length) {
+      const x0 = Math.min(...mv.map((r) => r.mx0)), x1 = Math.max(...mv.map((r) => r.mx1)), y0 = Math.min(...mv.map((r) => r.my0)), y1 = Math.max(...mv.map((r) => r.my1));
+      const w = Math.min(R.w, Math.max(200, x1 - x0 + 32)), h = Math.min(R.h, Math.max(120, y1 - y0 + 32));
+      c = { x: Math.max(0, Math.min(R.w - w, (x0 + x1) / 2 - w / 2)), y: Math.max(0, Math.min(R.h - h, (y0 + y1) / 2 - h / 2)), w, h };
+      if (c.w < R.w - 1 || c.h < R.h - 1) crop = `x ${(R.x + c.x).toFixed(0)}…${(R.x + c.x + c.w).toFixed(0)}, y ${(R.y + c.y).toFixed(0)}…${(R.y + c.y + c.h).toFixed(0)}`;
+    }
+  } catch { /* the whole region */ }
+  // Each frame with the trackpad beside it, not over it: nothing of the picture is hidden.
+  const IB = 86, k = Math.min(432 / c.w, 300 / c.h), TW = Math.round(c.w * k), TH = Math.round(c.h * k);
+  const CW = TW + 2 + IB, CH = Math.max(TH, IB), items: any[] = [];
+  pick.forEach((key, i) => {
+    const x = (i % cols) * (CW + G), y = Math.floor(i / cols) * (CH + G);
+    items.push({ png: join(dir, key.f), srcf: [c.x / R.w, c.y / R.h, c.w / R.w, c.h / R.h], dst: [x, y, TW, TH] }, { text: `${key.t.toFixed(2)}s`, at: [x + 4, y + 3], size: 12, ...(i < earlier.length ? { color: [185, 185, 185] } : {}) });
+    const pts = touchAt(d, key.t);
+    if (!pts.length) return;
+    const bx = x + TW + 2, by = y;
+    const xs = pts.map((p) => p[1]).concat(0), ys = pts.map((p) => p[2]).concat(0);
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+    const sc = (IB - 12) / Math.max(60, Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+    const at = (p: number[]) => [Math.round((bx + IB / 2 + (p[1] - cx) * sc) * 10) / 10, Math.round((by + IB / 2 + (p[2] - cy) * sc) * 10) / 10];
+    const every = Math.max(1, Math.ceil(pts.length / 400));
+    const upTo = pts.filter((p) => p[0] <= key.t + 0.01), nowAt = upTo[upTo.length - 1] ?? pts[0];
+    const tail = upTo.filter((p) => p[0] >= key.t - 0.2);
+    items.push({ rect: [bx, by, IB, IB], fill: [0, 0, 0], stroke: [90, 90, 90] },
+      { line: pts.filter((_, j) => j % every === 0).map(at), width: 1, color: [150, 150, 150] },
+      ...(tail.length > 1 ? [{ line: tail.map(at), width: 3, color: [255, 225, 40] }] : []),
+      { dot: at([0, 0, 0]), r: 4, color: [60, 220, 255] }, { dot: at([0, 0, 0]), r: 2.2, color: [0, 0, 0] },
+      { dot: at(nowAt), r: 3.5, color: [255, 60, 60] });
+  });
+  const stamp = Date.now(), spec = join(cap.dir, `strip_${stamp}.json`), outFile = join(cap.dir, `strip_${stamp}.jpg`);
+  try {
+    writeFileSync(spec, JSON.stringify({ out: outFile, w: cols * CW + (cols - 1) * G, h: rowsN * CH + (rowsN - 1) * G, bg: [18, 18, 18], items }));
+    const r = await run(BIN, ["draw", "--spec", spec], 6000);
+    rmSync(spec, { force: true });
+    if (r.code !== 0 || !existsSync(outFile)) return null;
+    return { image: { type: "image", data: readFileSync(outFile).toString("base64"), mimeType: "image/jpeg" }, n: pick.length, before: earlier.length, t0: pick[0].t, t1: pick[pick.length - 1].t, crop };
+  } catch { return null; }
+}
+/**
+ * How far the thing went between two moments of the recording, with the time of each extreme so it can be found in
+ * the film strip: what hangs from the top edge when the recording measures that, else the box of what moved.
+ */
+function reachLine(j: Job, from: number, to: number): string {
+  try {
+    const rs = loadRun(j.capture.csv).rows.filter((r) => r.t >= from && r.t <= to && r.s === "c");
+    const secs = (to - from).toFixed(1), at = (r: Row) => `${r.t.toFixed(2)}s`;
+    const most = (v: Row[], f: (r: Row) => number) => v.reduce((m, r) => (f(r) > f(m) ? r : m));
+    const an = rs.filter((r) => r.ah > 0), mv = rs.filter((r) => r.mx1 > r.mx0 && r.my1 > r.my0);
+    if (an.length) {
+      const z = an[an.length - 1], tall = most(an, (r) => r.ah), wide = most(an, (r) => r.aw), small = most(an, (r) => -r.ah);
+      return `what hangs from the top edge is ${z.aw.toFixed(0)}×${z.ah.toFixed(0)}pt now; in these ${secs}s: tallest ${tall.ah.toFixed(0)}pt (${at(tall)}), shortest ${small.ah.toFixed(0)}pt (${at(small)}), widest ${wide.aw.toFixed(0)}pt (${at(wide)})`;
+    }
+    if (!mv.length) return `nothing on screen moved in these ${secs}s`;
+    const z = mv[mv.length - 1], big = most(mv, (r) => (r.mx1 - r.mx0) * (r.my1 - r.my0));
+    const low = most(mv, (r) => r.my1), left = most(mv, (r) => -r.mx0), right = most(mv, (r) => r.mx1);
+    return `what moved on screen in these ${secs}s: ${(big.mx1 - big.mx0).toFixed(0)}×${(big.my1 - big.my0).toFixed(0)}pt at its largest (${at(big)}), down to y=${(low.my1 + j.rect.y).toFixed(0)} (${at(low)}), left to x=${(left.mx0 + j.rect.x).toFixed(0)} (${at(left)}), right to x=${(right.mx1 + j.rect.x).toFixed(0)} (${at(right)}); ${(z.mx1 - z.mx0).toFixed(0)}×${(z.my1 - z.my0).toFixed(0)}pt in the last frame that moved`;
+  } catch { return ""; }
+}
 async function dropProbe(id?: string) {
   if (id) await stopProbes(runDir, id).catch(() => {});
 }
@@ -1245,6 +1517,7 @@ async function endDrive(why: string, quitToo = false): Promise<string> {
   // under the lock (200ms of stillness, 1.5s at most), the eye closes, the window goes back, the user gets their input.
   if (d.hands && d.target) {
     r = await actorSend({ op: "wing", moves: [], end: true, pid: d.target.pid });
+    keepTouch(d, r);
     if (d.job.state === "running") for (let still = 0, end = Date.now() + 1500; still < 4 && Date.now() < end; await sleep(50)) still = readLive(cap)?.moving ? 0 : still + 1;
   }
   if (d.frames && d.job.state === "running" && !blind(readLive(cap))) {
@@ -1281,6 +1554,8 @@ async function endDrive(why: string, quitToo = false): Promise<string> {
       : `SESSION ENDED (${why}), ${secs}s watched${back ? ` · ${back}` : ""}.`,
     d.hands ? `WHAT IT LOOKED LIKE — ${d.what}, the whole session (times on the recording's clock):\n${looked}` : `WHAT IT LOOKED LIKE — ${d.what}:\n${final}`,
     ...probe.map((x) => `FROM INSIDE THE APP (the probe; eye_report {view:"probe", file} for every layer):\n${x}`),
+    ...touchesText(cap.dir),
+    ...handTouchesText(cap.dir),
     d.hands ? `run: ${cap.dir} · eye_report {view:"explain"} joins the worst frames with pointer, step and main thread` : "",
     quitLine,
   ].filter(Boolean).join("\n");
@@ -1290,36 +1565,49 @@ const pt = (x: number, y: number) => `(${x.toFixed(0)},${y.toFixed(0)})`;
 function compassOf(vx: number, vy: number) {
   return ["E", "SE", "S", "SW", "W", "NW", "N", "NE"][((Math.round(Math.atan2(vy, vx) / (Math.PI / 4)) % 8) + 8) % 8];
 }
+/** Where the fingers are from where they landed, in words (the hand reports wheel pixels: the other way round without Natural scrolling). */
+function fingersAt(r: any): string {
+  const sg = r.natural === false ? -1 : 1, x = Number(r.fpos?.[0] ?? 0) * sg, y = Number(r.fpos?.[1] ?? 0) * sg;
+  const w = [Math.abs(y) >= 2 ? `${Math.abs(y).toFixed(0)}pt ${y > 0 ? "below" : "above"}` : "", Math.abs(x) >= 2 ? `${Math.abs(x).toFixed(0)}pt ${x > 0 ? "right of" : "left of"}` : ""].filter(Boolean);
+  return w.length === 2 ? `${w[0]} and ${w[1]}` : w[0] ?? "back";
+}
 /** What one wing did, as the hand lived it: every element it passed over, each press where it happened, where it is now. */
-function wingText(words: string[], r: any): string[] {
+function wingText(words: string[], r: any, brief = false): string[] {
   const L: string[] = [];
   const secs = (Number(r.ms) / 1000).toFixed(2);
   L.push(r.stopped
     ? `WING STOPPED at move ${r.done + 1} of ${r.of}${words[r.done] ? ` (${words[r.done]})` : ""}: ${r.stopped}. ${r.done ? `The ${r.done} before it ${r.done === 1 ? "was" : "were"} flown` : "Nothing was flown"}${r.of - r.done - 1 > 0 ? `; the ${r.of - r.done - 1} after it ${r.of - r.done - 1 === 1 ? "was" : "were"} not` : ""}.`
     : `wing flown whole: ${r.of} move${r.of === 1 ? "" : "s"} in ${secs}s, one motion`);
   const rows: { t: number; s: string }[] = [];
-  for (const s of r.trail ?? []) {
+  for (const s of brief || r.path_pt < 1 ? [] : r.trail ?? []) {
     const still = Math.hypot(s.x1 - s.x0, s.y1 - s.y0) < 1;
     rows.push({ t: s.t, s: `${still ? `at ${pt(s.x0, s.y0)}` : `${pt(s.x0, s.y0)}→${pt(s.x1, s.y1)}`}  ${s.label}${fr(s.frame ?? undefined)}${s.ms >= 1 ? `  ${Number(s.ms).toFixed(0)}ms` : ""}` });
   }
   const shownRows = rows.length > 44 ? [...rows.slice(0, 22), { t: rows[22].t, s: `… ${rows.length - 44} more elements crossed …` }, ...rows.slice(-22)] : rows;
   for (const m of r.marks ?? []) {
+    if (brief && m.k === "scroll") continue;
     shownRows.push({ t: m.t, s: m.k === "note" ? `· ${m.what}` : `● ${m.k === "scroll" ? words[m.i] ?? "scroll" : m.k} at ${pt(m.x, m.y)} on ${m.what}` });
   }
   shownRows.sort((a, b) => a.t - b.t);
-  if (shownRows.length) {
-    L.push(`what the hand passed over (${r.path_pt < 1 ? "it did not move" : `${Number(r.path_pt).toFixed(0)}pt travelled, felt every ${(Number(r.path_pt) / Math.max(1, r.samples)).toFixed(1)}pt`}${r.trail_dropped ? `, ${r.trail_dropped} oldest stretches dropped` : ""}):`);
+  if (brief) for (const x of shownRows) L.push(`  ${x.s}`);
+  else if (shownRows.length) {
+    L.push(`${r.path_pt < 1 ? "the pointer stayed where it was" : "what the hand passed over"} (${r.path_pt < 1 ? "what was done there" : `${Number(r.path_pt).toFixed(0)}pt travelled, felt every ${(Number(r.path_pt) / Math.max(1, r.samples)).toFixed(1)}pt`}${r.trail_dropped ? `, ${r.trail_dropped} oldest stretches dropped` : ""}):`);
     for (const x of shownRows) L.push(`  ${x.t >= r.t0 ? "+" : "−"}${Math.abs(x.t - r.t0).toFixed(2)}s  ${x.s}`);
   }
-  const held = r.held?.length ? `, HOLDING the ${r.held.join(" and ")} button` : "";
+  const held = (r.held?.length ? `, HOLDING the ${r.held.join(" and ")} button` : "")
+    + (r.fingers && r.lifted ? `, the two fingers are OFF the trackpad for a moment, ${r.doing ?? "watching"}. They play on while you think and stop by themselves ${(Number(r.hold_ms) / 1000).toFixed(0)}s from now (hold_ms): a stroke you write lands them again and they play on from it, fingers calm or lift ends the play`
+    : r.fingers ? `, TWO FINGERS DOWN on the trackpad for ${Number(r.touch_s ?? 0).toFixed(1)}s, ${fingersAt(r)} where they landed, ${r.doing ?? "holding still"}. They go on like that while you think and lift by themselves ${(Number(r.hold_ms) / 1000).toFixed(0)}s from now (hold_ms): any fingers word carries this same touch on without a seam, lift ends it` : "");
   if (r.flying) {
     L.push(`now: still flying ${compassOf(r.course[0], r.course[1])} at ${Number(r.pace).toFixed(0)}pt/s, at ${pt(r.x, r.y)} over ${r.over}${held}. It goes on while you choose the next wing and brakes by itself after ${(Number(r.coast_ms) / 1000).toFixed(1)}s.`);
     if (r.ahead?.length) L.push(`ahead on this line: ${r.ahead.map((a: any) => `${a.label} in ${Number(a.in_pt).toFixed(0)}pt (${(Number(a.in_ms) / 1000).toFixed(2)}s)`).join(" · ")}`);
   } else L.push(`now: at rest at ${pt(r.x, r.y)} on ${r.over}${fr(r.over_frame ?? undefined)}${held}${r.edge ? " — it ran into the window's edge and stopped there" : ""}`);
+  if (r.capped) L.push(`the fingers kept going for ${Number(r.capped).toFixed(0)}pt and were stopped there (no trackpad is that long)${r.fingers ? "; they are still down" : ""}`);
   if (r.in_sight) L.push(`in sight instead: ${r.in_sight.join(" · ") || "nothing that can be pressed"}`);
   return L;
 }
 
+/** A wait written between two moves of a wing: fingers left on the trackpad must outlast it. */
+const holdFor = (step: any): number => (step?.op === "wait_until" ? (step.timeout_ms ?? 2000) + 300 : step?.op === "assert" ? 300 : 0);
 const stepsMs = (steps: any[] = []) => steps.reduce((t, s) => t + (s.ms ?? 0) + (s.timeout_ms ?? (s.op === "wait_until" ? 2000 : 0)) + (s.hold_ms ?? 0) + 400, 0);
 
 /** Open the session: the app (started if asked), the probe inside it, the recording, the lock. "" = open; else why not. */
@@ -1377,7 +1665,7 @@ async function openDrive(p: any, out: string[]): Promise<string> {
   }
   const idleS = p.idle_s ?? 30;
   const common = { rect, display, only_pid: only, events_pid: target?.pid, events: p.events, root: p.root,
-    keyframe_ms: p.keyframe_ms ?? 200, keyframe_max: 1200, fps: p.fps, profile: p.profile === true ? (target ? { process: String(target.pid) } : undefined) : p.profile || undefined,
+    keyframe_ms: p.keyframe_ms ?? (watchOnly ? 200 : 100), keyframe_max: 1200, fps: p.fps, profile: p.profile === true ? (target ? { process: String(target.pid) } : undefined) : p.profile || undefined,
     motion_threshold: p.motion_threshold, split_gap_ms: p.split_gap_ms, refresh_hz: p.refresh_hz };
   const job = watchOnly
     ? startJob({ ...common, label: p.label ?? (target ? target.name : "watch"), ax: p.ax ?? false, ax_hz: p.ax_hz, tree: p.tree ?? "none",
@@ -1399,7 +1687,7 @@ async function openDrive(p: any, out: string[]): Promise<string> {
     lock = startLock(idleS + 30, "tagged", p.lock_style ?? (short1 ? "quick" : "full"));
     if (!(await lock.ready)) { job.stopped ??= "lock refused"; job.stopNow(); await dropProbe(probeId); return await lockFailure(lock); }
   }
-  drive = { job, target, window: p.window, hands: !watchOnly, lock, idleS, calls: 0, evAt: 0, what, probe: probeId, room, frames: p.frames !== false, block };
+  drive = { job, target, window: p.window, hands: !watchOnly, lock, idleS, calls: 0, evAt: 0, what, probe: probeId, room, frames: p.frames !== false, block, hand: [], seenTo: 0 };
   // A hand needs the window in front: it presses only what is in sight. Put back when the session ends.
   if (target && (p.front ?? !watchOnly)) {
     const up = await raiseWindow(target.pid, p.window);
@@ -1440,8 +1728,9 @@ server.registerTool("eye_drive", {
     "(2) steps: exact, repeatable to the millisecond, for measuring and A/B: move {x,y,ms}, click {x?,y?,button,count}, down/up (drag = down, move, up), scroll {dy,dx,events,phased,momentum},",
     "pinch {scale,ms}, rotate {degrees,ms}, smart_zoom, swipe {direction}, press {force:[0…2 keyframes],ms} and force_click {ms} (Force Touch), wait {ms}, wait_until {expr,timeout_ms}, assert {expr}; any step may carry `guard`.",
     "Expressions see: a = top-anchored open extent {x0,x1,w,h,cx} or null, e = bbox of all change, moving, fps1, gap1 (ms), p = pointer {x,y}, h = element under the pointer (role, title, description, identifier, value, frame, …) or null, live, pr / L('label') = probe layers.",
-    "After each step: the pointer, the element under it, the visible state. Presses and gestures only land on the app; scrolls only inside the measured open area or scroll_zones (force:true skips that).",
+    "After each step: the pointer, the element under it, the visible state. Presses and gestures only land on the app; scrolls only where the app owns the window or the element under the pointer, inside the measured open area, or in scroll_zones (kept for the session once given; force:true skips the check).",
     "EVERY REPLY ends with the screen (moving / still), what a viewer noticed during this call, what the app told accessibility, and the frame it settled on.",
+    "WHILE TWO FINGERS ARE DOWN the reply is short and does not wait for the screen to stop (it will not, the fingers keep going): where they are and what they keep doing, how far the thing went, and a FILM STRIP of the frames since the last reply with the fingers' path in each. Answer what you see with the next fingers word; they stay down hold_ms (default 20s).",
     "NEVER UNSEEN: nothing is sent to a window that is minimized, hidden, on another Space or on a sleeping display, and the hand brakes where it is if the capture goes blind.",
     "ONLY WATCH (hands:false): the same session with no hand and no lock, for when the user drives, or your own script does: stays open until end:true; or `seconds` records that long and returns the report; or `command` runs your driver (env THE_EYE_LIVE, THE_EYE_RECT, THE_EYE_RUN_DIR) and returns its output and the report (lock:true holds the user's input meanwhile).",
     "Also: app_path starts the app when it is not running; quit:true quits it (with end, or alone); ask:\"…\" puts a yes/no to the person at the machine.",
@@ -1474,7 +1763,9 @@ server.registerTool("eye_drive", {
     frames: z.boolean().optional().describe("Hand frames back with the replies: the settled frame after each call and, at the end, the frame at each defect (default true)."),
     speed: z.number().min(20).max(4000).optional().describe("wing: pace in points per second from here on (default 700; or the words slow / walk / brisk / fast / <n>/s)."),
     coast_ms: z.number().min(0).max(10000).optional().describe("wing: how long a hand left flying on a heading keeps going after the reply before it brakes by itself (default 1500)."),
-    scroll_zones: z.array(rectSchema).optional().describe("steps: extra screen rects (points) where scrolling is allowed, e.g. the closed notch."),
+    hold_ms: z.number().min(0).max(60000).optional().describe("wing: how long two fingers left on the trackpad stay down, and keep doing what they were doing, after the reply before they lift by themselves (default 20000)."),
+    brief: z.boolean().optional().describe("The short reply: the wing in a line, where the fingers are and what they keep doing, how far the thing went, and the film strip; no element trail, no viewer's notes, no settled frame (those come with end:true). Default: true while two fingers are down, else false."),
+    scroll_zones: z.array(rectSchema).optional().describe("steps: extra screen rects (points) where scrolling is allowed even though the app owns nothing there. Kept for the rest of the session."),
     idle_s: z.number().min(3).max(300).optional().describe("A session with a hand ends by itself when no call comes for this long (default 30): input is never held while nobody is steering."),
     front: z.boolean().optional().describe("Bring the window to the front when the session opens (also from minimized) and put it back, with everything that was above it, when it ends. Default true with a hand, false when only watching. false = leave it where it is: a press on a part another app covers is then refused."),
     lock: z.boolean().optional().describe("Hold the user's physical input. Default true with a hand (false = they can move the pointer too, and will fight it); false when only watching (true = hold it for your own driver)."),
@@ -1483,7 +1774,7 @@ server.registerTool("eye_drive", {
     isolate: z.boolean().optional().describe("Record the app's own windows alone, over mid grey, so nothing behind a see-through window or over the app is mistaken for its motion. Default true on a window, false on a rect."),
     events: z.boolean().optional().describe("Listen to what the app tells accessibility and place it on the recording's clock (default true)."),
     root: z.boolean().optional().describe("false = no dtrace / powermetrics beside the recording (signposts and the app's own energy need no root and stay)."),
-    keyframe_ms: z.number().min(0).optional().describe("Keep a small frame every N ms while the picture changes (default 200; 0 = none). They are what the defect frames are taken from; eye_snapshot {csv, t_s} reads them."),
+    keyframe_ms: z.number().min(0).optional().describe("Keep a small frame every N ms while the picture changes (default 100 with a hand, 200 watching; 0 = none). The film strip and the defect frames are taken from them; eye_snapshot {csv, t_s} reads them."),
     fps: z.number().optional(),
     profile: z.union([z.boolean(), profileSchema]).optional().describe("true = also record Instruments (Time Profiler + Hitches) on the session's app, aligned with the frames for eye_report view:'explain'. Starting it takes a few seconds; accessibility hover is off by default while it runs. An object names another process or template."),
     ax: z.boolean().optional().describe("steps: tell the element under the pointer after each (default true). Only watching: log the element under the pointer ten times a second (default false; it costs the app frame time)."),
@@ -1528,7 +1819,9 @@ server.registerTool("eye_drive", {
   const d = drive!;
   if (p.idle_s) d.idleS = p.idle_s;
   const cap = d.job.capture;
-  const rearm = () => { if (d.hands) d.idle = setTimeout(idleOut, d.idleS * 1000); };
+  const rearm = () => { d.busy = false; if (d.hands) d.idle = setTimeout(idleOut, d.idleS * 1000); };
+  d.busy = true;
+  const fresh = d.calls === 0;
   if (d.block) {
     await d.job.finished;
     out.push(await endDrive(p.command ? "the command ended" : `${p.seconds}s recorded`, p.quit));
@@ -1553,8 +1846,16 @@ server.registerTool("eye_drive", {
     if (d.lock) extendLock(d.lock, d.idleS + 60 + Math.ceil(stepsMs(p.steps) / 1000));
     const seenFrom = readLive(cap)?.t ?? 0;
     const front: Front = { want: p.front, window: d.window, raised: d.raised };
-    const exact = (steps: any[], brief: true | "word") => actSteps({ steps, id: d.job.id, ax: p.ax ?? true, scroll_zones: p.scroll_zones, label: p.label, brief }, d.target!, front);
-    let halted = false;
+    // The hand forgets an Esc ×6 of an earlier session (a wing says so itself; steps alone would not).
+    if (fresh) await actorSend({ op: "fresh" });
+    const tookIt = async () => {
+      out.push("THE USER TOOK THEIR INPUT BACK (Esc ×6). The hand stopped where it was, lifted its fingers and let go of every button; nothing more was sent.", await endDrive("the user took their input back with Esc ×6"));
+      return done(true);
+    };
+    const exact = (steps: any[], brief: true | "word") => actSteps({ steps, id: d.job.id, ax: p.ax ?? true, scroll_zones: (d.zones = p.scroll_zones ?? d.zones), label: p.label, brief }, d.target!, front);
+    let halted = false, last: any = null;
+    const plots: any[] = [];
+    if (p.hold_ms) d.holdMs = p.hold_ms;
     if (p.wing?.trim()) {
       const w = parseWing(p.wing);
       if ("error" in w) { rearm(); out.push(w.error); return done(true); }
@@ -1569,19 +1870,31 @@ server.registerTool("eye_drive", {
         if (part.step) {
           const t = String((await exact([{ ...part.step, note: part.words[0] }], "word")).content[0].text);
           out.push(t);
+          if (d.taken) return tookIt();
           if (/^STOPPED — /m.test(t)) halted = true;
         } else {
           const room = await driveRoom(d);
+          let noTouch = "";
+          for (const m of part.moves) if (m.k === "fingers" && m.like) {
+            const t = touchFor(m.like, m.n);
+            if (typeof t === "string") { noTouch = t; break; }
+            m.trace = t.trace;
+          }
+          if (noTouch) { rearm(); out.push(`NOT FLOWN: ${noTouch}.`); return done(true); }
           if ("error" in room) { out.push(`NOT FLOWN, nothing was sent: ${room.error}.`, await endDrive("the window is not there to be seen")); return done(true); }
           const r = await actorSend({ op: "wing", moves: part.moves, pid: d.target!.pid, require_pid: d.target!.pid, bounds: room.bounds,
-            live: liveFile(cap), speed: p.speed, coast_ms: p.coast_ms, max_ms: 30_000 }, 35_000);
+            live: liveFile(cap), fresh: fresh && n === 0, speed: p.speed, coast_ms: (p.coast_ms ?? 1500) + holdFor(parts[n + 1]?.step), hold_ms: (d.holdMs ?? 20_000) + holdFor(parts[n + 1]?.step), max_ms: 30_000 }, 35_000);
           if (!r.ok) { rearm(); out.push(`the hand did not answer: ${r.error}`); return done(true); }
+          if (d.taken || r.taken) return tookIt();
           for (const m of r.marks ?? []) {
             if (m.k === "note") continue;
             const op = /^tap|right-tap/.test(m.k) ? "click" : m.k;
             try { appendFileSync(join(cap.dir, "actions.jsonl"), JSON.stringify({ wall0: m.wall0, wall1: m.wall1, op, note: /"([^"]+)"/.exec(String(m.what))?.[1] ?? String(m.what), x: m.x, y: m.y, ok: true }) + "\n"); } catch { /* run dir gone */ }
           }
-          out.push(...wingText(part.words, r));
+          last = r;
+          keepTouch(d, r);
+          plots.push(...(r.plots ?? []));
+          out.push(...wingText(part.words, r, p.brief ?? !!r.fingers));
           if (r.blind) out.push(`⚠ NOT SEEING: ${r.blind}. The hand braked where it was; what the last moves did was not watched.`);
           flying = !!r.flying;
           if (r.stopped) halted = true;
@@ -1595,16 +1908,29 @@ server.registerTool("eye_drive", {
     }
     if (p.steps?.length) {
       if (halted) out.push(`steps NOT RUN: the wing before them stopped (${p.steps.length} step${p.steps.length === 1 ? "" : "s"} not sent)`);
-      else { out.push(String((await exact(p.steps, true)).content[0].text)); flying = false; }
+      else { out.push(String((await exact(p.steps, true)).content[0].text)); flying = false; if (d.taken) return tookIt(); }
     }
     if (front.raised && !d.raised) {
       d.raised = front.raised;
       out.push(`brought ${fmtWin(front.raised)} forward (another app covered the press); it goes back where it was when the session ends`);
     }
+    // Fingers left down keep going: the screen is not waited for, and the reply is the short one unless asked otherwise.
+    const down = !!last?.fingers && !p.steps?.length, brief = p.brief ?? down;
     // Whatever this set going plays out a moment before the screen is read (a hand left flying is not waited for).
-    if (!flying) for (let still = 0, end = Date.now() + 600; still < 3 && Date.now() < end; await sleep(50)) still = readLive(cap)?.moving ? 0 : still + 1;
-    // A call that opens and ends the session gets the session's report below: saying it twice helps nobody.
-    if (!(p.end && d.calls <= 1)) {
+    if (!flying && !down) for (let still = 0, end = Date.now() + 600; still < 3 && Date.now() < end; await sleep(50)) still = readLive(cap)?.moving ? 0 : still + 1;
+    // What the fingers kept doing while nobody was steering belongs to this reply too.
+    const since = d.seenTo ? Math.min(d.seenTo, seenFrom) : seenFrom;
+    const liveNow = readLive(cap);
+    const nowT = Math.max(Number(liveNow?.t ?? seenFrom), last && liveNow?.t0_mach ? Number(last.t0) + Number(last.ms) / 1000 - Number(liveNow.t0_mach) : 0);
+    const drawn = d.hand.filter((x) => x[0] >= since - 0.02), touchNo = drawn.length ? drawn[drawn.length - 1][3] : -1;
+    const stroke = drawn.filter((x) => x[3] === touchNo);
+    if (stroke.length > 2) out.push(`the fingers ${d.seenTo ? "since the last reply" : "in this call"}: ${touchLine(stroke)}`);
+    if (last) out.push(...plotsText(d, { ...last, plots }));
+    if (brief && !(p.end && d.calls <= 1)) {
+      out.push(reachLine(d.job, since, nowT));
+      const ev = driveEvents(d);
+      if (ev) out.push(ev);
+    } else if (!(p.end && d.calls <= 1)) {
       out.push(describeLive(readLive(cap)));
       try {
         const { rows, meta } = loadRun(cap.csv);
@@ -1617,7 +1943,12 @@ server.registerTool("eye_drive", {
       const pl = d.probe ? activeProbeLive() : null;
       if (pl) out.push(describeProbeLive(pl, 4));
     }
-    if (d.frames && p.frames !== false && !flying && !p.end) {
+    if (d.frames && p.frames !== false && drawn.length) {
+      const fs = await filmStrip(d, since, seenFrom, nowT);
+      if (fs) imgs.push({ type: "text", text: `film strip, ${fs.n} frame${fs.n === 1 ? "" : "s"} from ${fs.t0.toFixed(2)}s to ${fs.t1.toFixed(2)}s on the recording's clock, left to right then down${fs.before ? ` (the first ${fs.before}, times in grey: before this call, while the fingers kept going)` : ""}${fs.crop ? `; each is cut to where something moved (${fs.crop}, screen points)` : ""}. Beside each, the trackpad as it was then: the whole touch grey, its last 0.2s yellow, the fingers red, where they landed cyan.` }, fs.image);
+    }
+    d.seenTo = down ? nowT : 0;
+    if (d.frames && p.frames !== false && !flying && !p.end && !brief) {
       const f = await settledFrame(d.job);
       if (f) imgs.push({ type: "text", text: "the frame it settled on:" }, f);
     }
@@ -1770,7 +2101,7 @@ function cleanup() {
   actor?.child.kill("SIGTERM");
   for (const j of jobs.values()) j.cmd?.kill("SIGTERM");
   for (const l of locks.values()) l.child.kill("SIGTERM");
-  for (const c of captures.values()) { c.child.kill("SIGTERM"); c.events?.kill("SIGTERM"); endUnder(c.under); }
+  for (const c of captures.values()) { c.child.kill("SIGTERM"); c.events?.kill("SIGTERM"); c.fingers?.kill("SIGTERM"); endUnder(c.under); }
 }
 startLeaseHeartbeat(() => [...jobs.values()].some(running) || locks.size > 0 || activeProbeTarget() !== null);
 process.on("exit", cleanup);

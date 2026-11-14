@@ -122,6 +122,87 @@ func cmdRaw() {
     exit(0)
 }
 
+/// `draw --spec file.json`: one picture put together from parts, top-left origin, pixels. The film strip a reply
+/// carries is made here (frames of the recording side by side, the fingers' path drawn in each), with files and
+/// CoreGraphics only: nothing that would disturb a recording in progress.
+///   {"out":"strip.png","w":1568,"h":420,"bg":[r,g,b],"items":[
+///     {"png":"frame.png","src":[x,y,w,h]? or "srcf":[fractions]?,"dst":[x,y,w,h]} · {"rect":[x,y,w,h],"fill":[r,g,b,a?]?,"stroke":[r,g,b]?}
+///     {"line":[[x,y],…],"width":1,"color":[r,g,b,a?]} · {"dot":[x,y],"r":3,"color":[r,g,b]} · {"text":"…","at":[x,y],"size":12,"color":[r,g,b]}]}
+func cmdDraw() {
+    guard let path = opt("spec"), let d = FileManager.default.contents(atPath: path),
+          let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any], let out = o["out"] as? String,
+          let W = (o["w"] as? NSNumber)?.intValue, let H = (o["h"] as? NSNumber)?.intValue, W > 0, H > 0, W <= 8000, H <= 8000 else {
+        fail("draw needs --spec file.json holding out, w, h and items")
+    }
+    guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
+          let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { fail("no canvas of \(W)×\(H)") }
+    func nums(_ v: Any?) -> [CGFloat] { (v as? [NSNumber])?.map { CGFloat($0.doubleValue) } ?? [] }
+    func color(_ v: Any?, _ def: [CGFloat]) -> CGColor {
+        let c = nums(v).isEmpty ? def : nums(v)
+        return CGColor(colorSpace: cs, components: [c[0] / 255, c.count > 1 ? c[1] / 255 : 0, c.count > 2 ? c[2] / 255 : 0, c.count > 3 ? c[3] : 1])!
+    }
+    ctx.translateBy(x: 0, y: CGFloat(H)); ctx.scaleBy(x: 1, y: -1) // y grows downwards from here on
+    ctx.setFillColor(color(o["bg"], [18, 18, 18])); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+    /// Images and text are stored bottom-up: each is drawn in a patch of the canvas turned the right way round.
+    func upright(at x: CGFloat, _ bottom: CGFloat, _ body: () -> Void) {
+        ctx.saveGState(); ctx.translateBy(x: x, y: bottom); ctx.scaleBy(x: 1, y: -1); body(); ctx.restoreGState()
+    }
+    var missing = 0
+    for it in (o["items"] as? [[String: Any]]) ?? [] {
+        if let png = it["png"] as? String {
+            let dst = nums(it["dst"])
+            guard dst.count == 4, let s = CGImageSourceCreateWithURL(URL(fileURLWithPath: png) as CFURL, nil),
+                  var img = CGImageSourceCreateImageAtIndex(s, 0, nil) else { missing += 1; continue }
+            let src = nums(it["src"])
+            if src.count == 4, let part = img.cropping(to: CGRect(x: src[0], y: src[1], width: src[2], height: src[3])) { img = part }
+            let sf = nums(it["srcf"]) // the same as fractions of the image, for a caller that does not know its size
+            if sf.count == 4, let part = img.cropping(to: CGRect(x: sf[0] * CGFloat(img.width), y: sf[1] * CGFloat(img.height),
+                                                                  width: sf[2] * CGFloat(img.width), height: sf[3] * CGFloat(img.height))) { img = part }
+            ctx.interpolationQuality = .high
+            upright(at: dst[0], dst[1] + dst[3]) { ctx.draw(img, in: CGRect(x: 0, y: 0, width: dst[2], height: dst[3])) }
+        } else if let r = it["rect"] {
+            let q = nums(r)
+            guard q.count == 4 else { continue }
+            let box = CGRect(x: q[0], y: q[1], width: q[2], height: q[3])
+            if it["fill"] != nil { ctx.setFillColor(color(it["fill"], [0, 0, 0])); ctx.fill(box) }
+            if it["stroke"] != nil { ctx.setStrokeColor(color(it["stroke"], [90, 90, 90])); ctx.setLineWidth(1); ctx.stroke(box.insetBy(dx: 0.5, dy: 0.5)) }
+        } else if let l = it["line"] as? [[NSNumber]], l.count > 1 {
+            ctx.setStrokeColor(color(it["color"], [255, 255, 255])); ctx.setLineWidth(CGFloat((it["width"] as? NSNumber)?.doubleValue ?? 1))
+            ctx.setLineJoin(.round); ctx.setLineCap(.round)
+            ctx.beginPath()
+            ctx.move(to: CGPoint(x: l[0][0].doubleValue, y: l[0][1].doubleValue))
+            for q in l.dropFirst() where q.count == 2 { ctx.addLine(to: CGPoint(x: q[0].doubleValue, y: q[1].doubleValue)) }
+            ctx.strokePath()
+        } else if let c = it["dot"] {
+            let q = nums(c), r = CGFloat((it["r"] as? NSNumber)?.doubleValue ?? 3)
+            guard q.count == 2 else { continue }
+            ctx.setFillColor(color(it["color"], [255, 60, 60])); ctx.fillEllipse(in: CGRect(x: q[0] - r, y: q[1] - r, width: 2 * r, height: 2 * r))
+        } else if let t = it["text"] as? String {
+            let at = nums(it["at"]), size = CGFloat((it["size"] as? NSNumber)?.doubleValue ?? 12)
+            guard at.count == 2 else { continue }
+            let font = CTFontCreateWithName("Menlo-Bold" as CFString, size, nil)
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: t, attributes: [
+                NSAttributedString.Key(kCTFontAttributeName as String): font,
+                NSAttributedString.Key(kCTForegroundColorAttributeName as String): color(it["color"], [255, 235, 60])]))
+            // On a dark plate, so it reads over any frame.
+            let w = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+            ctx.setFillColor(CGColor(colorSpace: cs, components: [0, 0, 0, 0.62])!)
+            ctx.fill(CGRect(x: at[0] - 2, y: at[1] - 1, width: w + 4, height: size + 4))
+            upright(at: at[0], at[1] + size) { ctx.textPosition = .zero; CTLineDraw(line, ctx) }
+        }
+    }
+    guard let img = ctx.makeImage() else { fail("could not draw \(out)") }
+    var ok = false
+    if out.hasSuffix(".jpg"), let dst = CGImageDestinationCreateWithURL(URL(fileURLWithPath: out) as CFURL, UTType.jpeg.identifier as CFString, 1, nil) {
+        CGImageDestinationAddImage(dst, img, [kCGImageDestinationLossyCompressionQuality: 0.74] as CFDictionary)
+        ok = CGImageDestinationFinalize(dst)
+    } else { ok = writePNG(img, out) }
+    guard ok else { fail("could not write \(out)") }
+    print(json(["path": out, "pixels": ["w": W, "h": H], "missing": missing]))
+    exit(0)
+}
+
 func onTerminate(_ handler: @escaping () -> Void) {
     for sig in [SIGINT, SIGTERM] {
         signal(sig, SIG_IGN)
@@ -219,6 +300,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // Live state (for <out>.live.json): recent callbacks and the current visible extent.
     var recent: [(t: Double, complete: Bool, interval: Double, frac: Double)] = []
     var curBox: (x0: Double, y0: Double, x1: Double, y1: Double)? = nil
+    /// What moved since the live reading was last written (about 50ms): the change of every frame summed (a thing
+    /// that moves twice as far changes about twice as much), the largest single frame, the box around all of it in
+    /// screen points. A hand that plays reads these as its sight: the last ones are kept so a late reader loses none.
+    var binSum = 0.0, binPeak = 0.0, binBox: (x0: Double, y0: Double, x1: Double, y1: Double)? = nil
+    var motionBins: [[Double]] = []
     var curLuma = 0.0
     var movingSince: Double? = nil
     var lastMoving: Double? = nil
@@ -381,6 +467,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         if buf.utf8.count > 64_000 { flush() }
         let fracNow = hasPrev ? Double(changed) / n : 0
         recent.append((rel, true, interval, fracNow))
+        binSum += fracNow; binPeak = max(binPeak, fracNow)
+        if mv, fracNow > 0.0005 {
+            let a = rect.origin.x + Double(mx0) * k, b = rect.origin.y + Double(my0) * k
+            let c = rect.origin.x + Double(mx1 + 1) * k, d = rect.origin.y + Double(my1 + 1) * k
+            binBox = binBox.map { (min($0.x0, a), min($0.y0, b), max($0.x1, c), max($0.y1, d)) } ?? (a, b, c, d)
+        }
         curBox = has ? (bx0, by0, bx1, by1) : nil
         curLuma = Double(lumaSum) / n
         if fracNow > 0.0005 { if movingSince == nil { movingSince = rel }; lastMoving = rel }
@@ -418,7 +510,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    /// Snapshot of what is visible right now; written to <out>.live.json ~10×/s. Runs on `q`.
+    /// Snapshot of what is visible right now; written to <out>.live.json ~20×/s. Runs on `q`.
     func liveJSON(refresh: Double) -> String {
         let now = recent.last?.t ?? 0
         recent.removeAll { now - $0.t > 1.0 }
@@ -443,6 +535,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             o["anchored_screen"] = NSNull()
         }
         o["anchor"] = ["x": anchorX, "row_pt": anchorRowPt]
+        // [mach seconds at the end of the bin, change summed, largest frame, box x0 y0 x1 y1, anchored w h]
+        let bb = binBox
+        motionBins.append([machSeconds(mach_absolute_time()), binSum, binPeak, bb?.x0 ?? 0, bb?.y0 ?? 0, bb?.x1 ?? 0, bb?.y1 ?? 0,
+                           anchored.map { $0.x1 - $0.x0 } ?? 0, anchored?.depth ?? 0])
+        if motionBins.count > 24 { motionBins.removeFirst(motionBins.count - 24) }
+        binSum = 0; binPeak = 0; binBox = nil
+        o["motion"] = motionBins
         // Is the eye open? Everything above is the LAST reading; these say how old it is and whether the stream lives.
         if lastCallback > 0 { o["age_s"] = machSeconds(mach_absolute_time()) - lastCallback } else { o["age_s"] = NSNull() }
         if streamDead { o["stream_error"] = streamError ?? "the capture stream stopped" } else { o["stream_error"] = NSNull() }
@@ -1021,7 +1120,7 @@ func cmdCapture() async {
     keep.append(flushTimer)
     let livePath = outPath + ".live.json", liveTmp = livePath + ".tmp"
     let liveTimer = DispatchSource.makeTimerSource(queue: rec.q)
-    liveTimer.schedule(deadline: .now() + 0.1, repeating: 0.1)
+    liveTimer.schedule(deadline: .now() + 0.05, repeating: 0.05)
     liveTimer.setEventHandler {
         try? rec.liveJSON(refresh: refresh).write(toFile: liveTmp, atomically: false, encoding: .utf8)
         rename(liveTmp, livePath)
@@ -1939,7 +2038,11 @@ enum Win {
                     "display_asleep": CGDisplayIsAsleep(disp) != 0, "screen_locked": locked,
                     "display": Int(disp), "display_bounds": [b.minX, b.minY, b.width, b.height]]
         }
-        let wasFront = !minimized && frontApp == pid && before.first?.number == num
+        // An overlay already on screen (not among the ordinary windows) sits above them by itself: it needs no
+        // raise, and its app is not made frontmost, so the app the user was in keeps its windows as they are.
+        let overlay = !minimized && !before.contains { $0.number == num }
+            && (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []).contains { ($0[kCGWindowNumber as String] as? Int) == num }
+        let wasFront = overlay || (!minimized && frontApp == pid && before.first?.number == num)
         let t0 = CACurrentMediaTime()
         if !wasFront {
             if minimized { AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse) }
@@ -1999,7 +2102,9 @@ enum Win {
             did.append("focus → pid \(fp)")
         }
         // Windows that were above ours, raised back to front (the frontmost last). Skips any that closed since.
-        let above = Array(before.prefix { $0 != num })
+        // An overlay (a notch window, a panel above the ordinary windows) is not in that list at all: nothing was
+        // above it, so nothing is re-raised (re-raising every window on screen shuffled them all).
+        let above = before.contains(num) ? Array(before.prefix { $0 != num }) : []
         var cache: [pid_t: [AXUIElement]] = [:]
         func reraise() {
             for n in above.reversed() {
@@ -2111,6 +2216,12 @@ extension AXI {
     }
 }
 
+/// A trackpad's scroll events say whether Natural scrolling turned them round (`NSEvent.isDirectionInvertedFromDevice`,
+/// CGEvent field 137, not in any header). Apps that follow the fingers whatever the setting read it, so ours carry it too.
+func markScrollDirection(_ e: CGEvent) {
+    if Hand.natural, let f = CGEventField(rawValue: 137) { e.setIntegerValueField(f, value: 1) }
+}
+
 final class Hand {
     enum Aim { case rest, heading(CGVector), point(CGPoint, stop: Bool) }
     struct Seg { var t0: Double, t1: Double, from: CGPoint, to: CGPoint, label: String, frame: CGRect?, el: AXUIElement?, n: Int }
@@ -2123,7 +2234,366 @@ final class Hand {
     var speed = 700.0
     var bounds: CGRect? = nil
     var deadman = Double.infinity, coasted = false
-    var scrollRate = CGVector.zero, scrollAcc = CGVector.zero, scrollOpen = false
+    // Two fingers on the trackpad. `scrollOpen` = they are down (a scroll gesture has begun and not ended). One
+    // travel at a time: `fGoal` wheel pixels over `fDur` seconds, of which `fSent` have been posted, so what arrives
+    // is exactly what was asked. They stay down between travels and between wings, until `fLift`, or `fDeadman`.
+    var scrollOpen = false, fActive = false, fFlick = false, fLift = false, fCoasted = false
+    /// The stroke being drawn: where the fingers are along it, in wheel pixels from where it began (a line, a curve
+    /// through several points, a circle, a wander). `fEven` = its points are evenly spaced in time already.
+    var fPath: [CGPoint] = [.zero, .zero], fEven = false, fEndVel = CGVector.zero
+    var fSent = CGVector.zero, fT0 = 0.0, fDur = 0.1, fDeadman = Double.infinity
+    // A touch is one thing from landing to lifting, and the fingers are never cut from one motion to the next. Where
+    // they are = where the strokes so far have taken them (`fOrg`, exact, from where they landed) + the stroke being
+    // drawn or the heading being held + what they keep doing about that place (a wave, a stir, a roam) + what is
+    // left of the motion before this one, dying away. `fSent` is what has been posted of the whole touch.
+    var fOrg = CGPoint.zero, fNow = CGPoint.zero, fTouch = 0, fLanded = 0.0
+    /// A heading: they keep going that way (wheel pixels per second) until the next word, `gMax` points at most.
+    var gOn = false, gV = CGVector.zero, gT0 = 0.0, gCapped = false
+    let gMax = 1500.0
+    /// What they keep doing where they are, wanted (…T) and as it is now (eased, so "bigger, faster" has no seam):
+    /// radius in points, cycles a second, shape (0 = a line: a wave; ±1 = a circle: a stir), the axis of the line.
+    var mAmp = 0.0, mAmpT = 0.0, mHz = 3.0, mHzT = 3.0, mEll = 0.0, mEllT = 0.0, mAx = 0.0, mAxT = 0.0, mPh = 0.0
+    /// A roam: how far from that place they may wander, wanted and now.
+    var mRoam = 0.0, mRoamT = 0.0
+    /// No two cycles alike: the phases of the slow waves that vary the size and the tempo, and draw a roam.
+    var mSeed: [Double] = (0..<12).map { _ in Double.random(in: 0...(2 * .pi)) }
+    /// What is left of the motion before this one (offset and velocity at `cT0`): critically damped, gone in ~0.3s.
+    var cT0 = 0.0, cP = CGVector.zero, cV = CGVector.zero
+    let cW = 14.0
+    /// The touch as it was drawn, for the reply: time, where the fingers were from where they landed, which touch.
+    var fTrace: [(t: Double, x: Double, y: Double, n: Int)] = [], fTraceT = 0.0
+    var fWants: Bool { fActive || gOn || mAmpT > 0 || mRoamT > 0 || (pOn && !pUp) }
+    /// The user took their input back (Esc ×6 ended the lock): everything stops where it is, fingers lift, buttons
+    /// are let go, and nothing moves again until a new session's first wing says so.
+    var taken = false
+
+    // ---- Play. Not a motion that is held, but a stream of small plots: each a short stroke towards somewhere
+    // (minimum jerk, bowed a little to one side), the next begun before the last has ended, so that a change of mind
+    // is a turn and never a stop; and each one decided from what the screen did under the ones before it.
+    struct Sub { var t0: Double, dur: Double, dx: Double, dy: Double, bx: Double, by: Double }
+    var pOn = false, pSubs: [Sub] = [], pNext = 0.0, pIv = 0.3
+    /// How it plays (0 gentle, 1 lively, 2 wild), the size of its strokes now, the way the last one went, the side
+    /// they bow to.
+    var pMood = 1, pSize = 60.0, pDir = Double.pi / 2, pBow = 1.0
+    /// Nothing about a stroke is drawn afresh: its turn, its time and its size each differ from the last one's by a
+    /// lean that itself wanders (and that what the screen does pushes), so a wave precesses, opens into loops and
+    /// closes, quickens and slackens, swells and sinks. `pHeat` = how hard they have been going lately (1 = a
+    /// person's usual): going hard is not kept up, a lull follows it.
+    var pTurn = 0.0, pTurnLean = 0.0, pTime = 0.0, pTimeLean = 0.0, pPush = 0.0, pPushLean = 0.0, pHeat = 0.6
+    /// The plot it is in the middle of, how many strokes it still means to make of it, how many it has made, how
+    /// little the last ones gave (a bored hand tries something else), what it was at before it slowed to watch.
+    enum Step { case stroke(String, Double, Double, Double), further(Int), wave(Int), hold(Double, Double), lift, fling }
+    /// The phrase they are in and the steps of it still to come; `pUp` = they have let go for a moment, to watch
+    /// (play is still on: they land again by themselves); how the phrase was answered; how far they have been.
+    var pPlan: [Step] = [], pPhrase = "", pUp = false, pHoldT0 = 0.0, pRun = 0, pBored = 0.0
+    /// What a wave means to do by itself, every there-and-back: swell, stay, or sink (the screen's answer adds to it).
+    var pBent = 1.0
+    var pAns = 0, pNo = 0, pReach = 0.0, pSeed = Double.pi / 2
+    var pKind: String { pPhrase }
+    /// Its sight: the screen in bins of about 50ms (when, how much changed, how large what moved was).
+    var pSight: [(t: Double, sum: Double, w: Double, h: Double)] = [], pT0Mach = 0.0
+    /// Its own travel: (when, points travelled so far, where the fingers were).
+    var pOdo: [(t: Double, d: Double, x: Double, y: Double)] = [], pTravel = 0.0, pXY = CGPoint.zero
+    /// What it has learnt in this touch: what the screen gives per point of travel (lately, and by the way gone),
+    /// the most a stretch of time gave, where the screen gave most, how large the thing has been.
+    var pGain = 0.0, pGainN = 0, pWay = [Double](repeating: -1, count: 8), pTop = 0.0
+    var pBest = (g: 0.0, x: 0.0, y: 0.0), pMaxW = 0.0, pMaxH = 0.0, pRecT = 0.0
+    /// A pop: the screen jumped and the fingers had done nothing new. Where they were; the places already known.
+    var pPopT = 0.0, pPopAt = CGPoint.zero, pPopNew = false, pKnown: [CGPoint] = []
+    /// Plots made and things noticed since the last reply.
+    var pLog: [[String: Any]] = []
+    static let moods = ["gentle", "lively", "wild"]
+
+    func pForget() {
+        pGain = 0; pGainN = 0; pWay = [Double](repeating: -1, count: 8); pTop = 0; pBest = (0, 0, 0); pKnown = []; pPopNew = false
+        pTurn = 0; pTurnLean = 0; pTime = 0; pTimeLean = 0; pPush = 0; pPushLean = 0; pHeat = 0.6
+        pPlan = []; pPhrase = ""; pUp = false; pHoldT0 = 0; pRun = 0; pBored = 0; pAns = 0; pNo = 0; pReach = 0
+    }
+    func pOdoAt(_ at: Double) -> Double {
+        for o in pOdo.reversed() where o.t <= at { return o.d }
+        return pOdo.first?.d ?? pTravel
+    }
+    func pWhere(_ at: Double) -> CGPoint {
+        for o in pOdo.reversed() where o.t <= at { return CGPoint(x: o.x, y: o.y) }
+        return pXY
+    }
+    /// New bins of sight (lock held). A pop is noticed here, when it is seen, not when the next plot falls due.
+    func pSee(_ bins: [[Double]], t0Mach: Double) {
+        pT0Mach = t0Mach
+        let last = pSight.last?.t ?? 0
+        for b in bins where b.count >= 9 && b[0] > last + 0.001 {
+            let w = b[7] > 0 ? b[7] : b[5] - b[3], h = b[8] > 0 ? b[8] : b[6] - b[4]
+            if scrollOpen {
+                let prior = pSight.suffix(30).map { $0.sum }.sorted()
+                let med = prior.isEmpty ? 0 : prior[prior.count / 2]
+                // Many times what the screen had been doing, and many times what that much travel has been giving.
+                let went = pOdoAt(b[0] - 0.07) - pOdoAt(b[0] - 0.12)
+                let unearned = pGainN >= 3 ? b[1] >= 4 * pGain * max(went, 8) : b[1] >= 0.05
+                if b[1] >= 0.02, b[1] >= 6 * max(med, 0.002), unearned, b[0] - pPopT > 1.0, pKind != "cross" {
+                    let at = pWhere(b[0] - 0.07)
+                    pPopT = b[0]
+                    if !pKnown.contains(where: { hypot($0.x - at.x, $0.y - at.y) < 90 }) {
+                        pPopAt = at; pPopNew = pOn; pKnown.append(at)
+                        pLog.append(["t": b[0], "k": "pop", "x": Double(at.x), "y": Double(at.y), "v": b[1], "w": w, "h": h])
+                    }
+                }
+                if b[1] > 0.002 {
+                    if w > pMaxW * 1.06 + 4 || h > pMaxH * 1.06 + 4 { pRecT = b[0] }
+                    pMaxW = max(pMaxW, w); pMaxH = max(pMaxH, h)
+                }
+            }
+            pSight.append((b[0], b[1], w, h))
+        }
+        if pSight.count > 200 { pSight.removeFirst(pSight.count - 160) }
+    }
+
+    /// The next step of what they are doing (lock held). They play in PHRASES: a few strokes with one purpose (pull it
+    /// to see how far it goes; wobble it where it answers; shake it; slide across; hold it stretched and let go;
+    /// throw it), and one phrase runs into the next: they are still only for a beat now and then, and after
+    /// letting go, when they watch with the fingers up until the screen is quiet. How a phrase was answered decides
+    /// the next one. A pop interrupts any of them: stop, then slowly back
+    /// over that place and forth, stopping each time to see.
+    func plot(_ t: Double) {
+        func rnd(_ a: Double, _ b: Double) -> Double { Double.random(in: a...b) }
+        func side() -> Double { Bool.random() ? 1 : -1 }
+        func bell() -> Double { (rnd(0, 1) + rnd(0, 1) + rnd(0, 1) - 1.5) * 2 }   // about a unit normal
+        let rad = Double.pi / 180
+        let lim = [150.0, 260, 550][pMood], pace = [1.5, 1.15, 0.92][pMood]
+        // What the last stretch of time gave. The screen runs about 0.07s behind the fingers.
+        let span = min(0.6, max(0.25, 2 * pIv))
+        var s = 0.0, n = 0
+        for b in pSight.reversed() { if b.t <= t - span { break }; s += b.sum; n += 1 }
+        let d = pOdoAt(t - 0.07) - pOdoAt(t - span - 0.07)
+        let sees = n > 0
+        let per = sees ? s / Double(n) : 0, g = d > 12 ? s / d : 0
+        pTop = max(pTop * 0.999, per)
+        let nothing = sees && d > 25 && per < max(0.0012, 0.2 * pTop)
+        let more = pGainN >= 3 && g > pGain * 1.25, less = pGainN >= 3 && g < pGain * 0.6
+        let record = t - pRecT < span + 0.1
+        // Is the screen still answering? Quiet = nothing has moved for a quarter of a second.
+        let tail = pSight.suffix(5)
+        let quiet = !sees || (tail.count == 5 && tail.allSatisfy { $0.sum < max(0.0012, 0.06 * pTop) })
+        if d > 12, sees, scrollOpen {
+            pGain = pGainN == 0 ? g : pGain + (g - pGain) * 0.2; pGainN += 1
+            let i = ((Int((pDir / (.pi / 4)).rounded()) % 8) + 8) % 8
+            pWay[i] = pWay[i] < 0 ? g : pWay[i] + (g - pWay[i]) * 0.4
+            if nothing { pNo += 1 } else { pAns += 1 }
+        }
+        // Where the strokes begun so far will have taken the fingers.
+        var hx = 0.0, hy = 0.0
+        if scrollOpen {
+            hx = Double(fOrg.x); hy = Double(fOrg.y)
+            for q in pSubs { hx += q.dx; hy += q.dy }
+            if fActive { hx += Double(fPath[fPath.count - 1].x); hy += Double(fPath[fPath.count - 1].y) }
+        }
+        func way() -> Double {   // a way to go: where the screen gave most so far, or one not tried yet
+            let top = max(1e-9, pWay.max() ?? 0)
+            var best = 0, bw = -1.0
+            for i in 0..<8 { let w = (pWay[i] < 0 ? 0.55 : 0.2 + pWay[i] / top) * rnd(0.45, 1); if w > bw { bw = w; best = i } }
+            return Double(best) * .pi / 4 + rnd(-0.3, 0.3)
+        }
+        /// One stroke: its turn, time and size lean on the last one's (see pTurn), it stays on the trackpad, and the
+        /// next step falls due before it has ended.
+        func launch(_ what: String, _ way: Double, _ length: Double, _ tempo: Double, _ bow0: Double, _ bs: Double) {
+            var dir = way, L = max(8, length)
+            let R = 520.0
+            var tx = hx + cos(dir) * L, ty = hy + sin(dir) * L
+            if abs(tx) > R || abs(ty) > R {
+                tx = min(R, max(-R, tx)); ty = min(R, max(-R, ty))
+                if hypot(tx - hx, ty - hy) < 20 { dir += .pi; tx = hx + cos(dir) * L; ty = hy + sin(dir) * L }
+                L = hypot(tx - hx, ty - hy); dir = atan2(ty - hy, tx - hx)
+            }
+            let iv = (0.05 + 0.014 * sqrt(L)) * tempo, dur = iv / 0.78
+            let dx = cos(dir) * L, dy = sin(dir) * L
+            pSubs.append(Sub(t0: t, dur: dur, dx: dx, dy: dy, bx: -sin(dir) * bow0 * bs * L, by: cos(dir) * bow0 * bs * L))
+            pDir = dir; pNext = t + iv; pIv = iv; pRun += 1
+            pHeat += (L / iv / 420 - pHeat) * 0.12   // 420pt/s: about the mean speed of a person's lively stroke
+            if rnd(0, 1) < 0.07 { pBow = -pBow }
+            pLog.append(["t": t, "k": what, "dx": dx, "dy": dy, "x": hx, "y": hy, "ms": dur * 1000, "g": g, "per": per])
+            if pLog.count > 900 { pLog.removeFirst(300) }
+        }
+        /// The next phrase, from how the last one was answered.
+        func phrase() {
+            let prev = pPhrase, gave = pAns > pNo, r = rnd(0, 1)
+            var best = pSeed, bg = 0.0
+            for i in 0..<8 where pWay[i] > bg { bg = pWay[i]; best = Double(i) * .pi / 4 }
+            if gave, scrollOpen { pReach = max(pReach, hypot(hx, hy)) }
+            pAns = 0; pNo = 0; pRun = 0; pBored = 0
+            // No phrase starts from where the last one left the size: it is pulled back towards the mood's own.
+            pSize = max(24, min(lim, pow(pSize, 0.55) * pow([45.0, 60, 85][pMood], 0.45)))
+            // A phrase runs into the next one: the fingers stop only now and then, for a beat, and when they let go.
+            func beat() -> [Step] { rnd(0, 1) < 0.14 ? [.hold(0.08, rnd(0.15, 0.4))] : [] }
+            func pull(_ w: Double) {
+                pPhrase = "pull"; pDir = w
+                pPlan = [.stroke("pull", w, min(lim, max(110, pSize * 2.2)), rnd(1.5, 2.6)), .further(Int.random(in: 1...3))] + beat()
+            }
+            func wobble(_ size: Double) {
+                pPhrase = "wobble"; pSize = max(22, min(lim, size))
+                let b = rnd(0, 1); pBent = b < 0.62 ? rnd(1.12, 1.3) : b < 0.85 ? 1.0 : rnd(0.85, 0.93)
+                pPlan = [.wave(Int.random(in: 6...13))] + beat()
+            }
+            func shake() {
+                pPhrase = "shake"; pSize = min(lim, max(90, pSize * rnd(1.6, 2.4))); pBent = rnd(1.0, 1.15)
+                pPlan = [.wave(Int.random(in: 5...9))]
+            }
+            func release() { pPhrase = "release"; pPlan = [.lift, .hold(0.3, 1.8)] }
+            // Held where it is stretched, for a moment, then let go: to see it spring.
+            func tease() { pPhrase = "release"; pPlan = [.hold(0.15, rnd(0.3, 0.7)), .lift, .hold(0.3, 1.8)] }
+            // Thrown: a fast stroke that the fingers leave at its fastest.
+            func fling(_ w: Double) {
+                pPhrase = "fling"; pDir = w
+                pPlan = [.stroke("flick", w, rnd(90, min(240, max(120, lim * 0.7))), 0.6), .fling, .hold(0.3, 1.8)]
+            }
+            func slide() {
+                let w = best + side() * .pi / 2, L = rnd(140, max(150, min(lim * 1.3, 380)))
+                pPhrase = "slide"; pDir = w; pPlan = [.stroke("slide", w, L, rnd(2.0, 2.9))]
+                if rnd(0, 1) < 0.4 { pPlan.append(.stroke("slide", w + .pi, L * rnd(0.8, 1.5), rnd(1.2, 2.2))) }
+            }
+            func far() {
+                pPhrase = "far"; pDir = best
+                pPlan = [.stroke("far", best, min(480, max(180, pReach * 1.3)), rnd(1.1, 1.6)), .further(2)]
+            }
+            let small = min(pSize, 70) * rnd(0.45, 0.8)
+            if prev.isEmpty { pull(pSeed); return }
+            if !scrollOpen {
+                // They let go and watched it. Now: further than it has been, or the same again, or another way.
+                if pReach > 60, r < 0.5 { far() } else { pull(r < 0.8 ? best : way()) }
+                return
+            }
+            if !gave {
+                // Nothing answered. Harder, another way from here, or let go and begin again.
+                if r < 0.25 { shake() } else if r < 0.65 { pull(way()) } else { release() }
+                return
+            }
+            let wild = [0.0, 0.06, 0.14][pMood]
+            switch prev {
+            case "pull", "far":
+                if r < 0.4 { wobble(small) } else if r < 0.52 + wild { shake() } else if r < 0.66 + wild { tease() }
+                else if r < 0.78 + wild { fling(pDir + (Bool.random() ? .pi : 0)) } else if r < 0.88 + wild { slide() } else { release() }
+            case "wobble":
+                if r < 0.28 + wild { shake() } else if r < 0.46 + wild { far() } else if r < 0.6 + wild { slide() }
+                else if r < 0.76 + wild { fling(pDir) } else { release() }
+            case "shake":
+                if r < 0.25 { fling(pDir) } else if r < 0.5 { wobble(small) } else if r < 0.7 { far() } else { release() }
+            case "slide":
+                if r < 0.45 { wobble(small) } else if r < 0.6 { shake() } else if r < 0.78 { fling(pDir) } else { release() }
+            case "cross":
+                if r < 0.5 { wobble(small) } else if r < 0.72 { shake() } else { release() }
+            default: release()
+            }
+        }
+        if pPopNew {
+            // It popped: stop. Then slowly back over that place, stop and look; and forth, stop and look.
+            pPopNew = false; pPhrase = "cross"; pHoldT0 = 0; pRun = 0; pAns = 1; pNo = 0
+            pPlan = [.hold(0.15, 0.5), .stroke("cross", 0, 0, 2.1), .hold(0.12, 0.6), .stroke("cross", 0, 0, 1.8)]
+        }
+        // The leans wander slowly and are pulled back to nothing; the turn, the time and the push follow their lean
+        // and are pulled back too. Going hard pulls the time out and the push down: it cannot only get quicker.
+        func lean() -> (Double, Double) {
+            pTurnLean += -0.12 * pTurnLean + 3.0 * rad * bell(); pTurn += -0.3 * pTurn + pTurnLean + 5 * rad * bell()
+            pTimeLean += -0.15 * pTimeLean + 0.02 * bell();      pTime += -0.22 * pTime + pTimeLean + 0.05 * bell()
+            pPushLean += -0.15 * pPushLean + 0.025 * bell();     pPush += -0.22 * pPush + pPushLean + 0.07 * bell()
+            if pHeat > 1 { pTimeLean += 0.02 * (pHeat - 1); pPushLean -= 0.02 * (pHeat - 1) }
+            pTurn = min(0.6, max(-0.6, pTurn)); pTime = min(0.45, max(-0.3, pTime)); pPush = min(0.4, max(-0.5, pPush))
+            return (exp(pTime), exp(pPush))
+        }
+        for _ in 0..<8 {
+            if pPlan.isEmpty { phrase() }
+            switch pPlan[0] {
+            case .hold(let least, let most):
+                // Still, for as long as the screen is still answering (and a moment at least).
+                if pHoldT0 == 0 { pHoldT0 = t; pLog.append(["t": t, "k": pUp ? "watch" : "hold", "x": hx, "y": hy]) }
+                if (t - pHoldT0 >= least && quiet) || t - pHoldT0 >= most { pHoldT0 = 0; pPlan.removeFirst(); continue }
+                pNext = t + 0.04; return
+            case .fling:
+                // Let go at the stroke's fastest: what they were moving is thrown, and coasts.
+                pPlan.removeFirst()
+                if scrollOpen, let q = pSubs.last {
+                    let v = 1.875 / q.dur
+                    fEndVel = CGVector(dx: q.dx * v, dy: q.dy * v); fFlick = true
+                    pUp = true; fLift = true; pLog.append(["t": t, "k": "fling", "x": hx, "y": hy])
+                }
+                pNext = t + 0.06; return
+            case .lift:
+                pPlan.removeFirst()
+                if scrollOpen { pUp = true; fLift = true; pLog.append(["t": t, "k": "lift", "x": hx, "y": hy]) }
+                pNext = t + 0.06; return
+            case .further(let left):
+                // On the same way, while the thing keeps growing.
+                if left <= 0 || (pRun > 0 && !record) || abs(hx) > 500 || abs(hy) > 500 { pPlan.removeFirst(); continue }
+                if !scrollOpen { pUp = false; pNext = t; return }
+                pPlan[0] = .further(left - 1)
+                let (slack, push) = lean()
+                launch("further", pDir + pTurn * 0.5, min(lim, max(80, pSize * 1.6)) * push, pace * 2.3 * slack, 0.04, pBow); return
+            case .wave(var left):
+                // There and back, with a bent of its own (it swells, mostly). The screen giving more than expected:
+                // bigger still, a little quicker, and it goes on. Giving nothing: it sinks, and soon ends.
+                if pRun > 0, pRun % 2 == 0 {
+                    pSize = max(22, min(lim, pSize * pBent))
+                    if more || record {
+                        pSize = min(lim, pSize * rnd(1.08, 1.2)); pBored = 0; pTimeLean -= 0.03; pPushLean += 0.03
+                        if left <= 1, pRun < 20 { left += 2 }
+                    } else if nothing || less {
+                        pBored += nothing ? 1.6 : 0.8; pSize = max(22, pSize * rnd(0.82, 0.95)); pTimeLean += 0.02
+                    }
+                }
+                if left <= 0 || pBored >= 3 { pPlan.removeFirst(); continue }
+                if !scrollOpen { pUp = false; pNext = t; return }
+                pPlan[0] = .wave(left - 1)
+                let (slack, push) = lean()
+                launch(pPhrase == "shake" ? "shake" : "wave", pDir + .pi + pTurn, pSize * push, pace * 0.9 * slack, 0.13 + 0.25 * abs(pTurn), pBow); return
+            case .stroke(let what, let w, let length, let tempo):
+                if !scrollOpen { pUp = false; pNext = t; return }
+                pPlan.removeFirst()
+                let (slack, push) = lean()
+                var dir = w + pTurn * 0.4, L = length * push
+                if what == "cross" {
+                    let vx = Double(pPopAt.x) - hx, vy = Double(pPopAt.y) - hy, far = hypot(vx, vy)
+                    dir = far > 15 ? atan2(vy, vx) : pDir + .pi; L = far + rnd(40, 70)
+                }
+                launch(what, dir, L, pace * tempo * slack, 0.04 + 0.2 * abs(pTurn), pBow)
+                if what == "flick" { pNext = t + pIv / 0.78 * 0.5 }   // let go half way: where it is fastest
+                return
+            }
+        }
+        pNext = t + 0.05
+    }
+    /// What remains of the last join, now: (offset, velocity).
+    func carry(_ t: Double) -> (CGVector, CGVector) {
+        let tc = max(0, t - cT0), e = exp(-cW * tc)
+        let kx = cV.dx + cW * cP.dx, ky = cV.dy + cW * cP.dy
+        return (CGVector(dx: (cP.dx + kx * tc) * e, dy: (cP.dy + ky * tc) * e), CGVector(dx: (cV.dx - cW * kx * tc) * e, dy: (cV.dy - cW * ky * tc) * e))
+    }
+    /// A new motion takes over (call with the lock held): a heading stops being one, and the speed it had is handed
+    /// to the remainder, so the fingers swing into what comes next instead of stopping dead.
+    func join(_ t: Double) {
+        var (p, v) = carry(t)
+        if gOn {
+            let tg = max(0, t - gT0), k = 1 - exp(-tg / 0.08), s = tg - 0.08 * k
+            fOrg.x += gV.dx * s; fOrg.y += gV.dy * s
+            v.dx += gV.dx * k; v.dy += gV.dy * k
+            gOn = false
+        }
+        if hypot(p.dx, p.dy) < 0.05, hypot(v.dx, v.dy) < 0.5 { p = .zero; v = .zero }
+        cP = p; cV = v; cT0 = t
+    }
+    /// What the fingers are doing, in words (for the reply).
+    var doing: String {
+        if pOn { return "playing (\(Hand.moods[pMood]))" + (pUp ? ", lifted for a moment to watch (they land again by themselves)" : pHoldT0 > 0 ? ", holding still to watch" : "") }
+        if gOn { return String(format: "going on at %.0fpt/s", hypot(gV.dx, gV.dy)) }
+        if mRoamT > 0 { return String(format: "roaming within %.0fpt", mRoamT) }
+        if mAmpT > 0 { return mEllT == 0 ? String(format: "waving ±%.0fpt at %.1f a second", mAmpT, mHzT) : String(format: "stirring a circle of %.0fpt at %.1f a second", mAmpT, mHzT) }
+        return "holding still"
+    }
+    // What the content does after a flick: momentum events, decaying (velocity in wheel pixels per second).
+    var mom = CGVector.zero, momAcc = CGVector.zero, momOpen = false, momOn = false
+    /// System Settings › Trackpad › Natural scrolling: the content follows the fingers. Read as a real device's events are.
+    /// (`-com.apple.swipescrolldirection NO` on the helper's command line sets it for that process only: a string there.)
+    static var natural: Bool {
+        let v = UserDefaults.standard.object(forKey: "com.apple.swipescrolldirection")
+        if let s = v as? String { return (s as NSString).boolValue }
+        return (v as? Bool) ?? true
+    }
     var trail: [Seg] = [], dropped = 0
     var livePath: String? = nil, blind: String? = nil, screenMoving = false
     var targetPid: pid_t = 0
@@ -2141,10 +2611,12 @@ final class Hand {
         let type: CGEventType = l ? .leftMouseDragged : r ? .rightMouseDragged : .mouseMoved
         post(CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: p, mouseButton: r && !l ? .right : .left))
     }
-    func postScroll(_ phase: Int64, _ y: Int32, _ x: Int32, at p: CGPoint) {
+    func postScroll(_ phase: Int64, _ momentum: Int64, _ y: Int32, _ x: Int32, at p: CGPoint) {
         guard let e = CGEvent(scrollWheelEvent2Source: src, units: .pixel, wheelCount: 2, wheel1: y, wheel2: x, wheel3: 0) else { return }
         e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
         e.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
+        if momentum != 0 { e.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentum) }
+        markScrollDirection(e)
         e.location = p
         post(e)
     }
@@ -2163,9 +2635,9 @@ final class Hand {
             let t = now(), dt = min(0.05, t - last)
             last = t
             lock.lock()
-            if resting, scrollRate == .zero, !scrollOpen { vel = .zero; lock.unlock(); continue }
+            if resting, !scrollOpen, !fWants, !fLift, !momOn, !(pOn && pUp) { vel = .zero; lock.unlock(); continue }
             // The eye shut, or nobody steering any more: brake where it is (velocity eases out, it does not snap).
-            if blind != nil { aim = .rest; scrollRate = .zero }
+            if blind != nil || taken { aim = .rest; fActive = false; fFlick = false; momOn = false; gOn = false; mAmpT = 0; mRoamT = 0; pOn = false; pUp = false; if scrollOpen { fLift = true } }
             if t > deadman { deadman = .infinity; if case .heading = aim { aim = .rest; coasted = true } }
             var vd = CGVector.zero
             switch aim {
@@ -2209,17 +2681,117 @@ final class Hand {
             }
             let moved = hypot(np.x - pos.x, np.y - pos.y) > 0.01
             pos = np
-            var scrolls: [(Int64, Int32, Int32)] = []
-            if scrollRate != .zero {
-                if !scrollOpen { scrollOpen = true; scrolls.append((1, 0, 0)) }
-                scrollAcc.dx += scrollRate.dx * dt; scrollAcc.dy += scrollRate.dy * dt
-                let iy = Int32(scrollAcc.dy), ix = Int32(scrollAcc.dx)
-                scrollAcc.dy -= Double(iy); scrollAcc.dx -= Double(ix)
-                if iy != 0 || ix != 0 { scrolls.append((2, iy, ix)) }
-            } else if scrollOpen { scrollOpen = false; scrollAcc = .zero; scrolls.append((4, 0, 0)) }
+            var scrolls: [(Int64, Int64, Int32, Int32)] = []
+            // Play with the fingers up: watching, until the next phrase lands them again; or nobody steers any more.
+            if pOn, pUp, !scrollOpen {
+                if t > fDeadman { pOn = false; pUp = false; fDeadman = .infinity; fCoasted = true }
+                else if t >= pNext { plot(t) }
+            }
+            if fWants {
+                // Fingers landing ends whatever was still coasting, as a touch does.
+                if momOn || momOpen { if momOpen { scrolls.append((0, 3, 0, 0)) }; momOn = false; momOpen = false }
+                if !scrollOpen {
+                    scrollOpen = true; scrolls.append((1, 0, 0, 0))
+                    fOrg = .zero; fSent = .zero; fNow = .zero; cP = .zero; cV = .zero; cT0 = t
+                    mAmp = 0; mRoam = 0; mPh = 0; mHz = mHzT; mEll = mEllT; mAx = mAxT
+                    fTouch += 1; fLanded = t; if gOn { gT0 = t }
+                    pSubs = []; pOdo = []; pXY = .zero; pMaxW = 0; pMaxH = 0; pRecT = 0
+                    // A touch that is not play's own knows nothing yet of what the thing gives.
+                    if !pOn { pForget() }
+                }
+            }
+            if scrollOpen {
+                // Play: a stroke that has ended is part of where the fingers are; the next plot when it falls due
+                // (before the last has ended); those under way are added up.
+                var q = 0
+                while q < pSubs.count {
+                    if t >= pSubs[q].t0 + pSubs[q].dur { fOrg.x += pSubs[q].dx; fOrg.y += pSubs[q].dy; pSubs.remove(at: q) } else { q += 1 }
+                }
+                if pOn, !gOn, t >= pNext { plot(t) }
+                var cx = Double(fOrg.x), cy = Double(fOrg.y)
+                for sub in pSubs {
+                    let u = max(0, (t - sub.t0) / sub.dur), m = u * u * u * (10 - 15 * u + 6 * u * u), b = sin(.pi * u)
+                    cx += sub.dx * m + sub.bx * b * b; cy += sub.dy * m + sub.by * b * b
+                }
+                if fActive {
+                    // Eased in and out (minimum jerk) so a change of direction is a turn, not a corner; a flick only
+                    // eases in and leaves at twice its mean speed.
+                    let u = min(1, max(0, (t - fT0) / fDur))
+                    let s = fEven ? u : fFlick ? u * u : u * u * u * (10 - 15 * u + 6 * u * u)
+                    let q = s * Double(fPath.count - 1), i0 = min(fPath.count - 2, Int(q)), fr = q - Double(i0)
+                    cx += Double(fPath[i0].x) + Double(fPath[i0 + 1].x - fPath[i0].x) * fr
+                    cy += Double(fPath[i0].y) + Double(fPath[i0 + 1].y - fPath[i0].y) * fr
+                    if u >= 1 {
+                        fActive = false
+                        fOrg.x += fPath[fPath.count - 1].x; fOrg.y += fPath[fPath.count - 1].y
+                        if fFlick { fLift = true }
+                    }
+                } else if gOn {
+                    // A heading: up to speed in a tenth of a second, then steady, until the next word.
+                    let tg = max(0, t - gT0), s = tg - 0.08 * (1 - exp(-tg / 0.08))
+                    if Double(hypot(gV.dx, gV.dy)) * s >= gMax { join(t); gCapped = true; cx = Double(fOrg.x); cy = Double(fOrg.y) }
+                    else { cx += Double(gV.dx) * s; cy += Double(gV.dy) * s }
+                }
+                // What they keep doing about that place. Size, tempo, shape and axis ease towards what was asked, so
+                // "bigger", "faster", "now in circles" have no seam; and no two cycles are quite alike. The tempo
+                // drifts by about 6% (self-paced tapping near 2Hz varies by 5-10%); the size by about 7%, which is a
+                // choice: nobody has a number for it.
+                let k = 1 - exp(-dt / 0.15)
+                mAmp += (mAmpT - mAmp) * k; mHz += (mHzT - mHz) * k; mEll += (mEllT - mEll) * k; mRoam += (mRoamT - mRoam) * k
+                var da = (mAxT - mAx).truncatingRemainder(dividingBy: .pi) // a line's axis: half a turn is the same line
+                if da > .pi / 2 { da -= .pi } else if da < -.pi / 2 { da += .pi }
+                mAx += da * k
+                if mAmp > 0.05 || mAmpT > 0 {
+                    let size = 1 + 0.09 * sin(2 * .pi * 0.37 * t + mSeed[0]) + 0.045 * sin(2 * .pi * 0.83 * t + mSeed[1])
+                    let tempo = 1 + 0.075 * sin(2 * .pi * 0.29 * t + mSeed[2]) + 0.04 * sin(2 * .pi * 0.71 * t + mSeed[3])
+                    mPh += 2 * .pi * mHz * tempo * dt
+                    let a = mAmp * size, along = a * sin(mPh), across = -a * mEll * cos(mPh)
+                    cx += along * cos(mAx) - across * sin(mAx); cy += along * sin(mAx) + across * cos(mAx)
+                }
+                if mRoam > 0.05 || mRoamT > 0 {
+                    // Two slow waves per axis at unrelated rates: about the pace of a person's doodling for its size.
+                    let rt = t - fLanded
+                    cx += mRoam * (0.62 * sin(2 * .pi * 0.30 * rt + mSeed[4]) + 0.38 * sin(2 * .pi * 0.85 * rt + mSeed[5]))
+                    cy += mRoam * (0.62 * sin(2 * .pi * 0.37 * rt + mSeed[6]) + 0.38 * sin(2 * .pi * 0.95 * rt + mSeed[7]))
+                }
+                let left = carry(t).0
+                cx += Double(left.dx); cy += Double(left.dy)
+                let ix = Int32(cx.rounded() - Double(fSent.dx)), iy = Int32(cy.rounded() - Double(fSent.dy))
+                fSent.dx += CGFloat(ix); fSent.dy += CGFloat(iy)
+                if iy != 0 || ix != 0 { scrolls.append((2, 0, iy, ix)) }
+                fNow = CGPoint(x: cx, y: cy)
+                pTravel += hypot(cx - Double(pXY.x), cy - Double(pXY.y)); pXY = fNow
+                if pOdo.isEmpty || t - pOdo[pOdo.count - 1].t > 0.02 {
+                    pOdo.append((t, pTravel, cx, cy))
+                    if pOdo.count > 500 { pOdo.removeFirst(150) }
+                }
+                if t - fTraceT > 0.016 {
+                    fTraceT = t; fTrace.append((t: t, x: cx, y: cy, n: fTouch))
+                    if fTrace.count > 3000 { fTrace.removeFirst(600) }
+                }
+            }
+            if scrollOpen, !fActive, !fLift, t > fDeadman { fLift = true; fCoasted = true }
+            if fLift, !fActive {
+                fLift = false; if !(pOn && pUp) { fDeadman = .infinity }
+                if scrollOpen {
+                    scrollOpen = false; scrolls.append((4, 0, 0, 0))
+                    if fFlick { mom = fEndVel; momAcc = .zero; momOn = true; momOpen = false }
+                }
+                fFlick = false
+                // The touch is over: nothing of it lives on into the next.
+                gOn = false; mAmpT = 0; mRoamT = 0; mAmp = 0; mRoam = 0; cP = .zero; cV = .zero
+                if !pUp { pOn = false }; pSubs = []
+            } else if momOn {
+                mom.dx *= exp(-dt / 0.135); mom.dy *= exp(-dt / 0.135)
+                momAcc.dx += mom.dx * dt; momAcc.dy += mom.dy * dt
+                let ix = Int32(momAcc.dx), iy = Int32(momAcc.dy)
+                momAcc.dx -= Double(ix); momAcc.dy -= Double(iy)
+                if hypot(mom.dx, mom.dy) < 40 { momOn = false; if momOpen { momOpen = false; scrolls.append((0, 3, 0, 0)) } }
+                else if ix != 0 || iy != 0 { scrolls.append((0, momOpen ? 2 : 1, iy, ix)); momOpen = true }
+            }
             lock.unlock()
             if moved { postMove(np) }
-            for s in scrolls { postScroll(s.0, s.1, s.2, at: np) }
+            for s in scrolls { postScroll(s.0, s.1, s.2, s.3, at: np) }
         }
     }
 
@@ -2253,6 +2825,9 @@ final class Hand {
             else if age > 1.5 { why = String(format: "the recording ended, or its helper stopped, %.1fs ago", age) }
             else if (o["frames_total"] as? NSNumber)?.intValue == 0 { why = "the recording has not delivered a single image" }
             mv = (o["moving"] as? Bool) ?? false
+            if let bins = o["motion"] as? [[Double]] {
+                lock.lock(); pSee(bins, t0Mach: (o["t0_mach"] as? NSNumber)?.doubleValue ?? 0); lock.unlock()
+            }
         } else { why = "the recording has no live reading" }
         lock.lock(); blind = why; screenMoving = mv; lock.unlock()
     }
@@ -2262,7 +2837,7 @@ final class Hand {
         while true {
             usleep(4000)
             let t = now()
-            if t - lastLive > 0.1 { lastLive = t; if t < senseUntil { readLive() } }
+            if t - lastLive > 0.045 { lastLive = t; if t < senseUntil { readLive() } }
             lock.lock()
             let on = t < senseUntil, p = resting ? Hand.pointer() : pos
             lock.unlock()
@@ -2305,7 +2880,7 @@ final class Hand {
     }
 
     /// One wing: the moves in order, as one motion. Returns what was done, what was passed over, where it is now.
-    func wing(_ c: [String: Any], pressAllowed: (CGPoint) -> String?) -> [String: Any] {
+    func wing(_ c: [String: Any], pressAllowed: (CGPoint) -> String?, scrollAllowed: (CGPoint) -> String?) -> [String: Any] {
         let moves = c["moves"] as? [[String: Any]] ?? []
         let t0 = now()
         let coast = ((c["coast_ms"] as? NSNumber)?.doubleValue ?? 1500) / 1000
@@ -2315,15 +2890,17 @@ final class Hand {
         if let b = c["bounds"] as? [NSNumber], b.count == 4 { bounds = CGRect(x: b[0].doubleValue, y: b[1].doubleValue, width: b[2].doubleValue, height: b[3].doubleValue) } else { bounds = nil }
         livePath = c["live"] as? String
         senseUntil = t0 + 60
+        if (c["fresh"] as? Bool) == true { taken = false }
+        let wasTaken = taken
         if resting { pos = Hand.pointer() }
-        deadman = .infinity; edge = false; coasted = false
+        deadman = .infinity; fDeadman = .infinity; edge = false; coasted = false
         if let v = (c["speed"] as? NSNumber)?.doubleValue { speed = max(20, min(4000, v)) }
         lock.unlock()
         readLive()
         start()
 
         var marks: [[String: Any]] = []
-        var stopped: String? = nil
+        var stopped: String? = wasTaken ? "the user took their input back (Esc ×6)" : nil
         var inSight: [String]? = nil
         var thing: AXUIElement? = nil, thingName = ""
         var done = 0
@@ -2337,6 +2914,7 @@ final class Hand {
         func wait(_ seconds: Double, _ cond: () -> Bool) -> String? {
             let end = min(limit, now() + seconds)
             while true {
+                if locked({ taken }) { return "the user took their input back (Esc ×6)" }
                 if let b = locked({ blind }) { return "the eye went blind: \(b)" }
                 if cond() { return nil }
                 if now() > end { return now() >= limit ? "the wing ran out of time" : "it did not get there" }
@@ -2362,12 +2940,21 @@ final class Hand {
             return wait(hypot(q.x - from.x, q.y - from.y) / max(20, speed) * 4 + 2) { locked { arrived } }
         }
 
+        var skip = 0
         loop: for (i, m) in moves.enumerated() {
+            if locked({ taken }) { stopped = "the user took their input back (Esc ×6)"; break loop }
             guard let k = m["k"] as? String else { continue }
+            if skip > 0 { skip -= 1; done = i + 1; continue }
             let f = { (key: String, def: Double) -> Double in (m[key] as? NSNumber)?.doubleValue ?? def }
             let wall0 = Date().timeIntervalSince1970
             if let b = locked({ blind }) { stopped = "the eye went blind: \(b)"; break }
             if now() > limit { stopped = "the wing ran out of time"; break }
+            // Two fingers resting on the trackpad stay there through waits; anything else the hand does lifts them.
+            if !["fingers", "scroll", "lift", "rest", "settle", "speed"].contains(k), locked({ scrollOpen }) {
+                locked { fLift = true }
+                _ = wait(0.1) { locked { !scrollOpen } }
+                mark(i, "lift", wall0, "the fingers came off for \(k)")
+            }
             switch k {
             case "speed": locked { speed = max(20, min(4000, f("v", 700))) }
             case "to":
@@ -2470,33 +3057,253 @@ final class Hand {
                     buttons.remove(b)
                 }
                 mark(i, "up", wall0, describe(AXI.hit(p)).label)
-            case "scroll":
+            case "scroll", "fingers":
+                // "scroll": wheel pixels, one gesture that lands and lifts. "fingers": how far two fingers travel on
+                // the trackpad (points, y down); they stay down afterwards, so the next travel is the same gesture.
                 halt()
                 let p = here()
-                if let why = pressAllowed(p) { stopped = why.replacingOccurrences(of: "press", with: "scroll"); break loop }
-                let dy = f("dy", 0), dx = f("dx", 0), rate = max(60, f("rate", 1200)), total = hypot(dx, dy)
+                if !locked({ scrollOpen }), let why = scrollAllowed(p) { stopped = why; break loop }
+                if k == "fingers", locked({ let c = fCoasted; fCoasted = false; return c }) {
+                    mark(i, "note", wall0, "the fingers had lifted by themselves (no call came for hold_ms); this is a new touch")
+                }
+                // Something the fingers keep doing (a wave, a stir, a roam, going on one way) or stop doing (calm). It
+                // has no end, so the wing does not wait for it; with `along` the place itself travels meanwhile.
+                var alongRaw: [CGPoint]? = nil
+                if k == "fingers", let kind = m["motif"] as? String {
+                    let pace = locked { speed }, sgn = Hand.natural ? 1.0 : -1.0
+                    locked {
+                        let t = now()
+                        join(t)
+                        switch kind {
+                        case "wave":
+                            mAmpT = max(1, f("amp", 30)); mHzT = min(6.5, max(0.2, f("hz", 3))); mEllT = 0
+                            mAxT = f("deg", 0) * .pi / 180; mRoamT = 0; pOn = false
+                        case "stir":
+                            mAmpT = max(1, f("amp", 30)); mHzT = min(6.5, max(0.2, abs(f("hz", 1.5))))
+                            mEllT = f("hz", 1.5) < 0 ? -1 : 1; mRoamT = 0; pOn = false
+                        case "roam": mRoamT = max(1, f("amp", 60)); mAmpT = 0; pOn = false
+                        case "play":
+                            // Play goes on until told otherwise; said again, it only changes how they play.
+                            if let md = m["mood"] as? String, let q = Hand.moods.firstIndex(of: md) { pMood = q }
+                            if let size = (m["amp"] as? NSNumber)?.doubleValue { pSize = max(12, min(550, size)) }
+                            else if !pOn { pSize = [45.0, 60, 80][pMood] }
+                            if let dg = (m["deg"] as? NSNumber)?.doubleValue { pDir = dg * .pi / 180 + (Hand.natural ? 0 : .pi) }
+                            else if !scrollOpen { pDir = (Hand.natural ? 1 : -1) * .pi / 2 }
+                            if !pOn || m["deg"] != nil {
+                                if !pOn { pForget() }
+                                pSeed = pDir; pPlan = []; pPhrase = ""; pHoldT0 = 0; pNext = t; pOn = true
+                                // Fingers that are already down have just made their first stroke: its answer is
+                                // watched, it is not made again.
+                                if scrollOpen, m["deg"] == nil { pPhrase = "pull"; pAns = 1; pNo = 0; pPlan = [.hold(0.3, 2.0)] }
+                            }
+                            mAmpT = 0; mRoamT = 0
+                        case "go":
+                            let deg = f("deg", 90) * .pi / 180
+                            gV = CGVector(dx: cos(deg) * pace * sgn, dy: sin(deg) * pace * sgn)
+                            gT0 = t; gOn = true; gCapped = false; mAmpT = 0; mRoamT = 0; pOn = false
+                        default: mAmpT = 0; mRoamT = 0; pOn = false; pUp = false
+                        }
+                        fLift = false; fDeadman = .infinity; fCoasted = false
+                    }
+                    if let al = m["along"] as? [NSNumber], al.count == 2 {
+                        alongRaw = [.zero, CGPoint(x: al[0].doubleValue, y: al[1].doubleValue)]
+                    } else {
+                        if kind != "calm" { _ = wait(0.1) { locked { scrollOpen } } }
+                        mark(i, "scroll", wall0, describe(AXI.hit(p)).label)
+                        break
+                    }
+                }
+                // The stroke, from where the fingers are: a line, a curve through several points, a circle, a wander.
+                func rawOf(_ mm: [String: Any]) -> ([CGPoint], Double) {
+                    let g = { (key: String, def: Double) -> Double in (mm[key] as? NSNumber)?.doubleValue ?? def }
+                    var raw: [CGPoint] = [.zero]
+                    var secs = 0.0
+                    if let tr = mm["trace"] as? [[NSNumber]], tr.count > 1 {
+                        // A recorded touch ([seconds, x, y] from its start, wheel pixels): played back on its own clock.
+                        let T = max(0.05, tr.last![0].doubleValue), n = max(2, Int(T * 240))
+                        secs = T
+                        var j = 0
+                        for q in 1...n {
+                            let t = T * Double(q) / Double(n)
+                            while j < tr.count - 2, tr[j + 1][0].doubleValue < t { j += 1 }
+                            let a = tr[j], b = tr[j + 1], span = b[0].doubleValue - a[0].doubleValue
+                            let fr = span > 0 ? min(1, max(0, (t - a[0].doubleValue) / span)) : 1
+                            raw.append(CGPoint(x: a[1].doubleValue + (b[1].doubleValue - a[1].doubleValue) * fr, y: a[2].doubleValue + (b[2].doubleValue - a[2].doubleValue) * fr))
+                        }
+                    } else if let r = (mm["orbit"] as? NSNumber)?.doubleValue {
+                        // Starts sideways and comes back to where it began; turns < 0 goes the other way round.
+                        let turns = g("turns", 1), n = max(24, Int(abs(turns) * 96))
+                        for j in 1...n { let a = 2 * Double.pi * turns * Double(j) / Double(n); raw.append(CGPoint(x: r * sin(a), y: r * (1 - cos(a)))) }
+                    } else if let r = (mm["wander"] as? NSNumber)?.doubleValue {
+                        // Two slow waves per axis at unrelated rates and random phase: it roams within r of where it
+                        // began, never the same way twice, and is back there at the end.
+                        secs = max(0.3, g("ms", 1500) / 1000)
+                        func wave() -> (Double) -> Double {
+                            let f1 = Double.random(in: 0.7...1.3), f2 = Double.random(in: 1.9...2.9)
+                            let p1 = Double.random(in: 0...(2 * .pi)), p2 = Double.random(in: 0...(2 * .pi))
+                            return { t in 0.62 * sin(2 * .pi * f1 * t + p1) + 0.38 * sin(2 * .pi * f2 * t + p2) }
+                        }
+                        let wx = wave(), wy = wave(), n = Int(secs * 240)
+                        for j in 1...n { let u = Double(j) / Double(n), e = sin(.pi * u); raw.append(CGPoint(x: r * e * wx(u * secs), y: r * e * wy(u * secs))) }
+                    } else {
+                        var pts: [CGPoint] = [.zero]
+                        if let list = mm["pts"] as? [[NSNumber]] { for q in list where q.count == 2 { let l = pts.last!; pts.append(CGPoint(x: l.x + q[0].doubleValue, y: l.y + q[1].doubleValue)) } }
+                        else { pts.append(CGPoint(x: g("dx", 0), y: g("dy", 0))) }
+                        if pts.count == 2 { raw = pts } else {
+                            // Through every point without stopping at any (Catmull-Rom): corners become turns.
+                            for j in 0..<(pts.count - 1) {
+                                let p0 = pts[max(0, j - 1)], p1 = pts[j], p2 = pts[j + 1], p3 = pts[min(pts.count - 1, j + 2)]
+                                for q in 1...24 {
+                                    let t = Double(q) / 24, t2 = t * t, t3 = t2 * t
+                                    raw.append(CGPoint(x: 0.5 * (2 * p1.x + (p2.x - p0.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (3 * p1.x - p0.x - 3 * p2.x + p3.x) * t3),
+                                                       y: 0.5 * (2 * p1.y + (p2.y - p0.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (3 * p1.y - p0.y - 3 * p2.y + p3.y) * t3)))
+                                }
+                            }
+                        }
+                    }
+    return (raw, secs)
+                }
+                var (raw, wanderS) = rawOf(m)
+                if let alongRaw { raw = alongRaw }
+                let even = wanderS > 0
+                var flick = !even && (m["flick"] as? Bool) == true
+                // A recorded touch that ended at speed was a throw: the fingers leave as they left then, and what they
+                // were moving coasts on (a trackpad sends momentum after such a lift; after a stop it sends none).
+                var thrown: CGVector? = nil
+                if k == "fingers", let tr = m["trace"] as? [[NSNumber]], tr.count > 2 {
+                    let e = tr[tr.count - 1]
+                    var j = tr.count - 2
+                    while j > 0, e[0].doubleValue - tr[j][0].doubleValue < 0.04 { j -= 1 }
+                    let span = e[0].doubleValue - tr[j][0].doubleValue
+                    if span > 0.005 {
+                        let v = CGVector(dx: (e[1].doubleValue - tr[j][1].doubleValue) / span, dy: (e[2].doubleValue - tr[j][2].doubleValue) / span)
+                        if hypot(v.dx, v.dy) > 200 { thrown = v; flick = true }
+                    }
+                }
+                // Strokes written one after the other are drawn as one: the fingers do not stop between them.
+                var merged = 0
+                while k == "fingers", !even, !flick, alongRaw == nil, i + merged + 1 < moves.count {
+                    let nx = moves[i + merged + 1]
+                    guard (nx["k"] as? String) == "fingers", nx["wander"] == nil, nx["motif"] == nil else { break }
+                    let (more, _) = rawOf(nx), o = raw.last!
+                    raw += more.dropFirst().map { CGPoint(x: o.x + $0.x, y: o.y + $0.y) }
+                    flick = (nx["flick"] as? Bool) == true
+                    merged += 1
+                }
+                if k == "fingers", !Hand.natural, m["trace"] == nil { raw = raw.map { CGPoint(x: -$0.x, y: -$0.y) } }
+                var cum: [Double] = [0]
+                for j in 1..<raw.count { cum.append(cum[j - 1] + hypot(raw[j].x - raw[j - 1].x, raw[j].y - raw[j - 1].y)) }
+                let total = cum.last!
                 guard total > 0 else { break }
-                locked { scrollAcc = .zero; scrollRate = CGVector(dx: dx / total * rate, dy: dy / total * rate) }
-                let r = wait(total / rate + 0.001, { false })
-                locked { scrollRate = .zero }
-                _ = wait(0.1) { locked { !scrollOpen } }
-                mark(i, "scroll", wall0, describe(AXI.hit(p)).label)
-                if let r, !r.hasPrefix("it did not") { stopped = r; break loop }
+                // Evenly spaced along its length, so the easing below is the speed of the fingers themselves.
+                var path = raw
+                if !even {
+                    let n = max(1, Int(total.rounded(.up)))
+                    path = []
+                    var j = 0
+                    for q in 0...n {
+                        let d = total * Double(q) / Double(n)
+                        while j < raw.count - 2, cum[j + 1] < d { j += 1 }
+                        let span = cum[j + 1] - cum[j], fr = span > 0 ? (d - cum[j]) / span : 0
+                        path.append(CGPoint(x: raw[j].x + (raw[j + 1].x - raw[j].x) * fr, y: raw[j].y + (raw[j + 1].y - raw[j].y) * fr))
+                    }
+                }
+                // A hand slows into a bend and runs on the straight (speed ∝ radius^⅓, the two-thirds power law): the
+                // samples are respaced so that equal steps of time cover less of the path where it curves.
+                if k == "fingers", !even, path.count > 12 {
+                    var tau: [Double] = [0]
+                    for q in 1..<path.count {
+                        let a = path[max(0, q - 5)], b = path[q], c = path[min(path.count - 1, q + 5)]
+                        let ab = hypot(b.x - a.x, b.y - a.y), bc = hypot(c.x - b.x, c.y - b.y), ca = hypot(a.x - c.x, a.y - c.y)
+                        let area2 = abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y))
+                        let radius = area2 > 1e-6 ? ab * bc * ca / (2 * area2) : 1e6
+                        let v = min(1.3, max(0.4, pow(radius / 40, 1.0 / 3)))
+                        tau.append(tau[q - 1] + hypot(b.x - path[q - 1].x, b.y - path[q - 1].y) / v)
+                    }
+                    var out: [CGPoint] = [], j = 0
+                    let n = path.count - 1
+                    for q in 0...n {
+                        let d = tau[n] * Double(q) / Double(n)
+                        while j < n - 1, tau[j + 1] < d { j += 1 }
+                        let span = tau[j + 1] - tau[j], fr = span > 0 ? (d - tau[j]) / span : 0
+                        out.append(CGPoint(x: path[j].x + (path[j + 1].x - path[j].x) * fr, y: path[j].y + (path[j + 1].y - path[j].y) * fr))
+                    }
+                    path = out
+                }
+                let pace = k == "scroll" ? max(60, f("rate", 1200)) : locked { speed }
+                // A long stroke is made faster than a short one (time grows slower than distance), and no two take
+                // quite the same time. "scroll" stays exact and repeatable.
+                let human = 150 / pace * pow(total / 100, 0.65) * Double.random(in: 0.85...1.2)
+                let asked = alongRaw == nil ? nil : (m["ms"] as? NSNumber).map { max(0.1, $0.doubleValue / 1000) }
+                let dur = asked ?? (even ? wanderS : k == "scroll" ? max(0.08, 1.5 * total / pace) : flick ? max(0.07, human * 0.8) : max(0.12, human))
+                let a = path[path.count - 2], b = path[path.count - 1], seg = max(0.001, hypot(b.x - a.x, b.y - a.y))
+                let endVel = CGVector(dx: (b.x - a.x) / seg * 2 * total / dur, dy: (b.y - a.y) / seg * 2 * total / dur)
+                // A stroke by itself is all the fingers do (what they kept doing dies away); one that carries a wave
+                // or a stir `along` keeps it going on the way.
+                locked {
+                    let t = now()
+                    join(t)
+                    if alongRaw == nil { mAmpT = 0; mRoamT = 0 }
+                    fPath = path; fEven = even; fEndVel = thrown ?? endVel; fT0 = t; fDur = dur; fFlick = flick
+                    fLift = false; fDeadman = .infinity; fCoasted = false; fActive = true
+                    // Fingers that play are sent somewhere: they go, and play on from there (the stroke is what
+                    // they judge next, and the next plot begins before it has ended).
+                    if pOn, k == "fingers" {
+                        let e = path[path.count - 1]
+                        pDir = atan2(Double(e.y), Double(e.x)); pPhrase = "pull"; pAns = 1; pNo = 0; pRun = 1; pHoldT0 = 0; pUp = false
+                        pPlan = [.hold(0.3, 2.0)]
+                        pNext = flick || even ? t + dur : t + dur * 0.8
+                    }
+                }
+                let r = wait(dur + 0.5) { locked { !fActive } }
+                if k == "scroll" { locked { fLift = true } }
+                if k == "scroll" || flick { _ = wait(0.1) { locked { !scrollOpen } } }
+                let over = describe(AXI.hit(p)).label
+                for q in 0...merged { mark(i + q, "scroll", wall0, over) }
+                if let r { stopped = r; break loop }
+                skip = merged
+            case "lift":
+                locked { pOn = false; pUp = false }
+                if locked({ scrollOpen }) {
+                    locked { fLift = true }
+                    _ = wait(0.1) { locked { !scrollOpen } }
+                    mark(i, "lift", wall0, describe(AXI.hit(here())).label)
+                } else {
+                    let gone = locked { () -> Bool in let c = fCoasted; fCoasted = false; return c }
+                    mark(i, "note", wall0, gone ? "the fingers had already lifted by themselves (no call came for hold_ms)" : "lift: no fingers were on the trackpad")
+                }
             default: stopped = "unknown move \(k)"; break loop
             }
             done = i + 1
         }
 
         let ending = (c["end"] as? Bool) == true
-        if stopped != nil || ending { halt() }
+        if locked({ taken }) {
+            // Nothing is left pressed either.
+            let p = here()
+            for b in buttons.all {
+                post(CGEvent(mouseEventSource: src, mouseType: b == "right" ? .rightMouseUp : .leftMouseUp, mouseCursorPosition: p, mouseButton: b == "right" ? .right : .left))
+                buttons.remove(b)
+            }
+        }
+        if stopped != nil || ending {
+            locked { pOn = false; pUp = false }
+            halt()
+            if locked({ scrollOpen }) { locked { fActive = false; fFlick = false; fLift = true }; usleep(30_000) }
+        }
         if ending {
             let p = here()
             for b in buttons.all {
                 post(CGEvent(mouseEventSource: src, mouseType: b == "right" ? .rightMouseUp : .leftMouseUp, mouseCursorPosition: p, mouseButton: b == "right" ? .right : .left))
                 buttons.remove(b)
             }
-            locked { scrollRate = .zero }
         }
+        // Fingers left on the trackpad stay there while the next wing is being thought of, for `coast` at most.
+        let hold = ((c["hold_ms"] as? NSNumber)?.doubleValue).map { $0 / 1000 } ?? coast
+        let fingersDown: Bool = locked { if scrollOpen || (pOn && pUp) { fDeadman = now() + hold; return true }; return false }
+        // Play has them up for a moment (or leaving: the lift is a frame away), watching: the play is not over, but
+        // nothing is on the trackpad.
+        let lifted: Bool = locked { pOn && pUp }
         // Still flying on a heading: it keeps going while the next wing is being thought of, for `coast` at most.
         var course = CGVector.zero, pace = 0.0
         let flying: Bool = locked {
@@ -2524,7 +3331,21 @@ final class Hand {
                                 "marks": marks, "trail": tr, "trail_dropped": lost, "path_pt": length, "samples": samples,
                                 "x": p.x, "y": p.y, "vx": v.dx, "vy": v.dy, "speed": sp, "flying": flying, "edge": hitEdge,
                                 "over": under.label, "over_frame": Hand.fr(under.frame), "held": buttons.all]
+        if fingersDown { o["fingers"] = true; o["hold_ms"] = hold * 1000; if lifted { o["lifted"] = true } }
+        // The touch as it was drawn since the last reply (also while nobody was steering): points on the trackpad,
+        // from where the fingers landed, in wheel pixels as `fingers.jsonl` has the user's (`natural` says which way round).
+        lock.lock()
+        let ft = fTrace, fAt = fNow, fDoing = doing, fCap = gCapped, fFor = tEnd - fLanded
+        let plots = pLog, playing = pOn ? Hand.moods[pMood] : nil
+        fTrace = []; gCapped = false; pLog = []
+        lock.unlock()
+        if !plots.isEmpty { o["plots"] = plots }
+        if let playing { o["playing"] = playing }
+        if !ft.isEmpty { o["ftrace"] = ft.map { [$0.t, $0.x, $0.y, Double($0.n)] }; o["natural"] = Hand.natural }
+        if fingersDown { o["fpos"] = [Double(fAt.x), Double(fAt.y)]; o["doing"] = fDoing; o["touch_s"] = fFor; o["natural"] = Hand.natural }
+        if fCap { o["capped"] = gMax }
         if let stopped { o["stopped"] = stopped }
+        if locked({ taken }) { o["taken"] = true }
         if let inSight { o["in_sight"] = inSight }
         if let dark { o["blind"] = dark }
         // What it is heading into, at the pace it was given (it may still be picking that pace up).
@@ -2547,6 +3368,7 @@ final class Hand {
 //   {"op":"smart_zoom"}                              two-finger double-tap
 //   {"op":"swipe","direction":"left|right|up|down"}  navigation swipe (back / forward)
 //   {"op":"wing","moves":[…],"pid":…,"bounds":[x,y,w,h],"live":path}   one unbroken motion of many moves (see Hand)
+//   {"op":"fresh"}                                  a session begins: forget that the user took their input back
 //   {"op":"pos"}                                    current pointer position
 //   {"op":"owner","x"?,"y"?}                         topmost window under a point {pid, owner, layer, number}
 //   {"op":"inspect","x"?,"y"?,"brief"?}              AX element under a point (everything it exposes) + its window
@@ -2555,6 +3377,7 @@ final class Hand {
 //                                                   or of the single window under a point; full JSON to `out`
 // click/down and the gestures accept "require_pid": the press is refused unless that pid owns the topmost window there.
 // All events carry eventSourceUserData 0x45594521 so they pass eye-capture's input lock.
+var inputKeep: [Any] = []
 func cmdInput() {
     setvbuf(stdout, nil, _IOLBF, 0)
     let src = CGEventSource(stateID: .hidSystemState)
@@ -2574,6 +3397,12 @@ func cmdInput() {
     }
     func reply(_ o: [String: Any]) { print(json(o)) }
     let hand = Hand(buttons: buttonsDown, src: src, post: send)
+    // SIGUSR1 from the server = the user ended the lock with Esc ×6: the hand stops at once, whatever it was doing.
+    signal(SIGUSR1, SIG_IGN)
+    let tookBack = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .global(qos: .userInteractive))
+    tookBack.setEventHandler { hand.lock.lock(); hand.taken = true; hand.lock.unlock() }
+    tookBack.resume()
+    inputKeep.append(tookBack)
     /// A press with `require_pid` is only posted when that process owns the topmost window at the point.
     func pressAllowed(_ c: [String: Any], at p: CGPoint) -> String? {
         guard let want = (c["require_pid"] as? NSNumber)?.intValue else { return nil }
@@ -2589,16 +3418,58 @@ func cmdInput() {
         let got = (o?["pid"] as? NSNumber)?.intValue ?? (o?["pid"] as? Int) ?? -1
         return got == want ? nil : "REFUSED press at \(Int(p.x)),\(Int(p.y)): topmost window belongs to \(o?["owner"] ?? "nothing") (pid \(got)), not pid \(want)"
     }
+    /// A scroll goes to the window under the pointer, not to the element a click would reach: an app that draws over
+    /// the menu bar (a notch pill) owns the window there while accessibility answers with the menu bar. So a scroll
+    /// with `require_pid` is posted when that process owns either one.
+    func scrollAllowed(_ c: [String: Any], at p: CGPoint) -> String? {
+        guard let want = (c["require_pid"] as? NSNumber)?.intValue else { return nil }
+        let o = topWindow(at: p)
+        let top = (o?["pid"] as? NSNumber)?.intValue ?? (o?["pid"] as? Int) ?? -1
+        var under = "nothing", clear = false
+        if AXIsProcessTrusted(), let el = AXI.hit(p) {
+            let got = Int(AXI.pid(el))
+            if got == want { return nil }
+            under = "\(NSRunningApplication(processIdentifier: pid_t(got))?.localizedName ?? "pid \(got)")"
+            // The app's window is on top here, but is the app there? An overlay far larger than what it draws lets
+            // a touch through wherever it is clear, and the scroll lands in the app behind. The menu bar is the one
+            // place where accessibility answers for somebody else under a thing the app really draws (a notch pill).
+            var cur = el, bar = false
+            for _ in 0..<8 {
+                if let r = AXI.raw(cur, kAXRoleAttribute) as? String, r.hasPrefix("AXMenuBar") || r == "AXMenuExtra" { bar = true; break }
+                guard let up = AXI.raw(cur, kAXParentAttribute), AXI.isElement(up) else { break }
+                cur = up as! AXUIElement
+            }
+            clear = !bar
+        }
+        if top == want {
+            if !clear { return nil }
+            return "REFUSED scroll at \(Int(p.x)),\(Int(p.y)): the session's app has a window there, but it is see-through at that point and the touch would land on \(under) behind it. Go onto the thing itself first (its pill, its panel)"
+        }
+        return "REFUSED scroll at \(Int(p.x)),\(Int(p.y)): the window there belongs to \(o?["owner"] ?? "nothing") and the element to \(under), not to the session's app (pid \(want)). Move over the app first, or name the place in scroll_zones"
+    }
     while let line = readLine() {
         guard let d = line.data(using: .utf8), let c = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
               let op = c["op"] as? String else { reply(["ok": false, "error": "bad command"]); continue }
         let num = { (k: String, def: Double) -> Double in (c[k] as? NSNumber)?.doubleValue ?? def }
         let t0 = Date()
+        // The user took their input back (Esc ×6): nothing that moves, presses or scrolls is sent until a session
+        // begins anew ("fresh"); what was held is let go.
+        let takenNow = { () -> Bool in hand.lock.lock(); defer { hand.lock.unlock() }; return hand.taken }
+        if op == "fresh" { hand.lock.lock(); hand.taken = false; hand.lock.unlock(); reply(["ok": true, "op": op]); continue }
+        if ["move", "click", "down", "scroll", "pinch", "rotate", "smart_zoom", "swipe", "press", "force_click"].contains(op), takenNow() {
+            for b in buttonsDown.all {
+                let (type, btn) = mouseType(b, down: false)
+                send(CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: pointer(), mouseButton: btn))
+                buttonsDown.remove(b)
+            }
+            reply(["ok": false, "taken": true, "error": "NOT SENT: the user took their input back (Esc ×6)"]); continue
+        }
         switch op {
         case "move":
             let from = pointer(), to = CGPoint(x: num("x", from.x), y: num("y", from.y))
             let ms = num("ms", 300), steps = max(1, Int(ms / 8))
             for i in 1...steps {
+                if takenNow() { break }
                 let t = CGFloat(i) / CGFloat(steps)
                 moveEvent(CGPoint(x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t))
                 if ms > 0 { usleep(8000) }
@@ -2629,6 +3500,7 @@ func cmdInput() {
             send(CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: pointer(), mouseButton: btn))
             if op == "down" { buttonsDown.insert(b) } else { buttonsDown.remove(b) }
         case "scroll":
+            if let why = scrollAllowed(c, at: pointer()) { reply(["ok": false, "error": why]); continue }
             let dy = Int32(num("dy", 0)), dx = Int32(num("dx", 0)), n = max(1, Int(num("events", 20)))
             let iv = useconds_t(num("interval_ms", 8) * 1000), phased = (c["phased"] as? Bool) ?? true
             func post(_ phase: Int64, _ y: Int32, _ x: Int32) {
@@ -2637,26 +3509,28 @@ func cmdInput() {
                     e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
                     e.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
                 }
+                markScrollDirection(e)
                 e.location = pointer()
                 send(e)
             }
             if phased { post(1, 0, 0); usleep(iv) }
-            for _ in 0..<n { post(2, dy, dx); usleep(iv) }
+            for _ in 0..<n { if takenNow() { break }; post(2, dy, dx); usleep(iv) }
             if phased { post(4, 0, 0) }
             // Fingers lifted mid-flick: the trackpad keeps going on its own with decaying momentum events
             // (momentum phase 1 begin, 2 continue, 3 end; scroll phase 0), which is what flings, rubber-banding
             // and page swipes react to.
-            if phased, (c["momentum"] as? Bool) == true {
+            if phased, (c["momentum"] as? Bool) == true, !takenNow() {
                 func mom(_ phase: Int64, _ y: Int32, _ x: Int32) {
                     guard let e = CGEvent(scrollWheelEvent2Source: src, units: .pixel, wheelCount: 2, wheel1: y, wheel2: x, wheel3: 0) else { return }
                     e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
                     e.setIntegerValueField(.scrollWheelEventMomentumPhase, value: phase)
+                    markScrollDirection(e)
                     e.location = pointer()
                     send(e)
                 }
                 var vy = Double(dy), vx = Double(dx), first = true
                 let decay = num("decay", 0.94)
-                while abs(vy) >= 1 || abs(vx) >= 1 {
+                while abs(vy) >= 1 || abs(vx) >= 1, !takenNow() {
                     vy *= decay; vx *= decay
                     mom(first ? 1 : 2, Int32(vy.rounded()), Int32(vx.rounded())); first = false
                     usleep(8333)
@@ -2699,8 +3573,10 @@ func cmdInput() {
                 let scale = num("scale", 1.5)
                 guard scale > 0 else { reply(["ok": false, "error": "pinch: scale must be > 0"]); continue }
                 gesture(8, 1) { $0.setDoubleValueField(CGEventField(rawValue: 113)!, value: 0) }
+                // Esc ×6 in the middle: no more of it, but the gesture is ended, never left open.
                 for w in weights() {
                     usleep(frame)
+                    if takenNow() { break }
                     let m = exp(log(scale) * w) - 1
                     gesture(8, 2) { $0.setDoubleValueField(CGEventField(rawValue: 113)!, value: m) }
                 }
@@ -2713,6 +3589,7 @@ func cmdInput() {
                 gesture(5, 1)
                 for w in weights() {
                     usleep(frame)
+                    if takenNow() { break }
                     gesture(5, 2) { $0.setDoubleValueField(CGEventField(rawValue: 114)!, value: -deg * w) }
                 }
                 usleep(frame)
@@ -2779,18 +3656,20 @@ func cmdInput() {
             force(1, 0)
             let dn = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: p, mouseButton: .left)
             dn?.setIntegerValueField(.mouseEventClickState, value: 1); send(dn)
-            for i in 1...steps { usleep(frame); force(2, at(i)) }
+            // Esc ×6 in the middle: the pressure stops rising, the press is ended and the button let go.
+            var cut = false
+            for i in 1...steps { usleep(frame); if takenNow() { cut = true; break }; force(2, at(i)) }
             usleep(frame)
             force(4, 0)
             let upE = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: p, mouseButton: .left)
             upE?.setIntegerValueField(.mouseEventClickState, value: 1); send(upE)
             reply(["ok": true, "op": op, "x": p.x, "y": p.y, "ms": Int(Date().timeIntervalSince(t0) * 1000),
-                   "peak_force": curve.max() ?? 0, "force_clicked": maxStage == 2]); continue
+                   "peak_force": curve.max() ?? 0, "force_clicked": maxStage == 2, "taken": cut]); continue
         case "pos": break
         case "wing":
             // One unbroken motion made of many moves (see Hand). The hand goes on living between wings.
             if !AXIsProcessTrusted() { reply(["ok": false, "error": "Accessibility permission missing for the host app"]); continue }
-            reply(hand.wing(c) { p in pressAllowed(c, at: p) }); continue
+            reply(hand.wing(c, pressAllowed: { p in pressAllowed(c, at: p) }, scrollAllowed: { p in scrollAllowed(c, at: p) })); continue
         case "raise": reply(Win.raiseOp(c)); continue
         case "restore": reply(Win.restoreOp(c)); continue
         case "inspect":
@@ -3225,6 +4104,34 @@ func cmdWatch() {
 ///   SkyLight (private, looked up at run time; a symbol that is gone is simply not reported)
 ///                     the window server's count of display updates, and the display's refresh period right now
 var vitalsTimer: DispatchSourceTimer?
+/// `fingers --out FILE [--seconds N]`: what the user's own fingers do on the trackpad, one line per scroll event
+/// (t = mach seconds, ph / mo = scroll and momentum phase, dx dy = pixels, x y = where the pointer was). It only
+/// listens, and leaves out the events the-eye itself posts.
+var fingersOut: FileHandle? = nil
+func cmdFingers() {
+    guard let outPath = opt("out") else { fail("fingers --out FILE [--seconds N]") }
+    FileManager.default.createFile(atPath: outPath, contents: nil)
+    guard let out = FileHandle(forWritingAtPath: outPath) else { fail("cannot write \(outPath)") }
+    fingersOut = out
+    let cb: CGEventTapCallBack = { _, type, e, _ in
+        guard type == .scrollWheel, e.getIntegerValueField(.eventSourceUserData) != eyeTag else { return Unmanaged.passUnretained(e) }
+        let line = String(format: "{\"t\":%.5f,\"ph\":%lld,\"mo\":%lld,\"dx\":%lld,\"dy\":%lld,\"x\":%.1f,\"y\":%.1f}\n",
+                          machSeconds(mach_absolute_time()), e.getIntegerValueField(.scrollWheelEventScrollPhase), e.getIntegerValueField(.scrollWheelEventMomentumPhase),
+                          e.getIntegerValueField(.scrollWheelEventPointDeltaAxis2), e.getIntegerValueField(.scrollWheelEventPointDeltaAxis1), e.location.x, e.location.y)
+        fingersOut?.write(line.data(using: .utf8)!)
+        return Unmanaged.passUnretained(e)
+    }
+    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+                                      eventsOfInterest: CGEventMask(1 << CGEventType.scrollWheel.rawValue), callback: cb, userInfo: nil) else {
+        fail("cannot listen to the trackpad (Accessibility / Input Monitoring permission missing for the host app)")
+    }
+    CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
+    CGEvent.tapEnable(tap: tap, enable: true)
+    let secs = opt("seconds").flatMap(Double.init) ?? 600
+    DispatchQueue.main.asyncAfter(deadline: .now() + secs) { exit(0) }
+    CFRunLoopRun()
+}
+
 func cmdVitals() {
     guard let pid = opt("pid").flatMap(Int32.init), let outPath = opt("out") else { fail("vitals --pid PID --out FILE [--seconds N] [--every 0.05]") }
     FileManager.default.createFile(atPath: outPath, contents: nil)
@@ -3280,10 +4187,12 @@ func cmdVitals() {
 
 switch sub {
 case "vitals": cmdVitals()
+case "fingers": cmdFingers()
 case "input": cmdInput()
 case "displays": Task { await cmdDisplays() }
 case "snapshot": Task { await cmdSnapshot() }
 case "raw": cmdRaw()
+case "draw": cmdDraw()
 case "capture": Task { await cmdCapture() }
 case "lock": cmdLock()
 case "watch": cmdWatch()

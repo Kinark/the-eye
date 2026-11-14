@@ -17,7 +17,7 @@ final class V: NSView {
     override func rotate(with e: NSEvent) { log("rotate", e, ["r": e.rotation]) }
     override func smartMagnify(with e: NSEvent) { log("smartMagnify", e) }
     override func swipe(with e: NSEvent) { log("swipe", e, ["dx": e.deltaX, "dy": e.deltaY]) }
-    override func scrollWheel(with e: NSEvent) { log("scroll", e, ["dx": e.scrollingDeltaX, "dy": e.scrollingDeltaY, "precise": e.hasPreciseScrollingDeltas]) }
+    override func scrollWheel(with e: NSEvent) { log("scroll", e, ["dx": e.scrollingDeltaX, "dy": e.scrollingDeltaY, "precise": e.hasPreciseScrollingDeltas, "inv": e.isDirectionInvertedFromDevice]) }
     override func beginGesture(with e: NSEvent) { log("beginGesture", e) }
     override func endGesture(with e: NSEvent) { log("endGesture", e) }
     override func rightMouseDown(with e: NSEvent) { log("rightMouseDown", e) }
