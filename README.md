@@ -266,6 +266,18 @@ timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` 
   `eye_act` / `eye_record` does not attach the observer; fps on the fixture reads the same with and without it.
   Test: `node test/said-e2e.mjs` (the fixture changes a value in its action and announces 200ms later; both are
   200ms gap between them reads 207–208ms).
+- **Under the pixels, as root.** When `sudo` runs `dtrace` and `powermetrics` without a password, a recording of an
+  app also reads what no screen recording can: every Core Animation commit of the app (when it ended and how long
+  it held the main thread), every frame the window server handed to the display (`under.txt`), and the CPU time of
+  the app and of the window server plus GPU and CPU power, ten times a second (`cost.jsonl`). The report says under
+  a freeze **who was late** (`the app was late: it committed nothing to Core Animation for 149ms`, or the app kept
+  committing and no frame reached the display), tells per motion whether the app drives it frame by frame or
+  committed once and left it to the window server, and prices moving against rest. No probe, any app, release
+  builds included. Nothing asks for a password: without the rule the readings are simply absent. The rule:
+  `<you> ALL=(root) NOPASSWD: /usr/sbin/dtrace, /usr/bin/powermetrics` in `/etc/sudoers.d/the-eye`
+  (`sudo visudo -f /etc/sudoers.d/the-eye`). `root:false` on `eye_record` / `eye_act` leaves them out. The frame
+  count is the whole display's, so it can convict the window server but not clear it for one window; Apple silicon
+  reports no per-process GPU time, so the GPU is told as power for the whole machine.
 - **The probe reaches any app when SIP is off.** With System Integrity Protection on, `eye_probe` needs a debuggable
   build signed by a certificate in your keychain. With it off the debugger may attach to anything, and the probe
   (built arm64 + arm64e, signed ad hoc when the app is someone else's) loads into release builds, hardened and

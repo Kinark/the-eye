@@ -8,6 +8,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+const AS_ROOT = spawnSync("/usr/bin/sudo", ["-n", "-l", "/usr/sbin/dtrace"], { stdio: "ignore" }).status === 0;
 import { join } from "node:path";
 
 const ROOT = new URL("..", import.meta.url).pathname;
@@ -52,6 +53,13 @@ try {
     want("the freeze was noticed", /(FROZE|HUNG) \d/.test(act.t));
     want("the cause is the main thread", /main thread was blocked/.test(act.t));
     want("the culprit is named", /Model\.reload/.test(act.t));
+    // As root (only when sudo runs dtrace without a password): the same freeze, read from the app's commits alone.
+    if (AS_ROOT) {
+      const quiet = Number(act.t.match(/the app was late: it committed nothing to Core Animation for ([\d.]+)ms/)?.[1]);
+      want(`dtrace agrees without the probe: no commit for ${quiet}ms of the 150ms block`, Math.abs(quiet - 150) <= 25);
+      want("commits and display frames are counted for the motion", /under the pixels[\s\S]*the app committed \d+×[\s\S]*the display got \d+ frames/.test(act.t));
+      want("moving is priced against rest", /cost while moving: app \d+ ms\/s CPU[\s\S]*cost at rest/.test(act.t));
+    } else console.log("skip root readings (sudo -n dtrace is not allowed here)");
   } else want("a clean run has no freeze and no blocked main thread", /LOOKED (SMOOTH|MOSTLY SMOOTH)/.test(act.t) && !/FROZE|HUNG|main thread was blocked/.test(act.t));
   want("the press was timed", /answered [\d.]+ms after click "Go"/.test(act.t) || /first visible change/.test(act.t));
 

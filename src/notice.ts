@@ -13,13 +13,17 @@ import { correlation, track } from "./track.ts";
 export type Percept = { t: number; sev: 0 | 1 | 2 | 3; kind: string; text: string; from?: number; to?: number; why?: string[]; more?: string[] };
 export type Seen = { grade: "still" | "smooth" | "minor" | "rough" | "broken"; verdict: string; percepts: Percept[];
   /** What the app told accessibility meanwhile, in order, each placed against the steps and the motion. */
-  said?: { from: number; lines: string[]; silent?: string } };
+  said?: { from: number; lines: string[]; silent?: string };
+  /** Root readings (dtrace, powermetrics) told against the motions. */
+  under?: string[] };
 
 /** One thing the app told accessibility while it was recorded (run clock; `n` changes between `t` and `last`). */
 export type Said = { t: number; last: number; n: number; event: string; text: string; el?: number; value?: string; head?: string };
 export type Heard = { from: number; app: string; events: Said[] };
 
 /** One main-thread stall measured inside the app by the probe's watchdog (mach seconds). */
+import { loadUnder, underLines, whoWasLate } from "./under.ts";
+
 export type Stall = { t: number; ms: number; n: number; ongoing?: boolean; app: [string, number][]; leaf: [string, number][]; stack: string[] };
 export type Stalls = { name: string; pid: number; from: number; to: number; threshold_ms: number; stacks: boolean; stalls: Stall[] };
 type Action = { t0: number; t1: number; op: string; note?: string; ok?: boolean };
@@ -134,6 +138,9 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
   const actions = o.dir ? loadActions(o.dir, t0Wall).filter((x) => inWin({ t: x.t0 } as Row)) : [];
   const heard = o.dir ? loadSaid(o.dir, t0Wall) : null;
   const said = heard ? heard.events.filter((e) => inWin({ t: e.t } as Row)) : [];
+  const under = o.dir ? loadUnder(o.dir, t0Wall) : null;
+  /** The probe says what held the main thread; the root readings say whether it was the app or the window server. */
+  const whyFroze = (from: number, to: number) => { const w = whyGap(stalls, t0Mach, from, to), late = under ? whoWasLate(under, from, to, period) : undefined; return late ? [...w, late] : w; };
   const P: Percept[] = [];
   const key = a.extent_source === "top-anchored" ? (["aw", "ah"] as const) : (["w", "h"] as const);
   const dimName = ["width", "height"];
@@ -173,7 +180,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
       && complete.every((r) => r.t <= prevEnd!.end + 1e-6 || r.t >= s.start_s - 1e-6 || r.interval >= 2.9 * period);
     if (prevEnd && prevEnd.atSpeed && starved && gapMs <= 1500
       && (prevEnd.dir === 0 || (prevEnd.d === d && prevEnd.dir === startDir))) {
-      const why = whyGap(stalls, t0Mach, prevEnd.end, s.start_s);
+      const why = whyFroze(prevEnd.end, s.start_s);
       // Certain when the edge carried on the same way, or when the app's own main thread was blocked right then.
       const sev = prevEnd.dir !== 0 || why.some((w) => /blocked/.test(w)) ? sevOf(gapMs) : 1;
       P.push({ t: prevEnd.end, from: prevEnd.end, to: s.start_s, sev, kind: "freeze",
@@ -198,7 +205,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
       const from = r.t - total / 1000;
       P.push({ t: from, from, to: r.t, sev, kind: "freeze",
         text: `${word(sev)} ${ms(total)} (${Math.round(total / period)} refreshes with no new image) at ${at(from)}, ${Math.round((100 * (from - s.start_s)) / Math.max(1e-3, s.end_s - s.start_s))}% into ${name}${caught}`,
-        why: whyGap(stalls, t0Mach, from, r.t) });
+        why: whyFroze(from, r.t) });
     }
     {
       const tail = steps.slice(-3), fracs = fr.map((r) => r.frac);
@@ -414,7 +421,8 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
     silent: !said.length && answered > 0 && actions.some((x) => x.t0 >= heard.from)
       ? `${heard.app || "the app"} told accessibility nothing while this happened (no value, focus, window, sheet, menu or announcement event): whatever the steps changed, assistive technology was not told` : undefined,
   } : undefined;
-  return { grade, verdict, percepts: P, said: toldOf };
+  const told = under ? underLines(under, a.segments, period) : [];
+  return { grade, verdict, percepts: P, said: toldOf, under: told.length ? told : undefined };
 }
 
 /** Verdict, then what was noticed (worst first, causes indented under each), then the plain facts. */
@@ -436,5 +444,6 @@ export function formatSeen(s: Seen, max = 10): string {
     for (const l of s.said.lines.slice(0, n)) L.push(`  ${l}`);
     if (s.said.lines.length > n) L.push(`  … ${s.said.lines.length - n} more (events.jsonl in the run folder; eye_report view:"explain" lists them all)`);
   } else if (s.said?.silent) L.push(`· ${s.said.silent}`);
+  if (s.under?.length) { L.push("under the pixels (as root: dtrace, powermetrics):"); for (const l of s.under) L.push(`  ${l}`); }
   return L.join("\n");
 }
