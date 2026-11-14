@@ -1,65 +1,207 @@
 // One-at-a-time rules.
-// 1. Driver lease: several MCP clients (OpenCode sessions) each start their own the-eye server, but there is one
-//    screen, one pointer and one keyboard. Tools that drive or own them (eye_act, eye_lock, eye_record, eye_probe)
-//    take a lease in a shared file; another live server's call is refused until the lease is released or expires.
-//    Read-only tools (status, inspect, snapshot, peek, report, stop) never need it.
+// 1. Driver turn: several MCP clients (Claude Code, OpenCode sessions) each start their own the-eye server, but there
+//    is one screen, one pointer and one keyboard. Tools that drive or own them (eye_act, eye_glance, eye_lock,
+//    eye_record, eye_probe, eye_app) take turns through a lease in a shared file. A call that finds another server
+//    mid-turn joins a FIFO queue and waits inside the server, so the agent gets its real result instead of a "BUSY,
+//    retry" it has to babysit. An idle holder (between its agent's calls) hands over at once when someone is waiting;
+//    a busy one (call in flight, lock, recording, probe) finishes first. Read-only tools never queue.
 // 2. Single app instance: two copies of the app under test (an Xcode run + an `open`, a stale launch) both draw on
 //    screen and both answer AX, so presses, probes and measurements hit the wrong one. Targets are checked first.
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync, watch as fsWatch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
-const DIR = join(homedir(), "Library", "Caches", "the-eye");
+const DIR = process.env.THE_EYE_LEASE_DIR || join(homedir(), "Library", "Caches", "the-eye");
 const LEASE = join(DIR, "driver.json");
-/** How long a lease outlives its last driving call (keeps it between an agent's calls). */
+const QUEUE = join(DIR, "queue");
+const MUTEX = join(DIR, "driver.lock");
+/** How long an idle lease outlives its last driving call when nobody is waiting (keeps an agent's calls together). */
 const IDLE_MS = 60_000;
+/** Longest a call waits in the queue before answering anyway (MCP clients commonly time out at 60s). */
+const MAX_WAIT_MS = Number(process.env.EYE_QUEUE_WAIT_MS) || 45_000;
+/** A call that gave up waiting keeps its place this long, so calling again doesn't go to the back. */
+const KEEP_PLACE_MS = 20_000;
 
-type Lease = { pid: number; cwd: string; tool: string; since: number; expires: number };
+type Lease = { pid: number; cwd: string; tool: string; since: number; expires: number; busy?: boolean };
+type Ticket = { pid: number; cwd: string; tool: string; since: number; expires: number };
 
 const aliveP = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
-function readLease(): Lease | null {
-  try { return JSON.parse(readFileSync(LEASE, "utf8")); } catch { return null; }
+const readJson = <T,>(f: string): T | null => { try { return JSON.parse(readFileSync(f, "utf8")); } catch { return null; } };
+function writeJson(f: string, v: unknown) {
+  const tmp = `${f}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(v));
+  renameSync(tmp, f);
 }
-function writeLease(l: Lease) {
-  mkdirSync(DIR, { recursive: true });
-  const tmp = `${LEASE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(l));
-  renameSync(tmp, LEASE);
-}
-const heldByOther = (l: Lease | null): l is Lease => !!l && l.pid !== process.pid && l.expires > Date.now() && aliveP(l.pid);
-const ago = (t: number) => `${Math.round((Date.now() - t) / 1000)}s ago`;
-const describe = (l: Lease) => `the-eye server pid ${l.pid} (session in ${l.cwd}), driving since ${ago(l.since)} via ${l.tool}, lease ends in ${Math.max(0, Math.round((l.expires - Date.now()) / 1000))}s unless renewed`;
+const readLease = () => readJson<Lease>(LEASE);
+const live = (l: { pid: number; expires: number } | null): boolean => !!l && l.expires > Date.now() && aliveP(l.pid);
+/** Older the-eye servers write no busy flag: treat them as busy until their lease runs out. */
+const yields = (l: Lease) => l.busy === false;
 
-/** Take or renew the lease. Returns an error message when another live server holds it. */
-export function claimDriver(tool: string, retry = true): string | null {
-  const cur = readLease();
-  if (heldByOther(cur)) {
-    return `BUSY: another agent session is driving the screen — ${describe(cur)}. Wait for it to finish (retry later), or ask the user. Read-only tools (eye_inspect, eye_snapshot, eye_status, eye_report) still work.`;
+const nap = new Int32Array(new SharedArrayBuffer(4));
+/** Cross-process critical section (mkdir is atomic). Every op inside is a few small file reads/writes. */
+function locked<T>(f: () => T): T {
+  mkdirSync(QUEUE, { recursive: true });
+  let got = false;
+  for (let i = 0; i < 500 && !got; i++) {
+    try { mkdirSync(MUTEX); got = true; } catch (e: any) {
+      if (e?.code !== "EEXIST") break;
+      try { if (Date.now() - statSync(MUTEX).mtimeMs > 2000) { rmdirSync(MUTEX); continue; } } catch {}
+      Atomics.wait(nap, 0, 0, 2);
+    }
   }
-  const own = cur as Lease | null;
-  const mine = own && own.pid === process.pid && own.expires > Date.now() ? own : null;
-  writeLease({ pid: process.pid, cwd: process.cwd(), tool, since: mine?.since ?? Date.now(), expires: Date.now() + IDLE_MS });
-  const check = readLease(); // two servers writing in the same instant: the rename that landed last wins
-  if (check?.pid === process.pid) return null;
-  return retry ? claimDriver(tool, false) : `could not take the driver lease (${LEASE})`;
+  try { return f(); } finally { if (got) try { rmdirSync(MUTEX); } catch {} }
 }
 
-/** Keep the lease alive while this server still has something running (recording, lock, probe). */
-export function startLeaseHeartbeat(busy: () => boolean) {
-  const t = setInterval(() => {
+const ticketFile = (pid = process.pid) => join(QUEUE, `${pid}.json`);
+function tickets(): Ticket[] {
+  let names: string[] = [];
+  try { names = readdirSync(QUEUE).filter((n) => /^\d+\.json$/.test(n)); } catch {}
+  const out: Ticket[] = [];
+  for (const n of names) {
+    const t = readJson<Ticket>(join(QUEUE, n));
+    if (t && live(t)) out.push(t);
+    else try { unlinkSync(join(QUEUE, n)); } catch {}
+  }
+  return out.sort((a, b) => a.since - b.since || a.pid - b.pid);
+}
+const dropTicket = () => { try { unlinkSync(ticketFile()); } catch {} };
+
+let inFlight = 0;
+let holding: () => boolean = () => false;
+const busyNow = () => inFlight > 0 || holding();
+
+const secs = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
+const ago = (t: number) => `${secs(Date.now() - t)} ago`;
+const who = (x: { pid: number; cwd: string }) => `the-eye server pid ${x.pid} (session in ${x.cwd})`;
+const describe = (l: Lease) =>
+  `${who(l)}, driving since ${ago(l.since)}, last via ${l.tool}, ${l.busy === undefined ? `older the-eye: holds until its lease ends in ${secs(l.expires - Date.now())}` : l.busy ? "mid-turn" : "idle"}`;
+
+/** One attempt: take or renew the lease if it's ours to take. Called under the mutex. */
+function tryTake(tool: string): boolean {
+  const cur = readLease();
+  const now = Date.now();
+  if (cur && cur.pid === process.pid && live(cur)) {
+    writeJson(LEASE, { ...cur, tool, busy: true, expires: now + IDLE_MS });
+    return true;
+  }
+  if (cur && live(cur) && !yields(cur)) return false;
+  const head = tickets()[0];
+  if (head && head.pid !== process.pid) return false;
+  writeJson(LEASE, { pid: process.pid, cwd: process.cwd(), tool, since: now, expires: now + IDLE_MS, busy: true } satisfies Lease);
+  dropTicket();
+  return true;
+}
+
+type Extra = {
+  signal?: AbortSignal;
+  _meta?: { progressToken?: string | number };
+  sendNotification?: (n: { method: "notifications/progress"; params: { progressToken: string | number; progress: number; total?: number; message?: string } }) => Promise<void>;
+};
+
+/** Wait for this server's turn at the screen. Resolves null once it's ours, or a message to hand back instead. */
+async function takeTurn(tool: string, extra?: Extra): Promise<string | null> {
+  if (locked(() => tryTake(tool))) { inFlight++; return null; }
+  const t0 = Date.now();
+  const mine = () => readJson<Ticket>(ticketFile());
+  const enqueue = () => locked(() => {
+    const prev = mine();
+    const since = prev && live(prev) ? prev.since : Date.now();
+    writeJson(ticketFile(), { pid: process.pid, cwd: process.cwd(), tool, since, expires: Date.now() + KEEP_PLACE_MS } satisfies Ticket);
+  });
+  enqueue();
+  let wake: () => void = () => {};
+  const watchers = [LEASE, QUEUE].flatMap((p) => { try { return [fsWatch(p === LEASE ? DIR : p, () => wake())]; } catch { return []; } });
+  const onAbort = () => wake();
+  extra?.signal?.addEventListener("abort", onAbort);
+  let lastNote = 0;
+  try {
+    for (;;) {
+      if (extra?.signal?.aborted) { locked(dropTicket); return "cancelled while queued for the screen; nothing was done"; }
+      if (locked(() => tryTake(tool))) { inFlight++; return null; }
+      const waited = Date.now() - t0;
+      const line = () => {
+        const q = tickets(), pos = q.findIndex((t) => t.pid === process.pid) + 1;
+        const l = readLease();
+        return { pos, of: q.length, holder: l && live(l) ? describe(l) : "nobody (handing over)" };
+      };
+      if (waited >= MAX_WAIT_MS) {
+        const s = line();
+        return `QUEUED, not run: waited ${secs(waited)} for the screen and it is still taken — ${s.holder}. You are #${s.pos || 1} in line; ` +
+          `call again within ${secs(KEEP_PLACE_MS)} to keep your place (it waits up to ${secs(MAX_WAIT_MS)} more). Nothing was done. ` +
+          `Read-only tools (eye_inspect, eye_snapshot, eye_status, eye_report, eye_peek) work meanwhile.`;
+      }
+      enqueue(); // refresh our place (expires) while we're actually waiting
+      if (extra?._meta?.progressToken !== undefined && extra.sendNotification && Date.now() - lastNote >= 2000) {
+        lastNote = Date.now();
+        const s = line();
+        extra.sendNotification({ method: "notifications/progress", params: {
+          progressToken: extra._meta.progressToken, progress: waited, total: MAX_WAIT_MS,
+          message: `queued for the screen: #${s.pos} of ${s.of}, behind ${s.holder}`,
+        } }).catch(() => {});
+      }
+      await new Promise<void>((r) => { const t = setTimeout(r, 1000); wake = () => { clearTimeout(t); r(); }; });
+    }
+  } finally {
+    for (const w of watchers) w.close();
+    extra?.signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+/** Write our current busy state into the lease (if it's still ours). */
+function settleLease() {
+  locked(() => {
     const cur = readLease();
-    if (cur?.pid === process.pid && busy()) writeLease({ ...cur, expires: Math.max(cur.expires, Date.now() + 15_000) });
-  }, 5000);
+    if (cur?.pid !== process.pid) return;
+    const busy = busyNow();
+    writeJson(LEASE, { ...cur, busy, expires: busy ? Math.max(cur.expires, Date.now() + 15_000) : Math.max(cur.expires, Date.now() + IDLE_MS) });
+  });
+}
+
+/**
+ * Wrap a tool handler that drives the screen: it waits its turn (FIFO across every the-eye server), runs, then
+ * marks the lease idle so a waiting session can go. `tool` may be a function returning null for calls that only
+ * read (e.g. eye_app list, eye_lock release) — those run straight away.
+ */
+export function driving<P, R extends { content: any[]; isError?: boolean }>(
+  tool: string | ((p: P) => string | null), fail: (t: string) => R, fn: (p: P, extra: any) => Promise<R>,
+) {
+  return async (p: P, extra: any): Promise<R> => {
+    const name = typeof tool === "string" ? tool : tool(p);
+    if (!name) return fn(p, extra);
+    const t0 = Date.now();
+    const refused = await takeTurn(name, extra);
+    if (refused) return fail(refused);
+    const waited = Date.now() - t0;
+    let r: R;
+    try { r = await fn(p, extra); } finally { inFlight--; settleLease(); }
+    const notes: string[] = [];
+    if (waited >= 500) notes.push(`(waited ${(waited / 1000).toFixed(1)}s in the queue for another session's turn first)`);
+    const others = tickets().filter((t) => t.pid !== process.pid);
+    if (others.length) {
+      notes.push(`⏳ ${others.length} other session${others.length > 1 ? "s are" : " is"} queued for the screen (${others.map((t) => `pid ${t.pid} via ${t.tool}`).join(", ")}). ` +
+        (holding() ? "They wait until your lock / recording / probe ends — end it as soon as you can." : "Your turn passes to them now; your next driving call queues behind them."));
+    }
+    if (notes.length && Array.isArray(r?.content)) r = { ...r, content: [...r.content, { type: "text", text: notes.join("\n") }] };
+    return r;
+  };
+}
+
+/** Keep the lease's busy flag honest while this server has something running (recording, lock, probe). */
+export function startLeaseHeartbeat(busy: () => boolean) {
+  holding = busy;
+  const t = setInterval(() => { if (readLease()?.pid === process.pid) settleLease(); }, 2000);
   t.unref();
 }
 export function releaseDriver() {
-  try { if (readLease()?.pid === process.pid) unlinkSync(LEASE); } catch {}
+  try { locked(() => { if (readLease()?.pid === process.pid) unlinkSync(LEASE); dropTicket(); }); } catch {}
 }
 export function driverStatus(): string {
   const l = readLease();
-  if (!l || l.expires <= Date.now() || !aliveP(l.pid)) return "driver lease: free";
-  return l.pid === process.pid ? `driver lease: this session (since ${ago(l.since)})` : `driver lease: ${describe(l)}`;
+  const q = tickets();
+  const queue = q.length ? `\nqueue: ${q.map((t, i) => `#${i + 1} ${t.pid === process.pid ? "this session" : who(t)} via ${t.tool}, waiting ${secs(Date.now() - t.since)}`).join("; ")}` : "";
+  if (!l || !live(l)) return `driver lease: free${queue}`;
+  return (l.pid === process.pid ? `driver lease: this session (since ${ago(l.since)}, ${busyNow() ? "mid-turn" : "idle"})` : `driver lease: ${describe(l)}`) + queue;
 }
 
 // ---- single app instance
@@ -150,7 +292,7 @@ function pick(all: Proc[], proc: string | number): Proc | undefined {
 }
 
 export type InstancePolicy = "ask" | "quit_others" | "relaunch" | "allow";
-export type InstanceCheck = { ok: boolean; pid?: number; note?: string; error?: string };
+export type InstanceCheck = { ok: true; pid?: number; note?: string } | { ok: false; error: string; pid?: number; note?: string };
 const line = (p: Proc, mark = "") => `  pid ${p.pid}  ${p.name}  started ${fmtAge(p.elapsed)} ago  ${p.app}${mark}`;
 
 /** Every running member of `proc`'s family (the target first), or null when nothing matches. */

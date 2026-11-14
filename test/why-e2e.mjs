@@ -1,0 +1,65 @@
+// node test/why-e2e.mjs [jank_ms] — the whole loop on a real screen: act, see, and be told why.
+// Builds test/fixtures/janky.swift as a debuggable app (ad-hoc signed, get-task-allow), loads the probe into it,
+// presses its button with eye_act (NO eye_record: eye_act watches the window by itself) and checks that the
+// reply names the freeze AND the function that blocked the main thread.
+// TAKES THE REAL INPUT LOCK for a few seconds (countdown, orange overlay; Esc ×6 releases).
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const ROOT = new URL("..", import.meta.url).pathname;
+const jank = process.argv[2] ?? "140";
+const dir = mkdtempSync(join(tmpdir(), "eye-janky-"));
+const appDir = join(dir, "Janky.app"), exe = join(appDir, "Contents", "MacOS", "Janky");
+mkdirSync(join(appDir, "Contents", "MacOS"), { recursive: true });
+writeFileSync(join(appDir, "Contents", "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>the-eye.fixture.janky</string><key>CFBundleName</key><string>Janky</string>
+<key>CFBundleExecutable</key><string>Janky</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>`);
+const ent = join(dir, "ent.plist");
+writeFileSync(ent, `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>`);
+const sh = (cmd, args) => { const r = spawnSync(cmd, args, { encoding: "utf8" }); if (r.status !== 0) { console.error(`${cmd} failed:\n${r.stderr}`); process.exit(2); } };
+sh("swiftc", ["-Onone", "-g", join(ROOT, "test", "fixtures", "janky.swift"), "-o", exe]);
+sh("codesign", ["-f", "-s", "-", "--entitlements", ent, appDir]);
+
+const app = spawn(exe, [], { stdio: "ignore", env: { ...process.env, JANK_MS: jank } });
+const client = new Client({ name: "why-e2e", version: "1" });
+await client.connect(new StdioClientTransport({ command: "node", args: [join(ROOT, "src", "index.ts")] }));
+const call = async (name, args) => {
+  const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 120_000 });
+  const t = r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+  console.log(`\n=== ${name} ${JSON.stringify(args)}${r.isError ? "  [ERROR]" : ""}\n${t}`);
+  return { t, err: !!r.isError };
+};
+let failed = 0;
+const want = (what, ok) => { console.log(`${ok ? "ok  " : "FAIL"} ${what}`); if (!ok) failed++; };
+try {
+  await new Promise((r) => setTimeout(r, 1500));
+  const tree = await call("eye_inspect", { process: String(app.pid) });
+  const m = tree.t.match(/Button "Go"[^\[]*\[(-?\d+),(-?\d+) (\d+)×(\d+)\]/);
+  want("found the Go button in the AX tree", !!m);
+  if (!m) throw new Error("no button");
+  const x = Number(m[1]) + Number(m[3]) / 2, y = Number(m[2]) + Number(m[4]) / 2;
+
+  const probe = await call("eye_probe", { process: app.pid, max_seconds: 60 });
+  want("probe loaded and recording", !probe.err && /recording layers/.test(probe.t));
+
+  const act = await call("eye_act", { target_process: app.pid, front: true, steps: [{ op: "click", x, y, note: "Go" }] });
+  want("eye_act watched the window by itself", /WHAT IT LOOKED LIKE/.test(act.t));
+  if (Number(jank) >= 100) {
+    want("the freeze was noticed", /(FROZE|HUNG) \d/.test(act.t));
+    want("the cause is the main thread", /main thread was blocked/.test(act.t));
+    want("the culprit is named", /Model\.reload/.test(act.t));
+  } else want("a clean run has no freeze and no blocked main thread", /LOOKED (SMOOTH|MOSTLY SMOOTH)/.test(act.t) && !/FROZE|HUNG|main thread was blocked/.test(act.t));
+  want("the press was timed", /answered [\d.]+ms after click "Go"/.test(act.t) || /first visible change/.test(act.t));
+
+  const stop = await call("eye_stop", {});
+  if (Number(jank) >= 100) want("the probe report lists the stall", /main-thread stalls/.test(stop.t) && /Model\.reload/.test(stop.t));
+  const ex = await call("eye_report", { view: "explain" });
+  if (Number(jank) >= 100) want("explain (default: the last run) ties the gap to the stall", /main thread was blocked/.test(ex.t));
+} catch (e) { console.error(e); failed++; }
+finally { app.kill("SIGKILL"); await client.close(); }
+console.log(failed ? `\n${failed} FAILED` : "\nall checks pass");
+process.exit(failed ? 1 : 0);

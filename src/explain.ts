@@ -4,6 +4,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { analyze, loadRun, type Row } from "./analyze.ts";
+import { loadStalls, whyGap } from "./notice.ts";
 
 type Cursor = { t: number; x: number; y: number; buttons: number; pid: number; role: string; label: string };
 type Action = { t0: number; t1: number; op: string; note?: string; x?: number; y?: number };
@@ -61,7 +62,23 @@ export function explain(csv: string, o: ExplainOptions = {}): string {
   L.push(a.overall
     ? `while animating: ${a.overall.fps} fps of ${hz} · hitches ${a.overall.hitches} (long ${a.overall.long_hitches}) · p95 gap ${a.overall.gap_p95_ms}ms · max ${a.overall.gap_max_ms}ms · ${a.segments.length} segments`
     : "no animation detected");
-  L.push(`sources: frames ${rows.length} · cursor samples ${cursor.length} · agent actions ${actions.length} · main-thread samples ${prof?.samples.length ?? "— (no profile; start with profile: {process})"}`);
+  const stalls = loadStalls(dir);
+  L.push(`sources: frames ${rows.length} · cursor samples ${cursor.length} · agent actions ${actions.length} · main-thread stalls ${stalls ? `${stalls.stalls.length} (probe watchdog in ${stalls.name})` : "— (eye_probe {process} before recording: it times and samples every stall)"} · Instruments samples ${prof?.samples.length ?? "— (profile: {process})"}`);
+  const stallLines: string[] = [];
+  if (stalls?.stalls.length) {
+    // Every long stall gets listed, whether or not the screen showed it as one gap: the capture can deliver
+    // identical "new" frames in the middle of a freeze, which splits the gap below the threshold.
+    const rel = stalls.stalls.filter((s) => { const t = s.t - t0Mach; return (o.from_s === undefined || t >= o.from_s) && (o.to_s === undefined || t <= o.to_s); });
+    L.push(`main thread: ${rel.length} stall${rel.length === 1 ? "" : "s"} in this window, ${rel.reduce((x, s) => x + s.ms, 0).toFixed(0)}ms in total, worst ${Math.max(0, ...rel.map((s) => s.ms)).toFixed(1)}ms`);
+    const worst = [...rel].sort((x, y) => y.ms - x.ms).filter((s) => s.ms >= 2.9 * period).slice(0, o.top ?? 5);
+    if (worst.length) {
+      stallLines.push("", `## longest main-thread stalls (probe watchdog in ${stalls.name})`);
+      for (const s of worst) {
+        const from = s.t - t0Mach;
+        stallLines.push(...whyGap({ ...stalls, stalls: [s], from: -Infinity, to: Infinity }, t0Mach, from, from + s.ms / 1000).map((l) => (l.startsWith(" ") ? `  ${l}` : `- ${l}`)));
+      }
+    }
+  }
 
   // Profile on the same clock.
   const samp = prof ? prof.samples.map(([w, st]) => ({ t: w - t0Wall, st })) : [];
@@ -91,7 +108,7 @@ export function explain(csv: string, o: ExplainOptions = {}): string {
 
   // 1. Worst on-screen gaps during animation, each fully attributed.
   const gapMin = (o.gap_frames ?? 3) * period * 0.97;
-  const inSeg = (t: number) => a.segments.some((s) => t >= s.start_s - 1e-6 && t <= s.end_s + 1e-6);
+  const inSeg = (t: number) => a.segments.some((s) => t > s.start_s + 1e-6 && t <= s.end_s + 1e-6); // a segment's first frame ends the wait before it, not a gap in it
   const gaps = rows.filter((r) => r.s === "c" && r.interval >= gapMin && inSeg(r.t)).sort((x, y) => y.interval - x.interval).slice(0, o.top ?? 12);
   L.push("");
   L.push(`## worst on-screen gaps (≥${o.gap_frames ?? 3} frames) during animation`);
@@ -100,6 +117,7 @@ export function explain(csv: string, o: ExplainOptions = {}): string {
     const from = g.t - g.interval / 1000;
     const act = actAt(from) ?? actAt(g.t);
     L.push(`- t=${g.t.toFixed(3)}s · ${g.interval.toFixed(1)}ms (${Math.round(g.interval / period)} frames) · ${describeCursor(at(from))}${act ? ` · during ${act.op}${act.note ? ` "${act.note}"` : ""}` : ""}`);
+    for (const w of whyGap(stalls, t0Mach, from, g.t)) L.push(`    ${w}`);
     const mt = mainThread(from, g.t);
     if (mt) {
       L.push(`    main thread ${mt.busy.toFixed(0)}% busy (${mt.n} samples)${mt.ax ? ` · ${Math.round((100 * mt.ax) / Math.max(1, mt.n))}% in Accessibility` : ""} · leaf: ${mt.leafBin.slice(0, 3).map(([b, n]) => `${b} ${n}`).join(", ")}`);
@@ -108,6 +126,8 @@ export function explain(csv: string, o: ExplainOptions = {}): string {
     const hs = prof?.hitches.filter(([w, d]) => { const t = w - t0Wall; return t < g.t + 0.002 && t + d / 1000 > from - 0.002; }) ?? [];
     if (hs.length) L.push(`    Instruments hitches: ${hs.map(([, d, s]) => `${d}ms${s ? ` "${s}"` : ""}`).join(", ")}`);
   }
+
+  L.push(...stallLines);
 
   // 2. Smoothness by what the cursor was over, and by agent action.
   const groups = (keyOf: (t: number) => string) => {

@@ -15,6 +15,8 @@
 //            in a row, ≤1s apart (those presses are swallowed too; the overlay shows the count). Synthetic events pass: those tagged with
 //            eventSourceUserData == 0x45594521 ("EYE!"), and with --allow synthetic (default) any
 //            event posted by a process (sourceUnixProcessID != 0).
+//   watch    [--app NAME]... [--until TEXT]... [--seconds N] [--values] [--json]
+//            One line per UI event (AXObserver + NSWorkspace) until killed or --until matches; see watch --help.
 //
 // Coordinates: display-local POINTS, top-left origin.
 import AppKit
@@ -71,6 +73,10 @@ func deadline(_ seconds: Double, _ what: String) {
     }
 }
 
+/// What shows behind an app recorded on its own. SCStreamConfiguration.backgroundColor is an `assign` property: it
+/// does not keep the colour alive, so this has to outlive every stream (a temporary there is a crash waiting).
+let captureBackdrop = CGColor(gray: 0.5, alpha: 1)
+
 func shareable() async -> SCShareableContent {
     // TCC occasionally reports a spurious "declined" when capture sessions start back-to-back; retry.
     var last: Error?
@@ -91,6 +97,26 @@ func writePNG(_ img: CGImage, _ path: String) -> Bool {
     guard let dst = CGImageDestinationCreateWithURL(url, UTType.png.identifier as CFString, 1, nil) else { return false }
     CGImageDestinationAddImage(dst, img, nil)
     return CGImageDestinationFinalize(dst)
+}
+
+/// The image as tightly packed 8-bit sRGB RGBA (no header), for the maths on a still frame (src/still.ts).
+func writeRaw(_ img: CGImage, _ path: String) -> Bool {
+    let w = img.width, h = img.height
+    guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
+          let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: cs,
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+          let base = { ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h)); return ctx.data }() else { return false }
+    return FileManager.default.createFile(atPath: path, contents: Data(bytesNoCopy: base, count: w * h * 4, deallocator: .none))
+}
+
+/// `raw --in image.png --out file.rgba`: an existing image (a keyframe, a fallback screenshot) as raw sRGB RGBA.
+func cmdRaw() {
+    guard let src = opt("in"), let out = opt("out") else { fail("raw needs --in image --out file.rgba") }
+    guard let s = CGImageSourceCreateWithURL(URL(fileURLWithPath: src) as CFURL, nil),
+          let img = CGImageSourceCreateImageAtIndex(s, 0, nil) else { fail("cannot read \(src)") }
+    guard writeRaw(img, out) else { fail("could not write \(out)") }
+    print(json(["path": out, "pixels": ["w": img.width, "h": img.height]]))
+    exit(0)
 }
 
 func onTerminate(_ handler: @escaping () -> Void) {
@@ -134,6 +160,7 @@ func cmdSnapshot() async {
     do {
         let img = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: d, excludingWindows: []), configuration: cfg)
         guard writePNG(img, out) else { fail("could not write \(out)") }
+        if let raw = opt("raw"), !writeRaw(img, raw) { fail("could not write \(raw)") }
         print(json(["path": out, "pixels": ["w": img.width, "h": img.height], "scale": scale]))
         exit(0)
     } catch { fail("snapshot failed: \(error.localizedDescription)") }
@@ -173,7 +200,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         out = h; self.outPath = outPath; self.rect = rect; self.scale = scale; self.step = step
         self.keyDir = keyDir; self.keyEvery = keyEvery
         super.init()
-        buf = "t,status,interval_ms,diff,changed_frac,mean_luma,bbox_x0,bbox_y0,bbox_x1,bbox_y1,bbox_w,bbox_h,anch_w,anch_h,anch_cx\n"
+        buf = "t,status,interval_ms,diff,changed_frac,mean_luma,bbox_x0,bbox_y0,bbox_x1,bbox_y1,bbox_w,bbox_h,anch_w,anch_h,anch_cx,mv_x0,mv_y0,mv_x1,mv_y1,mv_cx,mv_cy\n"
     }
     var t0Wall = 0.0         // unix seconds of the first frame
     var anchorX = 0.0        // display points (default: display centre)
@@ -233,6 +260,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         if base == nil || base!.count != luma.count { base = luma }
         var diffSum = 0, changed = 0
         var x0 = Int.max, y0 = Int.max, x1 = -1, y1 = -1
+        // What moved since the previous frame (not since the first): its box and its centre of change. A thing that
+        // slides, or shrinks, leaves the first-frame box untouched but shows up here; a change that happened once and
+        // stayed (a pressed button, a title bar) does not.
+        var mx0 = Int.max, my0 = Int.max, mx1 = -1, my1 = -1, mW = 0, mX = 0, mY = 0
         let hasPrev = prev?.count == luma.count
         luma.withUnsafeBufferPointer { L in
             base!.withUnsafeBufferPointer { B in
@@ -240,7 +271,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                     if hasPrev {
                         let d = abs(Int(L[i]) - Int(prev![i]))
                         diffSum += d
-                        if d > 8 { changed += 1 }
+                        if d > 8 {
+                            changed += 1
+                            let x = i % gw, y = i / gw
+                            if x < mx0 { mx0 = x }; if x > mx1 { mx1 = x }
+                            if y < my0 { my0 = y }; if y > my1 { my1 = y }
+                            mW += d; mX += d * x; mY += d * y
+                        }
                     }
                     if abs(Int(L[i]) - Int(B[i])) > 24 {
                         let x = i % gw, y = i / gw
@@ -293,10 +330,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         let has = x1 >= 0
         let bx0 = has ? Double(x0) * k : 0, by0 = has ? Double(y0) * k : 0
         let bx1 = has ? Double(x1 + 1) * k : 0, by1 = has ? Double(y1 + 1) * k : 0
-        buf += String(format: "%.5f,c,%.3f,%.3f,%.5f,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+        let mv = mx1 >= 0
+        buf += String(format: "%.5f,c,%.3f,%.3f,%.5f,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%.2f\n",
                       rel, interval, hasPrev ? Double(diffSum) / n : 0, hasPrev ? Double(changed) / n : 0,
                       Double(lumaSum) / n, bx0, by0, bx1, by1, bx1 - bx0, by1 - by0,
-                      ax0 >= 0 ? ax1 - ax0 : 0, adepth, ax0 >= 0 ? (ax0 + ax1) / 2 : 0)
+                      ax0 >= 0 ? ax1 - ax0 : 0, adepth, ax0 >= 0 ? (ax0 + ax1) / 2 : 0,
+                      mv ? Double(mx0) * k : 0, mv ? Double(my0) * k : 0, mv ? Double(mx1 + 1) * k : 0, mv ? Double(my1 + 1) * k : 0,
+                      mv ? (Double(mX) / Double(mW) + 0.5) * k : 0, mv ? (Double(mY) / Double(mW) + 0.5) * k : 0)
         lastComplete = t
         prev = luma
         if buf.utf8.count > 64_000 { flush() }
@@ -796,11 +836,29 @@ func cmdCapture() async {
     let cfg = SCStreamConfiguration()
     cfg.sourceRect = rect
     cfg.width = Int(rect.width * scale); cfg.height = Int(rect.height * scale)
-    cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(1, fps.rounded())))
+    // The limiter is given half a frame of slack. Asked for exactly one frame per refresh it throws away every frame
+    // that arrives a hair early (display times jitter by microseconds), and a perfectly smooth 120Hz animation is
+    // recorded as ~97 fps with "late" frames it never had. At 1.5× the asked rate every refresh still gets through,
+    // and a lower rate (60 on a 120Hz display) still gets every second one.
+    cfg.minimumFrameInterval = CMTime(value: 2, timescale: CMTimeScale(max(1, (fps * 3).rounded())))
     cfg.queueDepth = 8
     cfg.pixelFormat = kCVPixelFormatType_32BGRA
     cfg.showsCursor = false
-    let stream = SCStream(filter: SCContentFilter(display: d, excludingWindows: []), configuration: cfg, delegate: rec)
+    // --only-pid: record that app's windows alone (the ones it has now and the ones it opens), over mid grey. Otherwise
+    // whatever shows through a see-through window, or sits over the app (another app's window, the input-lock
+    // overlay), is measured as if it were the app's own motion.
+    var filter = SCContentFilter(display: d, excludingWindows: [])
+    if let pid = opt("only-pid").flatMap(Int32.init) {
+        if let app = content.applications.first(where: { $0.processID == pid }) {
+            filter = SCContentFilter(display: d, including: [app], exceptingWindows: [])
+            // Mid grey behind it, not the default clear (which lands as black): a black shape growing over nothing
+            // but black cannot be seen to move at all, and neither can a white one over white.
+            cfg.backgroundColor = captureBackdrop
+        } else {
+            FileHandle.standardError.write("eye-capture: --only-pid \(pid) is not an app ScreenCaptureKit can single out; recording everything in the rect\n".data(using: .utf8)!)
+        }
+    }
+    let stream = SCStream(filter: filter, configuration: cfg, delegate: rec)
     do {
         try stream.addStreamOutput(rec, type: .screen, sampleHandlerQueue: rec.q)
         try await stream.startCapture()
@@ -908,19 +966,97 @@ var maxDrift = 0.0
 let pointerHID = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
 var seizedDevices: [IOHIDDevice] = []
 let seizeOption = IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
-func seizePointers() {
+func matchPointers() {
     IOHIDManagerSetDeviceMatchingMultiple(pointerHID, [
         [kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop, kIOHIDDeviceUsageKey: kHIDUsage_GD_Mouse],
         [kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop, kIOHIDDeviceUsageKey: kHIDUsage_GD_Pointer],
         [kIOHIDDeviceUsagePageKey: kHIDPage_Digitizer],
     ] as CFArray)
-    // Fires for every device present now and for any mouse plugged in or paired mid-lock.
+}
+func pointerDevices() -> [IOHIDDevice] {
+    (IOHIDManagerCopyDevices(pointerHID) as? Set<IOHIDDevice>).map(Array.init) ?? []
+}
+func hidName(_ d: IOHIDDevice) -> String {
+    (IOHIDDeviceGetProperty(d, kIOHIDProductKey as CFString) as? String) ?? "pointing device"
+}
+func hidError(_ r: IOReturn) -> String {
+    switch r {
+    case kIOReturnExclusiveAccess: return "another process holds it exclusively"
+    case kIOReturnNotPermitted, kIOReturnNotPrivileged: return "not permitted (Input Monitoring / Accessibility for the host app?)"
+    default: return String(format: "IOReturn 0x%08x", r)
+    }
+}
+/// Other `eye-capture lock` processes: two locks fight over the HID seize and the second one silently loses.
+func otherLockPids() -> [Int32] {
+    let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep"); p.arguments = ["-f", "eye-capture lock"]
+    let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return [] }
+    p.waitUntilExit()
+    let s = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return s.split(separator: "\n").compactMap { Int32($0) }.filter { $0 != getpid() }
+}
+/// Everything that can make a lock fail, checked BEFORE the countdown: the tap must actually turn on, and every
+/// pointing device must accept a seize (each is seized and released again at once, only while no button is held,
+/// so a press can't lose its release in that instant). Returns the problems, empty = good to go.
+func lockPreflight(_ tap: CFMachPort) -> [String] {
+    var problems: [String] = []
+    CGEvent.tapEnable(tap: tap, enable: true)
+    if !CGEvent.tapIsEnabled(tap: tap) { problems.append("the event tap would not turn on (Accessibility permission for the host app?)") }
+    let others = otherLockPids()
+    if !others.isEmpty { problems.append("another eye-capture lock is already running (pid \(others.map(String.init).joined(separator: ", "))) — it holds the pointing devices") }
+    matchPointers()
+    // A held press is left alone (seizing now could eat its release); engage seizes for real and reports a refusal.
+    // Exactly what engage does (hold every device at once), then let go again.
+    if physicalButtons().isEmpty {
+        let (held, refused) = seizeAll()
+        for d in held { IOHIDDeviceClose(d, seizeOption) }
+        problems += refused.map { "cannot seize \($0)" }
+    }
+    return problems
+}
+/// Seize every pointing device now (synchronously, so "locked" is never printed before the arrow is pinned), and
+/// any mouse plugged in or paired mid-lock later. Returns the devices that refused.
+/// One physical device (the built-in keyboard/trackpad) shows up as several IOHIDDevice handles, one per interface.
+/// Seizing one makes its siblings answer "exclusive access" — that device is ours already, not a failure. Only a
+/// physical device with NO seized handle counts as refused.
+func hidPhysical(_ d: IOHIDDevice) -> String {
+    let loc = IOHIDDeviceGetProperty(d, kIOHIDLocationIDKey as CFString) as? NSNumber
+    let vid = IOHIDDeviceGetProperty(d, kIOHIDVendorIDKey as CFString) as? NSNumber
+    let pid = IOHIDDeviceGetProperty(d, kIOHIDProductIDKey as CFString) as? NSNumber
+    return "\(loc ?? 0)/\(vid ?? 0)/\(pid ?? 0)/\(hidName(d))"
+}
+func seizeAll(skip: [IOHIDDevice] = []) -> (held: [IOHIDDevice], refused: [String]) {
+    var held: [IOHIDDevice] = [], failed: [String: String] = [:]
+    var covered = Set(skip.map(hidPhysical))
+    for d in pointerDevices() where !skip.contains(d) {
+        let key = hidPhysical(d)
+        let r = IOHIDDeviceOpen(d, seizeOption)
+        if r == kIOReturnSuccess { held.append(d); covered.insert(key); failed[key] = nil }
+        else if !covered.contains(key) { failed[key] = "\(hidName(d)): \(hidError(r))" }
+    }
+    return (held, failed.filter { !covered.contains($0.key) }.map(\.value))
+}
+func seizePointers() -> [String] {
+    matchPointers()
+    let (held, refused) = seizeAll(skip: seizedDevices)
+    seizedDevices += held
     IOHIDManagerRegisterDeviceMatchingCallback(pointerHID, { _, _, _, device in
         guard !seizedDevices.contains(device), IOHIDDeviceOpen(device, seizeOption) == kIOReturnSuccess else { return }
         seizedDevices.append(device)
     }, nil)
     IOHIDManagerScheduleWithRunLoop(pointerHID, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+    return refused
 }
+func physicalButtons() -> [CGMouseButton] {
+    [CGMouseButton.left, .right, .center].filter { CGEventSource.buttonState(.hidSystemState, button: $0) }
+}
+/// What the user's hands were doing as the lock engaged (seen by the tap while it still let everything through):
+/// a scroll or fling still running, a gesture in the middle. Cut off by the lock, these would leave apps waiting
+/// for an end that never comes, so the lock ends them itself.
+var physScrollOpen = false, physMomentumOpen = false
+var physLastScroll = 0.0, physLastGesture = 0.0
+var interrupted: [String] = []
+var settleMs = 0
 func releasePointers() {
     IOHIDManagerUnscheduleFromRunLoop(pointerHID, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
     for d in seizedDevices { IOHIDDeviceClose(d, seizeOption) }
@@ -930,20 +1066,44 @@ func lockReport(_ why: String) -> String {
     let seized = seizedDevices.count
     releasePointers()
     CGAssociateMouseAndMouseCursorPosition(1) // older builds disassociated the cursor; never leave it cut off
-    return json(["ended": why, "blocked": blocked, "passed": passed, "pointer_devices_seized": seized,
-          "max_cursor_drift_pt": (maxDrift * 1000).rounded() / 1000,
+    var o: [String: Any] = ["ended": why, "style": lockStyle, "blocked": blocked, "passed": passed, "pointer_devices_seized": seized,
+          "max_cursor_drift_pt": (maxDrift * 1000).rounded() / 1000, "settle_ms": settleMs,
           "blocked_by_event_type": Dictionary(uniqueKeysWithValues: blockedTypes.map { (String($0.key), $0.value) }),
-          "pointer_events_by_source_pid": Dictionary(uniqueKeysWithValues: pidCounts.map { (String($0.key), $0.value) })])
+          "pointer_events_by_source_pid": Dictionary(uniqueKeysWithValues: pidCounts.map { (String($0.key), $0.value) })]
+    if !interrupted.isEmpty { o["interrupted_at_engage"] = interrupted }
+    return json(o)
 }
+
+/// "full": the 3·2·1 warning, then the orange wash. "quick" ("Just a sec…"): no countdown, a small pill at the top —
+/// for a glance of a second or two (raise a window, look, put it back).
+var lockStyle = "full"
 
 let lockCallback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if lockEngaged, let t = lockTap { CGEvent.tapEnable(tap: t, enable: true) }
+        // Re-enabling is always safe: before engaging, the callback below lets everything through.
+        if let t = lockTap { CGEvent.tapEnable(tap: t, enable: true) }
         return Unmanaged.passUnretained(event)
     }
     // EVERY event type is tapped (trackpad gesture phases, force touch, keys, media keys, …).
     let tag = event.getIntegerValueField(.eventSourceUserData)
     let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
+    if !lockEngaged {
+        // Countdown / settling: hands-off observer. Nothing is blocked or counted; only remember what a physical
+        // scroll, fling or gesture is in the middle of, so engaging can wait for it or end it cleanly.
+        if pid == 0, tag != eyeTag {
+            let now = CACurrentMediaTime()
+            if type == .scrollWheel {
+                let ph = event.getIntegerValueField(.scrollWheelEventScrollPhase)
+                let mo = event.getIntegerValueField(.scrollWheelEventMomentumPhase)
+                if ph != 0 { physScrollOpen = ph == 1 || ph == 2 || ph == 128 }
+                if mo != 0 { physMomentumOpen = mo == 1 || mo == 2 }
+                physLastScroll = now
+            } else if [18, 30, 31].contains(type.rawValue) {
+                physLastGesture = now // rotate / magnify / swipe (not 29: resting fingers fire those too)
+            }
+        }
+        return Unmanaged.passUnretained(event)
+    }
     pidCounts[pid, default: 0] += 1
     let isMove = [5, 6, 7, 27].contains(type.rawValue) // moved, left/right/other dragged
     if tag == eyeTag || tag == legacyTag || (allowSynthetic && pid != 0) {
@@ -959,10 +1119,7 @@ let lockCallback: CGEventTapCallBack = { _, type, event, _ in
         escStreak = now - escLast < panicGap ? escStreak + 1 : 1
         escLast = now
         showEscStreak(escStreak)
-        if escStreak >= panicCount {
-            print(lockReport("escape"))
-            exit(0)
-        }
+        if escStreak >= panicCount { lockEnd?("escape") }
         // Streak expired: empty the dots again.
         DispatchQueue.main.asyncAfter(deadline: .now() + panicGap) {
             if CACurrentMediaTime() - escLast >= panicGap - 0.01 { escStreak = 0; showEscStreak(0) }
@@ -973,38 +1130,249 @@ let lockCallback: CGEventTapCallBack = { _, type, event, _ in
     }
     return nil
 }
+var lockEnd: ((String) -> Void)?
+
+/// Why engaging right now would cut the user off mid-action, or nil when their hands are idle.
+func handsBusy() -> String? {
+    let held = physicalButtons()
+    if !held.isEmpty { return held.contains(.left) ? "left button held (drag?)" : "button held" }
+    let now = CACurrentMediaTime()
+    if (physScrollOpen || physMomentumOpen) && now - physLastScroll < 0.3 { return physMomentumOpen ? "scroll momentum" : "scrolling" }
+    if now - physLastGesture < 0.15 { return "gesture" }
+    return nil
+}
+
+/// Engaging while the user was mid-drag / mid-scroll would strand that action: the seize swallows the release, so the
+/// window server keeps the button down and the app stays in its drag loop (eating our events). End each one cleanly,
+/// with tagged events the tap lets through.
+func endInterruptedActions() {
+    let src = CGEventSource(stateID: .hidSystemState)
+    let at = CGEvent(source: nil)?.location ?? .zero
+    func post(_ e: CGEvent?) { guard let e else { return }; e.setIntegerValueField(.eventSourceUserData, value: eyeTag); e.post(tap: .cghidEventTap) }
+    for b in physicalButtons() {
+        let (type, name): (CGEventType, String) = b == .left ? (.leftMouseUp, "left drag") : b == .right ? (.rightMouseUp, "right drag") : (.otherMouseUp, "other-button drag")
+        post(CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: at, mouseButton: b))
+        interrupted.append("\(name) released at \(Int(at.x)),\(Int(at.y))")
+    }
+    let now = CACurrentMediaTime()
+    if physScrollOpen && now - physLastScroll < 1 {
+        let e = CGEvent(scrollWheelEvent2Source: src, units: .pixel, wheelCount: 2, wheel1: 0, wheel2: 0, wheel3: 0)
+        e?.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1); e?.setIntegerValueField(.scrollWheelEventScrollPhase, value: 4)
+        e?.location = at; post(e); interrupted.append("scroll ended")
+    }
+    if physMomentumOpen && now - physLastScroll < 1 {
+        let e = CGEvent(scrollWheelEvent2Source: src, units: .pixel, wheelCount: 2, wheel1: 0, wheel2: 0, wheel3: 0)
+        e?.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1); e?.setIntegerValueField(.scrollWheelEventMomentumPhase, value: 3)
+        e?.location = at; post(e); interrupted.append("scroll momentum ended")
+    }
+}
 
 func cmdLock() {
-    let seconds = min(opt("seconds").flatMap(Double.init) ?? 60, 600)
-    let countdown = max(0, Int(opt("countdown") ?? "3") ?? 3)
+    setvbuf(stdout, nil, _IOLBF, 0)
+    var seconds = min(opt("seconds").flatMap(Double.init) ?? 60, 600)
+    lockStyle = opt("style") == "quick" ? "quick" : "full"
+    let countdown = max(0, Int(opt("countdown") ?? (lockStyle == "quick" ? "0" : "3")) ?? 3)
+    // How long to wait (after any countdown) for a drag / scroll / gesture in progress to finish before engaging anyway.
+    let settleMax = (opt("settle-ms").flatMap(Double.init) ?? 1200) / 1000
+    let message = opt("message") ?? "Just a sec…"
     allowSynthetic = (opt("allow") ?? "synthetic") != "tagged"
+    let say = { (s: String) in FileHandle.standardError.write("eye-capture: \(s)\n".data(using: .utf8)!) }
     let mask: CGEventMask = ~CGEventMask(0)
-    // Created up front (disabled) so a missing Accessibility permission fails before any countdown.
     guard let tap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
                                       eventsOfInterest: mask, callback: lockCallback, userInfo: nil) else {
-        fail("cannot create event tap — grant Accessibility permission to the host app")
+        fail("preflight: cannot create event tap — grant Accessibility permission to the host app")
     }
-    CGEvent.tapEnable(tap: tap, enable: false)
     lockTap = tap
     CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
+    // Every check that could fail runs now, before the user sees a countdown.
+    let problems = lockPreflight(tap)
+    if !problems.isEmpty { fail("preflight: " + problems.joined(separator: "; ")) }
+    say("preflight ok (\(pointerDevices().count) pointing devices)")
+    var ended = false
     let end: (String) -> Void = { why in
-        print(lockReport(why))
-        exit(0)
+        guard !ended else { return }
+        ended = true
+        CGEvent.tapEnable(tap: tap, enable: false)
+        print(lockReport(why)) // input is free from here on
+        fflush(stdout)
+        if lockStyle == "quick", lockEngaged { hideQuickPill { exit(0) } } else { exit(0) }
     }
+    lockEnd = end
     onTerminate { end("signal") }
+    var timer: DispatchWorkItem?
+    func arm(_ s: Double) {
+        timer?.cancel()
+        let t = DispatchWorkItem { end("timeout") }
+        timer = t
+        DispatchQueue.main.asyncAfter(deadline: .now() + s, execute: t)
+    }
+    // stdin: "extend <seconds>" pushes the end out (one lock across several calls instead of a gap and a new one);
+    // "release" ends it now.
+    FileHandle.standardInput.readabilityHandler = { h in
+        let data = h.availableData
+        guard !data.isEmpty else { h.readabilityHandler = nil; return }
+        for line in (String(data: data, encoding: .utf8) ?? "").split(separator: "\n") {
+            let parts = line.split(separator: " ")
+            DispatchQueue.main.async {
+                if parts.first == "release" { end("released") }
+                else if parts.first == "extend", parts.count > 1, let s = Double(parts[1]), !ended {
+                    seconds = min(s, 600)
+                    if lockEngaged { arm(seconds); updateLockMessage(until: Date().addingTimeInterval(seconds)) }
+                    say("extended \(seconds)s")
+                }
+            }
+        }
+    }
     let engage = {
         heldCursor = CGEvent(source: nil)?.location
+        let refused = seizePointers()
+        if !refused.isEmpty { end("failed: could not seize " + refused.joined(separator: "; ")); return }
         lockEngaged = true
-        seizePointers()
-        CGEvent.tapEnable(tap: tap, enable: true)
-        // The overlay is only ever shown together with this full lock: orange on screen = no physical input gets through.
-        showLockOverlay(until: Date().addingTimeInterval(seconds))
+        endInterruptedActions()
+        // The overlay is only ever shown together with the lock: orange on screen = no physical input gets through.
+        if lockStyle == "quick" { showQuickPill(locked: true, message: message) } else { showLockOverlay(until: Date().addingTimeInterval(seconds)) }
         // The TS side waits for this line before it drives anything.
-        FileHandle.standardError.write("eye-capture: physical pointer + keyboard locked for \(seconds)s (Esc ×6 = emergency release)\n"
-            .data(using: .utf8)!)
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { end("timeout") }
+        say("physical pointer + keyboard locked for \(seconds)s (\(lockStyle), settle \(settleMs)ms\(interrupted.isEmpty ? "" : ", ended: " + interrupted.joined(separator: ", ")); Esc ×6 = emergency release)")
+        arm(seconds)
     }
-    if countdown > 0 { showLockCountdown(from: countdown, step: 0.5, then: engage) } else { engage() }
+    // Hands still on the trackpad (a drag, a scroll, a fling, a pinch): give them up to settleMax to finish, so
+    // the lock doesn't cut an action in half. A quick lock shows its pill greyed meanwhile ("let go…").
+    let settle = {
+        let t0 = CACurrentMediaTime()
+        var shown = false
+        func poll() {
+            if ended { return }
+            let busy = handsBusy()
+            let waited = CACurrentMediaTime() - t0
+            if busy == nil || waited >= settleMax {
+                settleMs = Int(waited * 1000)
+                engage()
+                return
+            }
+            if lockStyle == "quick", !shown, waited > 0.08 { shown = true; showQuickPill(locked: false, message: "let go… (\(busy!))") }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { poll() }
+        }
+        poll()
+    }
+    if countdown > 0 { showLockCountdown(from: countdown, step: 0.5, then: settle) } else { settle() }
+}
+
+/// The full overlay's message layers, so `extend` can update the "locked until" time in place.
+var lockMessageLayers: [(layer: CATextLayer, font: NSFont)] = []
+func updateLockMessage(until: Date) {
+    if lockStyle == "quick" { return }
+    let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+    let message = "the-eye is testing — trackpad & keyboard locked until \(f.string(from: until)) · Esc ×\(panicCount) releases"
+    for (l, font) in lockMessageLayers {
+        l.string = NSAttributedString(string: message, attributes: [.font: font, .foregroundColor: NSColor.black])
+    }
+}
+
+/// "Just a sec…": the quick lock's whole UI. A small dark pill under the menu bar of every screen — no wash, no
+/// countdown — that springs in, glows orange while input is held, and springs away the moment it's released.
+/// Greyed while waiting for the user's hands to finish a drag/scroll ("let go…"). Click-through, every Space,
+/// excluded from screen capture like the full overlay.
+var quickPills: [(window: NSWindow, pill: CALayer, dot: CALayer, label: CATextLayer, screen: NSScreen)] = []
+let quickFont = NSFont.systemFont(ofSize: 14, weight: .semibold)
+let quickOrange = NSColor(srgbRed: 1, green: 0.55, blue: 0.1, alpha: 1)
+
+func spring(_ key: String, from: Any?, to: Any, damping: CGFloat = 16, stiffness: CGFloat = 420) -> CASpringAnimation {
+    let a = CASpringAnimation(keyPath: key)
+    a.fromValue = from; a.toValue = to
+    a.mass = 1; a.stiffness = stiffness; a.damping = damping
+    a.duration = a.settlingDuration
+    return a
+}
+
+func showQuickPill(locked: Bool, message: String) {
+    let app = NSApplication.shared
+    if quickPills.isEmpty {
+        app.setActivationPolicy(.accessory)
+        app.finishLaunching()
+        for screen in NSScreen.screens {
+            let vf = screen.visibleFrame, fr = screen.frame
+            // Room for the pill, its glow, and the Esc hint under it.
+            let size = CGSize(width: 520, height: 96)
+            let w = NSWindow(contentRect: NSRect(x: fr.midX - size.width / 2, y: vf.maxY - size.height - 4, width: size.width, height: size.height),
+                             styleMask: [.borderless], backing: .buffered, defer: false)
+            w.isOpaque = false; w.backgroundColor = .clear; w.hasShadow = false
+            w.ignoresMouseEvents = true
+            w.level = .screenSaver
+            w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+            w.sharingType = .none
+            w.animationBehavior = .none
+            let v = NSView(frame: NSRect(origin: .zero, size: size)); v.wantsLayer = true
+            let root = v.layer!
+            let pill = CALayer()
+            pill.cornerRadius = 19; pill.cornerCurve = .continuous
+            pill.backgroundColor = NSColor(white: 0.08, alpha: 0.88).cgColor
+            pill.borderWidth = 1.5
+            pill.shadowColor = quickOrange.cgColor; pill.shadowRadius = 16; pill.shadowOffset = .zero
+            let dot = CALayer(); dot.cornerRadius = 4.5; dot.bounds = CGRect(x: 0, y: 0, width: 9, height: 9)
+            pill.addSublayer(dot)
+            let label = CATextLayer(); label.contentsScale = screen.backingScaleFactor; label.alignmentMode = .left
+            pill.addSublayer(label)
+            root.addSublayer(pill)
+            let hint = CATextLayer(); hint.contentsScale = screen.backingScaleFactor; hint.alignmentMode = .center
+            hint.frame = CGRect(x: 0, y: 4, width: size.width, height: 20); hint.opacity = 0
+            root.addSublayer(hint)
+            escFeedback.append((pill, [], hint))
+            w.contentView = v
+            w.orderFrontRegardless()
+            quickPills.append((w, pill, dot, label, screen))
+            // Arrive: drop in from just above with a little overshoot.
+            pill.add(spring("transform.scale", from: 0.6, to: 1, damping: 14), forKey: "in")
+            pill.add(spring("opacity", from: 0, to: 1, damping: 30), forKey: "fade")
+        }
+    }
+    let text = locked ? "\(message)  ·  Esc ×\(panicCount) releases" : message
+    let tw = ceil((text as NSString).size(withAttributes: [.font: quickFont]).width)
+    for q in quickPills {
+        let size = q.window.frame.size
+        let pw = tw + 48, ph: CGFloat = 38
+        let target = CGRect(x: (size.width - pw) / 2, y: size.height - ph - 12, width: pw, height: ph)
+        // Every change morphs (width, colours) on a spring instead of snapping.
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        let oldBounds = q.pill.bounds
+        q.pill.bounds = CGRect(origin: .zero, size: target.size)
+        q.pill.position = CGPoint(x: target.midX, y: target.midY)
+        q.pill.shadowPath = CGPath(roundedRect: q.pill.bounds, cornerWidth: 19, cornerHeight: 19, transform: nil)
+        if oldBounds.width > 0 { q.pill.add(spring("bounds", from: NSValue(rect: oldBounds), to: NSValue(rect: q.pill.bounds)), forKey: "morph") }
+        let accent = locked ? quickOrange : NSColor(white: 0.6, alpha: 1)
+        let oldBorder = q.pill.borderColor
+        q.pill.borderColor = accent.withAlphaComponent(locked ? 0.95 : 0.5).cgColor
+        q.pill.add(spring("borderColor", from: oldBorder, to: q.pill.borderColor!, damping: 30), forKey: "border")
+        let oldGlow = q.pill.shadowOpacity
+        q.pill.shadowOpacity = locked ? 0.55 : 0
+        q.pill.add(spring("shadowOpacity", from: oldGlow, to: q.pill.shadowOpacity, damping: 30), forKey: "glow")
+        q.dot.position = CGPoint(x: 20, y: ph / 2)
+        q.dot.backgroundColor = accent.cgColor
+        q.label.frame = CGRect(x: 34, y: (ph - 19) / 2, width: tw + 4, height: 19)
+        q.label.string = NSAttributedString(string: text, attributes: [.font: quickFont, .foregroundColor: NSColor(white: 1, alpha: locked ? 0.96 : 0.7)])
+        if locked {
+            // The one ambient loop: the dot breathes while input is held.
+            let b = CABasicAnimation(keyPath: "opacity")
+            b.fromValue = 1; b.toValue = 0.55; b.duration = 0.9; b.autoreverses = true; b.repeatCount = .infinity
+            b.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            q.dot.add(b, forKey: "breathe")
+            q.pill.add(spring("transform.scale", from: 1.06, to: 1, damping: 12), forKey: "lockpop")
+        }
+        CATransaction.commit()
+    }
+}
+
+/// Leave with the same spring the pill came in on (input is already free), then call `done`.
+func hideQuickPill(_ done: @escaping () -> Void) {
+    guard !quickPills.isEmpty else { done(); return }
+    CATransaction.begin(); CATransaction.setDisableActions(true)
+    for q in quickPills {
+        q.pill.opacity = 0
+        q.pill.add(spring("opacity", from: 1, to: 0, damping: 30), forKey: "out")
+        q.pill.add(spring("transform.scale", from: 1, to: 0.7, damping: 26), forKey: "outscale")
+        q.pill.transform = CATransform3DMakeScale(0.7, 0.7, 1)
+    }
+    CATransaction.commit()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { done() }
 }
 
 /// Warning before a lock: a big "3 · 2 · 1" in the centre of every screen, one number per `step` seconds, input
@@ -1188,6 +1556,7 @@ func showLockOverlay(until: Date) {
         dot.add(pulse, forKey: "pulse")
         pill.addSublayer(dot)
         let text = CATextLayer()
+        lockMessageLayers.append((text, font))
         text.string = NSAttributedString(string: message, attributes: [.font: font, .foregroundColor: NSColor.black])
         text.contentsScale = screen.backingScaleFactor
         text.alignmentMode = .center
@@ -1215,6 +1584,170 @@ func showLockOverlay(until: Date) {
         lockOverlayWindows.append(w)
     }
 }
+
+// MARK: - windows: raise one to the front, put everything back afterwards
+
+/// Private but stable since 10.x (yabai, Rectangle and AltTab rely on it): the CGWindowID behind an AX window.
+@_silgen_name("_AXUIElementGetWindow") func _AXUIElementGetWindow(_ el: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+enum Win {
+    struct Info { let number: Int; let pid: pid_t; let owner: String; let title: String; let bounds: CGRect }
+    /// Normal (layer 0) on-screen windows, front to back.
+    static func windows() -> [Info] {
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return list.compactMap { w in
+            guard (w[kCGWindowLayer as String] as? Int) == 0,
+                  let n = w[kCGWindowNumber as String] as? Int,
+                  let p = (w[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  let b = w[kCGWindowBounds as String] as? [String: CGFloat] else { return nil }
+            return Info(number: n, pid: p, owner: w[kCGWindowOwnerName as String] as? String ?? "", title: w[kCGWindowName as String] as? String ?? "",
+                        bounds: CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0))
+        }
+    }
+    static func axWindows(_ pid: pid_t) -> [AXUIElement] {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.5)
+        return AXI.raw(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+    }
+    static func id(_ w: AXUIElement) -> Int? { var n: CGWindowID = 0; return _AXUIElementGetWindow(w, &n) == .success ? Int(n) : nil }
+    static func ax(_ pid: pid_t, _ num: Int) -> AXUIElement? { axWindows(pid).first { id($0) == num } }
+    static func frontPid() -> pid_t {
+        guard let v = AXI.raw(AXI.system, kAXFocusedApplicationAttribute), AXI.isElement(v) else { return 0 }
+        return AXI.pid(v as! AXUIElement)
+    }
+    /// AXRaise alone stops just under the active app's key window: making the app frontmost too puts it on top.
+    static func raise(_ pid: pid_t, _ w: AXUIElement) {
+        AXUIElementPerformAction(w, kAXRaiseAction as CFString)
+        AXUIElementSetAttributeValue(AXUIElementCreateApplication(pid), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+    }
+    static func frameOf(_ w: AXUIElement) -> CGRect? { AXI.frame(AXI.many(w, [kAXPositionAttribute, kAXSizeAttribute])) }
+
+    /// Bring one window of `pid` to the very front (default: its main window, else the largest; `title` substring
+    /// or window `number` picks another). Waits until the window server shows it on top. Returns everything
+    /// `restore` needs to put the screen back as it was: the z-order before, the app that was frontmost, whether
+    /// the window was minimized, and its frame.
+    static func raiseOp(_ c: [String: Any]) -> [String: Any] {
+        guard AXIsProcessTrusted() else { return ["ok": false, "error": "Accessibility permission missing for the host app"] }
+        guard let pid = (c["pid"] as? NSNumber)?.int32Value else { return ["ok": false, "error": "raise needs pid"] }
+        let before = windows()
+        let frontApp = frontPid()
+        let all = axWindows(pid)
+        let wantTitle = (c["title"] as? String)?.lowercased()
+        let wantNum = (c["number"] as? NSNumber)?.intValue
+        let area = { (w: AXUIElement) -> CGFloat in let f = frameOf(w) ?? .zero; return f.width * f.height }
+        var candidates = all.filter { AXI.text(AXI.raw($0, kAXRoleAttribute)) == "AXWindow" }
+        if candidates.isEmpty { candidates = all }
+        var win: AXUIElement?
+        if let n = wantNum { win = candidates.first { id($0) == n } }
+        else if let t = wantTitle { win = candidates.first { (AXI.text(AXI.raw($0, kAXTitleAttribute)) ?? "").lowercased().contains(t) } }
+        else {
+            win = candidates.first { AXI.bool(AXI.raw($0, kAXMainAttribute)) == true && AXI.bool(AXI.raw($0, kAXMinimizedAttribute)) != true }
+                ?? candidates.filter { AXI.bool(AXI.raw($0, kAXMinimizedAttribute)) != true }.max { area($0) < area($1) }
+                ?? candidates.first
+        }
+        guard let w = win, let num = id(w) else {
+            let titles = candidates.compactMap { AXI.text(AXI.raw($0, kAXTitleAttribute)) }.map { "\"\($0)\"" }.joined(separator: ", ")
+            return ["ok": false, "error": candidates.isEmpty ? "pid \(pid) has no windows" : "no window of pid \(pid) matches (windows: \(titles))"]
+        }
+        let minimized = AXI.bool(AXI.raw(w, kAXMinimizedAttribute)) == true
+        // locate: where that window is, without touching anything (the rect to record or look at).
+        if (c["locate"] as? Bool) == true {
+            let f = frameOf(w) ?? before.first { $0.number == num }?.bounds ?? .zero
+            var ids = [CGDirectDisplayID](repeating: 0, count: 8), n: UInt32 = 0
+            CGGetDisplaysWithPoint(CGPoint(x: f.midX, y: f.midY), 8, &ids, &n)
+            let disp = n > 0 ? ids[0] : CGMainDisplayID(), b = CGDisplayBounds(disp)
+            return ["ok": true, "op": "raise", "pid": Int(pid), "number": num, "title": AXI.text(AXI.raw(w, kAXTitleAttribute)) ?? "",
+                    "frame": [f.minX, f.minY, f.width, f.height], "minimized": minimized,
+                    "on_top": !minimized && before.first?.number == num, "on_screen": before.contains { $0.number == num },
+                    "display": Int(disp), "display_bounds": [b.minX, b.minY, b.width, b.height]]
+        }
+        let wasFront = !minimized && frontApp == pid && before.first?.number == num
+        let t0 = CACurrentMediaTime()
+        if !wasFront {
+            if minimized { AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanFalse) }
+            raise(pid, w)
+        }
+        // Raised = first in the window server's front-to-back list. Usually ~50ms; un-minimizing animates longer.
+        var onTop = wasFront
+        while !onTop && CACurrentMediaTime() - t0 < (minimized ? 1.5 : 0.8) {
+            usleep(10000)
+            onTop = windows().first?.number == num
+            if !onTop, CACurrentMediaTime() - t0 > 0.3 { raise(pid, w) } // focus stolen back once: insist
+        }
+        let f = frameOf(w) ?? before.first { $0.number == num }?.bounds ?? .zero
+        var o: [String: Any] = [
+            "ok": true, "op": "raise", "pid": Int(pid), "number": num, "title": AXI.text(AXI.raw(w, kAXTitleAttribute)) ?? "",
+            "frame": [f.minX, f.minY, f.width, f.height], "was_minimized": minimized, "already_front": wasFront,
+            "front_pid": Int(frontApp), "before": before.map(\.number), "on_top": onTop,
+            "raise_ms": Int((CACurrentMediaTime() - t0) * 1000),
+        ]
+        // The display the window is mostly on, and its origin: snapshot/record rects are display-local.
+        var ids = [CGDirectDisplayID](repeating: 0, count: 8), n: UInt32 = 0
+        CGGetDisplaysWithPoint(CGPoint(x: f.midX, y: f.midY), 8, &ids, &n)
+        let disp = n > 0 ? ids[0] : CGMainDisplayID(), origin = CGDisplayBounds(disp).origin
+        o["display"] = Int(disp); o["display_origin"] = [origin.x, origin.y]
+        if !onTop { o["warning"] = "the window is not the topmost one after \(o["raise_ms"]!)ms (another app keeps taking focus, or it lives on another Space)" }
+        return o
+    }
+
+    /// Undo `raiseOp`: frame back, re-minimize, focus back to the app that had it, and re-raise the windows that
+    /// were above ours from the back forward, so the z-order ends where it started.
+    static func restoreOp(_ c: [String: Any]) -> [String: Any] {
+        guard let pid = (c["pid"] as? NSNumber)?.int32Value, let num = (c["number"] as? NSNumber)?.intValue,
+              let before = (c["before"] as? [NSNumber])?.map(\.intValue) else { return ["ok": false, "error": "restore needs the raise result"] }
+        if (c["already_front"] as? Bool) == true { return ["ok": true, "op": "restore", "restored": "nothing to do (it was already in front)"] }
+        var did: [String] = []
+        let target = ax(pid, num)
+        // Something in the check moved or resized the window: put it back where it was.
+        if let w = target, let f = (c["frame"] as? [NSNumber])?.map({ CGFloat($0.doubleValue) }), f.count == 4,
+           let cur = frameOf(w), abs(cur.minX - f[0]) + abs(cur.minY - f[1]) + abs(cur.width - f[2]) + abs(cur.height - f[3]) > 1 {
+            var pos = CGPoint(x: f[0], y: f[1]), size = CGSize(width: f[2], height: f[3])
+            if let v = AXValueCreate(.cgSize, &size) { AXUIElementSetAttributeValue(w, kAXSizeAttribute as CFString, v) }
+            if let v = AXValueCreate(.cgPoint, &pos) { AXUIElementSetAttributeValue(w, kAXPositionAttribute as CFString, v) }
+            did.append("frame")
+        }
+        if (c["was_minimized"] as? Bool) == true, let w = target {
+            AXUIElementSetAttributeValue(w, kAXMinimizedAttribute as CFString, kCFBooleanTrue)
+            did.append("re-minimized")
+        }
+        let now0 = windows()
+        let pidOf = Dictionary(now0.map { ($0.number, $0.pid) }, uniquingKeysWith: { a, _ in a })
+        if let fp = (c["front_pid"] as? NSNumber)?.int32Value, fp != 0, fp != pid {
+            AXUIElementSetAttributeValue(AXUIElementCreateApplication(fp), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+            // Activation is asynchronous. AXRaise puts an inactive app's window just under the ACTIVE app's windows,
+            // so raising before the switch lands would slot the windows under our (still active) app instead.
+            let tf = CACurrentMediaTime()
+            while frontPid() != fp && CACurrentMediaTime() - tf < 0.3 { usleep(5000) }
+            did.append("focus → pid \(fp)")
+        }
+        // Windows that were above ours, raised back to front (the frontmost last). Skips any that closed since.
+        let above = Array(before.prefix { $0 != num })
+        var cache: [pid_t: [AXUIElement]] = [:]
+        func reraise() {
+            for n in above.reversed() {
+                guard let p = pidOf[n] else { continue }
+                let wins = cache[p] ?? axWindows(p); cache[p] = wins
+                if let aw = wins.first(where: { id($0) == n }) { AXUIElementPerformAction(aw, kAXRaiseAction as CFString) }
+            }
+        }
+        reraise()
+        if !above.isEmpty { did.append("re-raised \(above.count) window\(above.count == 1 ? "" : "s") above it") }
+        // Verify: the windows that still exist are back in their old relative order. One more pass if not.
+        var ok = false, retried = false
+        let t0 = CACurrentMediaTime()
+        repeat {
+            let now = windows().map(\.number)
+            let a = now.filter { before.contains($0) }, b = before.filter { now.contains($0) }
+            ok = (c["was_minimized"] as? Bool) == true ? a == b.filter { $0 != num } : a == b
+            if !ok {
+                if !retried, CACurrentMediaTime() - t0 > 0.15 { retried = true; reraise(); did.append("second pass") }
+                usleep(15000)
+            }
+        } while !ok && CACurrentMediaTime() - t0 < 0.6
+        return ["ok": true, "op": "restore", "restored": did.joined(separator: ", "), "order_restored": ok]
+    }
+}
+
 
 // MARK: - input actor
 //
@@ -1468,6 +2001,8 @@ func cmdInput() {
             reply(["ok": true, "op": op, "x": p.x, "y": p.y, "ms": Int(Date().timeIntervalSince(t0) * 1000),
                    "peak_force": curve.max() ?? 0, "force_clicked": maxStage == 2]); continue
         case "pos": break
+        case "raise": reply(Win.raiseOp(c)); continue
+        case "restore": reply(Win.restoreOp(c)); continue
         case "inspect":
             // The element under a point (default: the pointer) — everything it exposes — plus the window there.
             let p = CGPoint(x: num("x", pointer().x), y: num("y", pointer().y))
@@ -1518,14 +2053,326 @@ func cmdInput() {
     exit(0)
 }
 
+// MARK: - watch: UI events as lines, so an agent can wait on the screen instead of polling it
+
+/// Element-equality wrapper (AX refs to the same element are CFEqual, not pointer-equal).
+struct AXKey: Hashable {
+    let el: AXUIElement
+    static func == (a: AXKey, b: AXKey) -> Bool { CFEqual(a.el, b.el) }
+    func hash(into h: inout Hasher) { h.combine(CFHash(el)) }
+}
+
+final class Watch {
+    struct Win { let pid: pid_t; var title: String; let kind: String }
+    /// System agents that put up the dialogs an agent most often waits on (permission prompts, banners,
+    /// Gatekeeper). Observed by default alongside every regular app.
+    static let systemUI: Set<String> = ["com.apple.notificationcenterui", "com.apple.UserNotificationCenter",
+                                        "com.apple.CoreServicesUIAgent", "com.apple.coreservices.uiagent",
+                                        "com.apple.SecurityAgent", "com.apple.accessibility.universalAccessAuthWarn"]
+
+    let asJSON = argv.contains("--json")
+    let values = argv.contains("--values")
+    let untils: [String] = argv.indices.filter { argv[$0] == "--until" && $0 + 1 < argv.count }.map { argv[$0 + 1].lowercased() }
+    let apps: [String] = argv.indices.filter { argv[$0] == "--app" && $0 + 1 < argv.count }.map { argv[$0 + 1].lowercased() }
+    var observers: [pid_t: AXObserver] = [:]
+    var names: [pid_t: String] = [:]
+    var windows: [AXKey: Win] = [:]
+    var lastValue: [AXKey: (at: Double, text: String)] = [:]
+    var pendingValue: Set<AXKey> = []
+    var lastActivate: (pid: pid_t, at: Double) = (0, 0)
+    var lastLine = (text: "", at: 0.0)
+    let clock = DateFormatter()
+    let debugRaw = ProcessInfo.processInfo.environment["EYE_WATCH_RAW"] != nil
+
+    init() { clock.dateFormat = "HH:mm:ss" }
+    func now() -> Double { Date().timeIntervalSinceReferenceDate }
+
+    func wanted(_ app: NSRunningApplication) -> Bool {
+        let pid = app.processIdentifier
+        guard pid != getpid(), app.localizedName != "eye-capture" else { return false }
+        if apps.isEmpty { return app.activationPolicy == .regular || Watch.systemUI.contains(app.bundleIdentifier ?? "") }
+        let name = (app.localizedName ?? "").lowercased(), bid = (app.bundleIdentifier ?? "").lowercased()
+        return apps.contains { $0 == String(pid) || $0 == bid || name == $0 || name.hasPrefix($0) }
+    }
+
+    // MARK: output
+
+    func emit(_ event: String, _ pid: pid_t, _ fields: [String: Any] = [:], initial: Bool = false) {
+        let app = names[pid] ?? NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
+        var text = "\(event) \(app)"
+        if let k = fields["kind"] as? String, !event.hasPrefix(k) { text += " \(k)" }
+        if let t = fields["title"] as? String, !t.isEmpty { text += " \"\(t)\"" }
+        if let old = fields["from"] as? String { text = "\(event) \(app) \"\(old)\" → \"\(fields["title"] as? String ?? "")\"" }
+        if let v = fields["value"] as? String { text += " = \"\(v)\"" }
+        if let ts = fields["texts"] as? [String], !ts.isEmpty { text += " — " + ts.map { "\"\($0)\"" }.joined(separator: " ") }
+        if let bs = fields["buttons"] as? [String], !bs.isEmpty { text += " [" + bs.joined(separator: " | ") + "]" }
+        let matched = !untils.isEmpty && untils.contains { text.lowercased().contains($0) }
+        if initial && !matched { return }              // existing state is only reported when it already satisfies --until
+        let t = now()
+        if text == lastLine.text && t - lastLine.at < 0.4 { return }   // AX double-fires some notifications
+        lastLine = (text, t)
+        if asJSON {
+            var o = fields; o["event"] = initial ? "already-" + event : event; o["app"] = app; o["pid"] = pid
+            o["t"] = Date().timeIntervalSince1970; if matched { o["matched"] = true }
+            print(json(o))
+        } else {
+            print("\(clock.string(from: Date())) \(initial ? "already " : "")\(text)")
+        }
+        if matched { exit(0) }
+    }
+
+    // MARK: describing what appeared
+
+    static func role(_ el: AXUIElement) -> (role: String, subrole: String) {
+        let v = AXI.many(el, [kAXRoleAttribute, kAXSubroleAttribute])
+        return (v[kAXRoleAttribute] as? String ?? "", v[kAXSubroleAttribute] as? String ?? "")
+    }
+    static func title(_ el: AXUIElement) -> String { AXI.text(AXI.raw(el, kAXTitleAttribute), max: 120) ?? "" }
+
+    /// What a person would read in a window: its texts and its buttons. Bounded walk; dialogs are small.
+    static func contents(_ root: AXUIElement) -> (texts: [String], buttons: [String]) {
+        var texts: [String] = [], buttons: [String] = [], queue: [(AXUIElement, Int)] = [(root, 0)], seen = 0
+        while !queue.isEmpty, seen < 120, texts.count < 4 || buttons.count < 6 {
+            let (el, depth) = queue.removeFirst(); seen += 1
+            let v = AXI.many(el, [kAXRoleAttribute, kAXTitleAttribute, kAXValueAttribute, kAXDescriptionAttribute, kAXChildrenAttribute])
+            let r = v[kAXRoleAttribute] as? String ?? ""
+            let label = [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute].lazy
+                .compactMap { AXI.text(v[$0], max: 100) }.first { !$0.isEmpty }
+            if r == "AXStaticText", let l = label, texts.count < 4, !texts.contains(l) { texts.append(l) }
+            if r == "AXButton", let l = (AXI.text(v[kAXTitleAttribute], max: 40) ?? label), !l.isEmpty, buttons.count < 6, !buttons.contains(l) { buttons.append(l) }
+            if ["AXSearchField", "AXTextField", "AXComboBox", "AXTextArea", "AXWebArea"].contains(r) { continue }   // their insides aren't what the window says
+            if depth < 8, let kids = v[kAXChildrenAttribute] as? [AXUIElement] { queue += kids.prefix(40).map { ($0, depth + 1) } }
+        }
+        return (texts, buttons)
+    }
+
+    /// Window or sheet → fields. Plain document windows report just their title; anything modal, floating
+    /// or untitled (dialogs, alerts, sheets, banners, panels) also reports what it says and its buttons.
+    func describe(_ el: AXUIElement, _ pid: pid_t) -> [String: Any] {
+        let (r, s) = Watch.role(el)
+        let kind = r == "AXSheet" ? "sheet" : s == "AXDialog" || s == "AXSystemDialog" ? "dialog"
+            : s == "AXFloatingWindow" || s == "AXSystemFloatingWindow" ? "panel" : "window"
+        let t = Watch.title(el)
+        var o: [String: Any] = ["title": t]
+        if kind != "window" { o["kind"] = kind }
+        if kind != "window" || t.isEmpty || Watch.systemUI.contains(NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? "") {
+            let c = Watch.contents(el)
+            if !c.texts.isEmpty { o["texts"] = c.texts.filter { $0 != t } }
+            if !c.buttons.isEmpty { o["buttons"] = c.buttons }
+        }
+        return o
+    }
+
+    func track(_ el: AXUIElement, _ pid: pid_t, _ fields: [String: Any]) {
+        windows[AXKey(el: el)] = Win(pid: pid, title: fields["title"] as? String ?? "", kind: fields["kind"] as? String ?? "window")
+        if let obs = observers[pid] { AXObserverAddNotification(obs, el, kAXUIElementDestroyedNotification as CFString, nil) }
+    }
+
+    // MARK: AX callbacks
+
+    func handle(_ el: AXUIElement, _ note: String, _ info: CFDictionary?) {
+        let pid = AXI.pid(el)
+        if debugRaw { FileHandle.standardError.write("raw \(note) \(AXI.summary(el))\(info.map { " info=\(($0 as NSDictionary).description.replacingOccurrences(of: "\n", with: " "))" } ?? "")\n".data(using: .utf8)!) }
+        switch note {
+        case kAXWindowCreatedNotification, kAXSheetCreatedNotification, kAXDrawerCreatedNotification:
+            // Content is often filled in a beat after the window exists: describe it once it has settled.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [self] in
+                guard windows[AXKey(el: el)] == nil else { return }
+                let f = describe(el, pid)
+                track(el, pid, f)
+                emit(note == kAXSheetCreatedNotification ? "sheet-opened" : "window-opened", pid, f)
+            }
+        case kAXUIElementDestroyedNotification:
+            guard let w = windows.removeValue(forKey: AXKey(el: el)) else { return }
+            var f: [String: Any] = ["title": w.title]; if w.kind != "window" { f["kind"] = w.kind }
+            emit(w.kind == "sheet" ? "sheet-closed" : "window-closed", w.pid, f)
+        case kAXTitleChangedNotification:
+            let k = AXKey(el: el)
+            guard var w = windows[k] else { return }
+            let t = Watch.title(el)
+            guard t != w.title else { return }
+            emit("title-changed", pid, ["from": w.title, "title": t])
+            w.title = t; windows[k] = w
+        case kAXFocusedWindowChangedNotification:
+            if lastActivate.pid == pid && now() - lastActivate.at < 0.6 { return }   // already said by app-focused
+            if windows[AXKey(el: el)] == nil && Watch.role(el).role == "AXWindow" { return }   // brand new: window-opened says it
+            let t = Watch.title(el)
+            if !t.isEmpty { emit("window-focused", pid, ["title": t]) }   // untitled = a sheet or a window mid-close: noise
+        case kAXWindowMiniaturizedNotification:
+            emit("window-minimized", pid, ["title": Watch.title(el)])
+        case kAXAnnouncementRequestedNotification:
+            // Apps send either a String or an NSAttributedString (Calculator: "Result, 46" with a priority attribute).
+            let raw = (info as? [String: Any])?[kAXAnnouncementKey as String]
+            let text = ((raw as? NSAttributedString)?.string ?? raw as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { emit("announced", pid, ["title": text]) }
+        case kAXValueChangedNotification:
+            valueChanged(el, pid)
+        default: break
+        }
+    }
+
+    /// Value changes are leading-edge + trailing throttled per element (≤1/s), so a progress bar reports its
+    /// first move, then once a second, and always its final value.
+    func valueChanged(_ el: AXUIElement, _ pid: pid_t, trailing: Bool = false) {
+        let k = AXKey(el: el)
+        if trailing { pendingValue.remove(k) } else if pendingValue.contains(k) { return }
+        let (r, _) = Watch.role(el)
+        guard ["AXStaticText", "AXProgressIndicator", "AXBusyIndicator", "AXLevelIndicator", "AXValueIndicator"].contains(r) else { return }
+        let v = AXI.raw(el, kAXValueAttribute)
+        let text = AXI.text(v, max: 100) ?? ""
+        let shown = r == "AXProgressIndicator" ? (v as? NSNumber).map { n -> String in
+            let mx = (AXI.raw(el, kAXMaxValueAttribute) as? NSNumber)?.doubleValue ?? 1
+            return "\(Int((n.doubleValue / (mx > 0 ? mx : 1) * 100).rounded()))%"
+        } ?? text : text
+        guard !shown.isEmpty else { return }
+        // A window's own title text repeats title-changed; a window not announced yet (an alert being filled in)
+        // reports its texts with window-opened / sheet-opened instead.
+        let top = AXI.raw(el, kAXTopLevelUIElementAttribute).flatMap { AXI.isElement($0) ? ($0 as! AXUIElement) : nil }
+            ?? AXI.raw(el, kAXWindowAttribute).flatMap { AXI.isElement($0) ? ($0 as! AXUIElement) : nil }
+        if let top {
+            if windows[AXKey(el: top)] == nil { return }   // not announced yet: window-opened/sheet-opened will carry its texts
+            if Watch.title(top) == shown { return }         // the window's own title text: title-changed says it
+        }
+        let t = now()
+        if let last = lastValue[k] {
+            if last.text == shown { return }
+            if t - last.at < 1 {
+                pendingValue.insert(k)
+                DispatchQueue.main.asyncAfter(deadline: .now() + (1 - (t - last.at))) { [self] in valueChanged(el, pid, trailing: true) }
+                return
+            }
+        }
+        lastValue[k] = (t, shown)
+        emit("value-changed", pid, ["kind": String(r.dropFirst(2)), "value": shown])
+    }
+
+    // MARK: wiring
+
+    /// `initial`: windows already up at watch start (only reported if they satisfy --until). `fresh`: the app
+    /// just launched, so every window it has is new and reports as opened. Returns false while the app isn't
+    /// answering AX yet (an observer attached before then never receives anything).
+    @discardableResult
+    func observe(_ app: NSRunningApplication, initial: Bool, fresh: Bool = false) -> Bool {
+        let pid = app.processIdentifier
+        guard observers[pid] == nil else { return true }
+        guard wanted(app) else { return true }
+        let probe = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(probe, 0.3)
+        var wv: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(probe, kAXWindowsAttribute as CFString, &wv) == .success else { return false }
+        var obs: AXObserver?
+        let cb: AXObserverCallbackWithInfo = { _, el, note, info, _ in watcher.handle(el, note as String, info) }
+        guard AXObserverCreateWithInfoCallback(pid, cb, &obs) == .success, let obs else { return false }
+        let root = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(root, 0.3)
+        var notes = [kAXWindowCreatedNotification, kAXSheetCreatedNotification, kAXDrawerCreatedNotification, kAXTitleChangedNotification,
+                     kAXFocusedWindowChangedNotification, kAXWindowMiniaturizedNotification, kAXAnnouncementRequestedNotification]
+        if values { notes.append(kAXValueChangedNotification) }
+        var ok = 0
+        for n in notes where AXObserverAddNotification(obs, root, n as CFString, nil) == .success { ok += 1 }
+        guard ok > 0 else { return false }   // not answering AX (yet)
+        observers[pid] = obs
+        names[pid] = app.localizedName ?? "pid \(pid)"
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
+        // Windows (and their sheets) that already exist: remember them so closes and title changes report,
+        // and if one already says what --until waits for, the wait is over before it started.
+        for w in (AXI.raw(root, kAXWindowsAttribute) as? [AXUIElement]) ?? [] {
+            let f = describe(w, pid)
+            track(w, pid, f)
+            if initial || fresh { emit(fresh ? "window-opened" : "window", pid, f, initial: initial) }
+            for s in (AXI.raw(w, kAXChildrenAttribute) as? [AXUIElement]) ?? [] where Watch.role(s).role == "AXSheet" {
+                let sf = describe(s, pid); track(s, pid, sf)
+                if initial || fresh { emit(fresh ? "sheet-opened" : "sheet", pid, sf, initial: initial) }
+            }
+        }
+        return true
+    }
+
+    func forget(_ pid: pid_t) {
+        if let obs = observers.removeValue(forKey: pid) {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
+        }
+        windows = windows.filter { $0.value.pid != pid }
+    }
+
+    func start() {
+        let ws = NSWorkspace.shared, nc = ws.notificationCenter
+        func app(_ n: Notification) -> NSRunningApplication? { n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication }
+        nc.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [self] n in
+            guard let a = app(n), wanted(a) else { return }
+            names[a.processIdentifier] = a.localizedName
+            emit("app-launched", a.processIdentifier)
+            // AX isn't answering the instant a process launches: attach once it is (checked 4×/s, up to 10 s).
+            func attach(_ tries: Int) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [self] in
+                    if a.isTerminated || observe(a, initial: false, fresh: true) || tries <= 0 { return }
+                    attach(tries - 1)
+                }
+            }
+            attach(40)
+        }
+        nc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [self] n in
+            guard let a = app(n), wanted(a) || observers[a.processIdentifier] != nil else { return }
+            emit("app-quit", a.processIdentifier)
+            forget(a.processIdentifier)
+        }
+        nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [self] n in
+            guard let a = app(n), wanted(a) else { return }
+            let pid = a.processIdentifier
+            lastActivate = (pid, now())
+            let front = AXI.raw(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute).map { Watch.title($0 as! AXUIElement) } ?? ""
+            emit("app-focused", pid, ["title": front])
+        }
+        for a in ws.runningApplications { observe(a, initial: true) }
+        let list = observers.keys.compactMap { names[$0] }.sorted()
+        let what = apps.isEmpty ? "\(list.count) apps + system dialogs" : list.isEmpty ? "nothing running yet (\(apps.joined(separator: ", ")))" : list.joined(separator: ", ")
+        let until = untils.isEmpty ? "" : " until " + untils.map { "\"\($0)\"" }.joined(separator: " or ")
+        if asJSON { print(json(["event": "ready", "apps": list, "until": untils])) }
+        else { print("\(clock.string(from: Date())) ready watching \(what)\(until)") }
+    }
+}
+
+var watcher: Watch!
+func cmdWatch() {
+    if argv.contains("--help") || argv.contains("-h") {
+        print("""
+        usage: watch [--app NAME|BUNDLE_ID|PID]... [--until TEXT]... [--seconds N] [--values] [--json]
+          One line per UI event, as it happens: app-launched/quit/focused, window-opened/closed/focused/minimized,
+          sheet-opened/closed, title-changed, announced (VoiceOver announcements), and with --values
+          value-changed for text, progress and level indicators. Dialogs, sheets and banners include what they
+          say and their [buttons]. --app (repeatable; name matches as a prefix) limits it to those apps; default
+          is every regular app plus system dialogs.
+          --until TEXT (repeatable, case-insensitive substring of the line): print the first matching line and
+          exit 0. A window that already matches when the watch starts counts ("already …").
+          --seconds N: stop after N s; exit 124 if an --until never matched.
+        """)
+        exit(0)
+    }
+    guard AXIsProcessTrusted() else { fail("Accessibility permission missing for the host app (System Settings → Privacy & Security → Accessibility)") }
+    setvbuf(stdout, nil, _IOLBF, 0)   // a pipe is block-buffered by default; every event must leave now
+    signal(SIGPIPE, SIG_DFL)
+    onTerminate { exit(0) }
+    watcher = Watch()
+    if let s = opt("seconds").flatMap(Double.init), s > 0 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + s) {
+            if watcher.untils.isEmpty { exit(0) }
+            print(watcher.asJSON ? json(["event": "timeout", "seconds": s]) : "\(watcher.clock.string(from: Date())) timeout after \(s.formatted())s — nothing matched")
+            exit(124)
+        }
+    }
+    watcher.start()
+}
+
 // MARK: - main
 
 switch sub {
 case "input": cmdInput()
 case "displays": Task { await cmdDisplays() }
 case "snapshot": Task { await cmdSnapshot() }
+case "raw": cmdRaw()
 case "capture": Task { await cmdCapture() }
 case "lock": cmdLock()
+case "watch": cmdWatch()
 case "release-cursor": CGAssociateMouseAndMouseCursorPosition(1); exit(0)
 default:
     print("usage: eye-capture displays | capture --rect x,y,w,h --out f.csv [--seconds N] | snapshot --rect x,y,w,h --out f.png | lock [--seconds N]")

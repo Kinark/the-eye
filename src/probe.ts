@@ -7,7 +7,9 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileS
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
-import { checkInstances, claimDriver, duplicatesSchemaDescription } from "./single.ts";
+import { checkInstances, driving, duplicatesSchemaDescription } from "./single.ts";
+import { whyGap, type Stall, type Stalls } from "./notice.ts";
+import { CURVES, bezierValue, fitMotion, formatFit, type MotionFit, type Sample } from "./physics.ts";
 
 type Deps = {
   root: string;
@@ -162,15 +164,175 @@ function fmtEntry(e: any): string {
 }
 export function describeProbeLive(l: any, max = 8): string {
   if (!l) return "probe: (no live data yet)";
-  const lines = [`probe @${l.t.toFixed(1)}s · last ${l.window_s}s: ${l.ticks} ticks (${l.tick_hz.toFixed(0)}/s) · walk p50 ${l.walk_us_p50}µs max ${l.walk_us_max}µs · ${l.layers_tracked} layers · ${l.moving_count} moving`];
+  const lines = [`probe @${l.t.toFixed(1)}s · last ${l.window_s}s: ${l.ticks} ticks (${l.tick_hz.toFixed(0)}/s) · walk p50 ${l.walk_us_p50}µs max ${l.walk_us_max}µs · ${l.layers_tracked} layers · ${l.moving_count} moving${l.stalls ? ` · MAIN THREAD STALLED ${l.stalls}× so far (worst ${l.stall_worst_ms}ms)` : ""}`];
   if (l.moving?.length) lines.push(` moving:`, ...l.moving.slice(0, max).map(fmtEntry));
   if (l.watched?.length) lines.push(` watched:`, ...l.watched.slice(0, max).map(fmtEntry));
   return lines.join("\n");
 }
 
+// ---- main-thread stalls (the probe's watchdog: "H" lines + their "F" frames)
+
+/** Every stall in a probe recording, frames resolved, plus the span the watchdog covered (mach seconds). */
+export function readStalls(file: string, name = "the app", pid = 0): Stalls | null {
+  let head: any = null, lastT = 0;
+  const frames = new Map<number, { s: string; b: string; a: number }>();
+  const raw = new Map<number, any>();
+  let lines: string[];
+  try { lines = readFileSync(file, "utf8").split("\n"); } catch { return null; }
+  for (const line of lines) {
+    // Tick lines are the bulk of the file and carry nothing needed here but their time.
+    if (line.startsWith('{"k":"T"')) { const m = line.match(/"t":([\d.]+)/); if (m) lastT = Number(m[1]); continue; }
+    if (!line) continue;
+    let r: any; try { r = JSON.parse(line); } catch { continue; }
+    if (r.k === "S") head = r;
+    else if (r.k === "F") frames.set(r.i, r);
+    else if (r.k === "H") raw.set(r.t, r); // an ongoing stall is rewritten: the last line for a start time wins
+    else if (r.k === "E") lastT = Math.max(lastT, r.t ?? 0);
+  }
+  if (!head || head.stall_ms === undefined) return null; // recorded by a probe without the watchdog
+  const short = (s: string) => s.replace(/\(.*?\)/g, "()").replace(/closure #\d+ in /g, "λ ").replace(/ -> .*$/, "").slice(0, 120);
+  const stalls: Stall[] = [...raw.values()].sort((x, y) => x.t - y.t).map((h) => {
+    const app = new Map<string, number>(), leaf = new Map<string, number>(), whole = new Map<string, number>();
+    for (const st of h.s as number[][]) {
+      const f = st.map((i) => frames.get(i) ?? { s: "?", b: "?", a: 0 });
+      // Deepest frame in the app's own image = "our code that was running"; the leaf = what it was actually doing.
+      const own = f.find((x) => x.a && !/^(main|\?|0x|__debug_main_executable)/.test(x.s)); // Xcode's debug-dylib stub is `main` by another name
+      if (own) app.set(short(own.s), (app.get(short(own.s)) ?? 0) + 1);
+      if (f[0]) { const k = `${short(f[0].s)} [${f[0].b}]`; leaf.set(k, (leaf.get(k) ?? 0) + 1); }
+      const k = st.join(",");
+      whole.set(k, (whole.get(k) ?? 0) + 1);
+    }
+    const top = (m: Map<string, number>) => [...m].sort((x, y) => y[1] - x[1]).slice(0, 4);
+    const common = top(whole)[0]?.[0].split(",").map(Number) ?? [];
+    return { t: h.t, ms: h.ms, n: h.n, ongoing: h.ongoing, app: top(app), leaf: top(leaf),
+      stack: trimStack(common, frames).map((i) => { const x = frames.get(i); return x ? `${short(x.s)}${x.a ? "" : ` [${x.b}]`}` : "?"; }) };
+  });
+  return { name, pid: pid || head.pid, from: head.t, to: Math.max(lastT, head.t), threshold_ms: head.stall_ms, stacks: !!head.stacks, stalls };
+}
+/** Leaf → the outermost frame of the app's own code, plus the system caller that ran it; 10 frames at most. */
+function trimStack(st: number[], frames: Map<number, { a: number; s: string }>): number[] {
+  let last = -1;
+  st.forEach((i, k) => { const f = frames.get(i); if (f?.a && !/^(main|start|\?|0x|__debug_main_executable)/.test(f.s)) last = k; }); // `main` is everyone's root, not a clue
+  if (last < 0) return st.slice(0, 6);
+  // Leaf side first: what it was executing, then the app's frames out to the one the system called into.
+  return last + 2 <= 10 ? st.slice(0, last + 2) : [...st.slice(0, 3), ...st.slice(last - 5, last + 2)];
+}
+/** Save what the running (or last) probe's watchdog saw next to a capture, so its reports can say WHY. */
+export function snapshotStalls(dir: string): Stalls | null {
+  const r = [...runs.values()].filter((x) => !x.final).pop();
+  if (!r) return null;
+  const st = readStalls(r.out, r.target.name, r.target.pid);
+  if (!st) return null;
+  st.to += 0.15; // ticks reach the file in batches of 12
+  try { writeFileSync(join(dir, "stalls.json"), JSON.stringify(st)); } catch { /* run dir gone */ }
+  return st;
+}
+function stallSection(st: Stalls | null, t0: number, top: number): string[] {
+  if (!st) return [];
+  if (!st.stalls.length) return [`main thread: no run-loop turn over ${st.threshold_ms}ms — the app's main thread never held a frame back`];
+  const worst = [...st.stalls].sort((x, y) => y.ms - x.ms).slice(0, top);
+  return [
+    `main-thread stalls (run-loop turns over ${st.threshold_ms}ms): ${st.stalls.length}, ${st.stalls.reduce((s, x) => s + x.ms, 0).toFixed(0)}ms in total · worst first:`,
+    ...worst.flatMap((s) => whyGap({ ...st, from: -Infinity, to: Infinity, stalls: [s] }, t0, s.t - t0, s.t - t0 + s.ms / 1000).map((l) => (l.startsWith(" ") ? `  ${l}` : `- ${l}`))),
+    st.stalls.length > top ? `… ${st.stalls.length - top} more` : "",
+  ];
+}
+
+// ---- what moved a layer: the fit on its exact values, next to what the app declared
+
+type Change = { t: number; v: number[]; motion: boolean };
+const CHANNELS = ["x", "y", "width", "height", "opacity", "shape x", "shape y", "shape width", "shape height"];
+const r2 = (x: number) => (Math.round(x * 100) / 100).toString();
+const shown = (v: unknown) => (typeof v === "number" ? r2(v) : typeof v === "string" ? v.replace(/^NS(Point|Size|Rect): /, "") : "?");
+
+/**
+ * One stretch of a layer's motion as a series, one sample per display tick, on the channel that travelled furthest
+ * (size before position: a thing growing about its centre moves its edge too). samples[0] is the value at rest before.
+ */
+export function segmentSeries(chs: Change[], seg: { a: number; b: number }, tickTimes: number[], hz: number):
+  { samples: Sample[]; channel: number; cut: boolean } | null {
+  const i0 = chs.findIndex((c) => c.t >= seg.a - 1e-6);
+  if (i0 < 1) return null; // never seen at rest before it moved
+  let i1 = i0;
+  while (i1 + 1 < chs.length && chs[i1 + 1].t <= seg.b + 1e-6) i1++;
+  const range = (k: number) => {
+    let lo = Infinity, hi = -Infinity;
+    for (let i = i0 - 1; i <= i1; i++) { const x = chs[i].v[k]; if (x === null || x === undefined) return 0; lo = Math.min(lo, x); hi = Math.max(hi, x); }
+    return hi - lo;
+  };
+  let channel = -1, most = 0.5;
+  for (const k of [2, 3, 0, 1, 7, 8, 5, 6]) { const r = range(k); if (r > most * 1.02) { most = r; channel = k; } }
+  if (channel < 0) { if (range(4) < 0.02) return null; channel = 4; }
+  const next = chs[i1 + 1]?.t ?? Infinity, until = Math.min(next - 1e-6, seg.b + 0.25);
+  const before = tickTimes.filter((t) => t < seg.a - 1e-6).pop() ?? seg.a - 1 / hz;
+  const samples: Sample[] = [{ t: before, x: chs[i0 - 1].v[channel] }];
+  let i = i0 - 1;
+  for (const t of tickTimes) {
+    if (t < seg.a - 1e-6) continue;
+    if (t > until) break;
+    while (i < i1 && chs[i + 1].t <= t + 1e-6) i++;
+    samples.push({ t, x: chs[i].v[channel] });
+  }
+  const last = tickTimes[tickTimes.length - 1] ?? seg.b;
+  return { samples, channel, cut: last - seg.b < 2.5 / hz };
+}
+
+const timing = (tf: number[] | null | undefined) => {
+  if (!tf) return "linear";
+  const preset = CURVES.find(([, p]) => p.every((x, i) => Math.abs(x - tf[i]) < 0.011));
+  const bez = `cubic-bezier(${tf.map(r2).join(", ")})`;
+  return preset ? (preset[0] === "linear" ? "linear" : `${preset[0].split(" (")[0]} = ${bez}`) : bez;
+};
+
+/** One Core Animation animation as the app declared it, in the words its code used. */
+export function describeDeclared(a: any): string {
+  const on = a.kp ?? a.key ?? "?";
+  const span = a.from !== null && a.from !== undefined && a.to !== null && a.to !== undefined ? ` ${shown(a.from)} → ${shown(a.to)}` : "";
+  const extra = `${a.additive ? ", additive" : ""}${a.autoreverses ? ", autoreverses" : ""}${a.repeat ? `, repeats ${a.repeat === "forever" ? "forever" : `${r2(a.repeat)}×`}` : ""}${a.speed !== undefined && a.speed !== 1 ? `, speed ${r2(a.speed)}` : ""}`;
+  if (a.cls === "CASpringAnimation" && a.mass > 0 && a.stiffness > 0) {
+    const zeta = a.damping / (2 * Math.sqrt(a.stiffness * a.mass)), response = (2 * Math.PI) / Math.sqrt(a.stiffness / a.mass);
+    return `CASpringAnimation on ${on}${span}: mass ${r2(a.mass)} stiffness ${r2(a.stiffness)} damping ${r2(a.damping)} = damping ratio ${r2(zeta)}, response ${r2(response)}s${a.v0 ? `, initial velocity ${r2(a.v0)}` : ""}; given ${r2(a.dur)}s to run${typeof a.settle === "number" && a.dur < a.settle * 0.8 ? ` — CUT SHORT: it needs ${r2(a.settle)}s to settle, so it snaps to the end` : ""}${extra}`;
+  }
+  if (a.cls === "CAAnimationGroup") return `CAAnimationGroup (${r2(a.dur)}s${extra}): ${(a.group ?? []).map(describeDeclared).join(" + ")}`;
+  if (a.cls === "CAKeyframeAnimation") return `CAKeyframeAnimation on ${on}: ${a.path ? "along a path" : `${a.values} values`} over ${r2(a.dur)}s, ${a.mode}${a.keyTimes ? ` at ${a.keyTimes.map(r2).join(", ")}` : ""}${extra}`;
+  if (a.cls === "CATransition") return `CATransition ${a.transition} over ${r2(a.dur)}s, ${timing(a.tf)}${extra}`;
+  if (a.cls === "CABasicAnimation") return `CABasicAnimation on ${on}${span}: ${r2(a.dur)}s, ${timing(a.tf)}${extra}`;
+  return `${a.cls} on ${on}: ${r2(a.dur)}s${extra}`;
+}
+
+/** Did the frames do what the code asked? Only said when one declared animation is the same kind as the fit. */
+export function declaredVerdict(fit: MotionFit, declared: any[]): string | null {
+  const m = fit.model;
+  if (!m || fit.caveat) return null;
+  const flat = declared.flatMap((a) => (a.cls === "CAAnimationGroup" ? a.group ?? [] : [a]));
+  if (m.kind === "spring") {
+    const s = flat.filter((a) => a.cls === "CASpringAnimation" && a.mass > 0 && a.stiffness > 0);
+    if (!s.length) return flat.some((a) => a.cls === "CABasicAnimation") ? "≠ the code declared a timed animation, yet it moved like a spring: something else is driving this layer too" : null;
+    const off = s.map((a) => {
+      const zeta = a.damping / (2 * Math.sqrt(a.stiffness * a.mass)), response = (2 * Math.PI) / Math.sqrt(a.stiffness / a.mass);
+      return { dz: Math.abs(zeta - m.zeta), dr: Math.abs(response - m.duration) / response, zeta, response };
+    }).sort((p, q) => p.dz + p.dr - (q.dz + q.dr))[0];
+    return off.dz <= 0.06 && off.dr <= 0.08 ? "✓ it ran as declared"
+      : `≠ declared damping ratio ${r2(off.zeta)} / response ${r2(off.response)}s, but it ran as ${r2(m.zeta)} / ${r2(m.duration)}s: interrupted, retargeted mid-flight, or stacked with another animation`;
+  }
+  if (m.kind === "curve") {
+    const c = flat.filter((a) => a.cls === "CABasicAnimation");
+    if (!c.length) return null;
+    const off = c.map((a) => {
+      const tf: number[] = a.tf ?? [0, 0, 1, 1];
+      let shape = 0;
+      for (let p = 0.1; p < 0.95; p += 0.1) shape = Math.max(shape, Math.abs(bezierValue(tf[0], tf[1], tf[2], tf[3], p) - bezierValue(m.p[0], m.p[1], m.p[2], m.p[3], p)));
+      return { shape, dd: Math.abs(a.dur - m.duration) / a.dur, a };
+    }).sort((p, q) => p.shape + p.dd - (q.shape + q.dd))[0];
+    return off.shape <= 0.04 && off.dd <= 0.1 ? "✓ it ran as declared"
+      : `≠ declared ${r2(off.a.dur)}s ${timing(off.a.tf)}, but it ran over ${r2(m.duration)}s${off.shape > 0.04 ? " along a different curve" : ""}: interrupted, slowed by dropped frames, or stacked with another animation`;
+  }
+  return null;
+}
+
 // ---- offline analysis
 
-type Opts = { match?: string[]; from_s?: number; to_s?: number; top?: number; split_ms?: number; capture_csv?: string; layer_id?: number; max_rows?: number };
+type Opts = { match?: string[]; from_s?: number; to_s?: number; top?: number; split_ms?: number; capture_csv?: string; layer_id?: number; max_rows?: number; name?: string };
 
 export function analyzeProbe(file: string, o: Opts = {}): string {
   const lines = readFileSync(file, "utf8").split("\n");
@@ -179,12 +341,14 @@ export function analyzeProbe(file: string, o: Opts = {}): string {
   const ticks: { t: number; us: number; v: number }[] = [];
   const changes = new Map<number, { t: number; v: number[]; motion: boolean }[]>();
   const lastVals = new Map<number, number[]>();
+  const anims = new Map<number, any[]>(); // what the app declared, per layer ("A" lines)
   for (const line of lines) {
     if (!line) continue;
     let r: any; try { r = JSON.parse(line); } catch { continue; }
     if (r.k === "S") head = r;
     else if (r.k === "E") end = r;
     else if (r.k === "L") layers.set(r.id, r);
+    else if (r.k === "A") { if (!anims.has(r.id)) anims.set(r.id, []); anims.get(r.id)!.push(r); }
     else if (r.k === "T") {
       ticks.push({ t: r.t, us: r.us, v: r.v });
       for (const g of r.g ?? []) lastVals.delete(g);
@@ -250,21 +414,87 @@ export function analyzeProbe(file: string, o: Opts = {}): string {
     }
     let frames = 0, upd = 0, gap = 0;
     for (const s of segs) { if (s.n < 2) continue; frames += ticksBetween(s.a, s.b); upd += s.n; gap = Math.max(gap, s.gap); }
-    stats.push({ id, label: label(id), updates: mv.length, segs, frames, upd, cov: frames ? upd / frames : null, gap, travel, shapeTravel, last: chs[chs.length - 1].v });
+    stats.push({ id, label: label(id), updates: mv.length, segs, chs, frames, upd, cov: frames ? upd / frames : null, gap, travel, shapeTravel, last: chs[chs.length - 1].v });
   }
   stats.sort((a, b) => b.travel + b.shapeTravel - (a.travel + a.shapeTravel));
   const top = o.top ?? 15;
+  // What moved each layer: the app's own declared animations, the fit on the exact values, and whether they agree.
+  const told = new Map<string, number>();
+  // Everything the app's own code asked Core Animation for, on whichever layer: the same animation started again
+  // (glow-1, glow-2, …) is one line with a count.
+  const declaredSection = (): string[] => {
+    const seen = new Map<string, { n: number; first: number; line: string }>();
+    for (const [id, list] of anims) {
+      if (match.length && !match.some((m) => label(id).toLowerCase().includes(m))) continue;
+      for (const a of list) {
+        if (a.t < from || a.t > to) continue;
+        const line = `#${id} ${label(id).slice(0, 70)} · "${String(a.key).replace(/[-_]?\d+$/, "")}" ${describeDeclared(a)}`;
+        const e = seen.get(line);
+        if (e) e.n++; else seen.set(line, { n: 1, first: a.t, line });
+      }
+    }
+    if (!seen.size) return [];
+    const rows = [...seen.values()].sort((p, q) => p.first - q.first);
+    return ["", `declared by the app's code (Core Animation animations found on layers as they changed): ${rows.length}`,
+      ...rows.slice(0, 12).map((r) => `  ${rel(r.first)}s ${r.line}${r.n > 1 ? ` · started ${r.n}×` : ""}`),
+      rows.length > 12 ? `  … ${rows.length - 12} more` : ""];
+  };
+  const stalls = readStalls(file, o.name ?? `pid ${head.pid}`);
+  // Too few in-between values to fit: say what the layer did instead, and what the main thread was doing meanwhile.
+  const leap = (ser: { samples: Sample[]; channel: number }, seg: { a: number; b: number; n: number }): string[] => {
+    const x = ser.samples, travel = x[x.length - 1].x - x[0].x;
+    let k = 1, lastChange = x[0].t, gap = 0;
+    for (let i = 1, prev = x[0].t; i < x.length; i++) {
+      if (x[i].x === x[i - 1].x) continue;
+      if (Math.abs(x[i].x - x[i - 1].x) > Math.abs(x[k].x - x[k - 1].x)) { k = i; gap = x[i].t - prev; }
+      prev = x[i].t; lastChange = x[i].t;
+    }
+    const step = x[k].x - x[k - 1].x, span = Math.max(Math.abs(travel), Math.abs(step));
+    if (span < 2 || Math.abs(step) < 0.3 * span) return [];
+    const hits = (stalls?.stalls ?? []).filter((h) => h.t < x[k].t + 0.004 && h.t + h.ms / 1000 > x[k].t - gap - 0.004).sort((p, q) => q.ms - p.ms);
+    const hit = hits[0], blocked = hits.reduce((t, h) => t + h.ms, 0);
+    const unit = ser.channel === 4 ? "" : "pt";
+    return [
+      `moved by: cannot be told — its ${CHANNELS[ser.channel]} went ${r2(x[k - 1].x)} → ${r2(x[k].x)}${unit} in ONE step at ${rel(x[k].t)}s (${Math.round((100 * Math.abs(step)) / span)}% of the way, ${Math.round(gap * 1000)}ms after its previous update); the animation's in-between positions were never shown`,
+      hit ? `  the app's main thread was blocked ${hits.length > 1 ? `${hits.length}× for ${blocked.toFixed(0)}ms around that gap, longest ` : ""}${hit.ms.toFixed(1)}ms from ${rel(hit.t)}s${hit.app.length ? ` in ${hit.app[0][0]}` : hit.leaf.length ? ` in ${hit.leaf[0][0]}` : ""}: that is where those positions went`
+        : `  ${seg.n} updates over ${Math.round((lastChange - x[0].t) * 1000)}ms: the app set it there in one go (no animation on this value), or its frames were dropped`,
+    ];
+  };
+  const why = (s: any): string => {
+    const L: string[] = [];
+    const segs = [...s.segs].filter((x: any) => x.n >= 6).sort((p: any, q: any) => q.n - p.n).slice(0, 3).sort((p: any, q: any) => p.a - q.a);
+    for (const seg of segs) {
+      const declared = (anims.get(s.id) ?? []).filter((a) => a.t >= seg.a - 0.05 && a.t <= seg.b + 1e-6);
+      const ser = segmentSeries(s.chs, seg, tickTimes, hz);
+      const fit = ser ? fitMotion(ser.samples, 1 / hz, { cut: ser.cut, res: ser.channel === 4 ? 0.004 : 0.01 }) : null;
+      const shownAs = { unit: ser?.channel === 4 ? " (opacity)" : "pt", from: `the layer's own ${CHANNELS[ser?.channel ?? 0]} inside the app, exact, every display tick` };
+      const verdict = fit && declared.length ? declaredVerdict(fit, declared) : null;
+      const body = [
+        ...declared.map((a) => `declared: ${describeDeclared(a)}`),
+        ...(fit?.model ? formatFit(fit, shownAs) : ser && leap(ser, seg).length ? leap(ser, seg) : fit ? formatFit(fit, shownAs) : []),
+        ...(verdict ? [verdict] : []),
+      ];
+      if (!body.length) continue;
+      const key = `${seg.a.toFixed(3)}|${body.join("|")}`, first = told.get(key);
+      if (first !== undefined) { L.push(`   ${rel(seg.a)}→${rel(seg.b)}s: moved exactly as #${first} did`); continue; }
+      told.set(key, s.id);
+      L.push(`   ${rel(seg.a)}→${rel(seg.b)}s`, ...body.map((b) => `     ${b}`));
+    }
+    return L.length ? "\n" + L.join("\n") : "";
+  };
   const out = [
     `probe ${head.id} · pid ${head.pid} · display ${head.display} @${hz}Hz · t relative to ${align}${end ? ` · ended: ${end.reason}` : ""}`,
     `ticks: ${tk.length} over ${span.toFixed(2)}s (${span ? (tk.length / span).toFixed(1) : 0}/s) · display-link gaps >1.5 frames: ${missed} · walk cost p50 ${pct(us, 0.5)}µs p95 ${pct(us, 0.95)}µs max ${us[us.length - 1] ?? 0}µs (runs on the app's main thread)`,
+    ...stallSection(stalls, t0, 5),
     `layers seen: ${layers.size} · layers that moved: ${stats.length}${match.length ? ` (matching ${o.match!.join(", ")})` : ""}`,
     "",
     "coverage = frames this layer's geometry actually changed / display frames during its motion (100% = updated every frame).",
     ...stats.slice(0, top).map((s) => {
       const segs = s.segs.filter((x: any) => x.n >= 2).map((x: any) => `${rel(x.a)}→${rel(x.b)}s`).slice(0, 4).join(", ");
-      return `#${s.id} ${s.label.slice(0, 100)}\n   ${s.updates} updates · ${s.cov === null ? "no sustained motion" : `coverage ${(s.cov * 100).toFixed(0)}% (${s.upd}/${s.frames})`} · max gap ${(s.gap * 1000).toFixed(1)}ms · travel ${s.travel.toFixed(1)}pt${s.shapeTravel ? ` · shape travel ${s.shapeTravel.toFixed(1)}pt` : ""}\n   motion ${segs || "-"} · now ${fmtRect(s.last.slice(0, 4))}${s.last[5] !== null && s.last[5] !== undefined ? ` · shape ${fmtRect(s.last.slice(5, 9))}` : ""}`;
+      return `#${s.id} ${s.label.slice(0, 100)}\n   ${s.updates} updates · ${s.cov === null ? "no sustained motion" : `coverage ${(s.cov * 100).toFixed(0)}% (${s.upd}/${s.frames})`} · max gap ${(s.gap * 1000).toFixed(1)}ms · travel ${s.travel.toFixed(1)}pt${s.shapeTravel ? ` · shape travel ${s.shapeTravel.toFixed(1)}pt` : ""}\n   motion ${segs || "-"} · now ${fmtRect(s.last.slice(0, 4))}${s.last[5] !== null && s.last[5] !== undefined ? ` · shape ${fmtRect(s.last.slice(5, 9))}` : ""}` + why(s);
     }),
     stats.length > top ? `… ${stats.length - top} more (raise top, or filter with match)` : "",
+    ...declaredSection(),
     `\nfile: ${file}`,
   ];
   return out.filter((x) => x !== "").join("\n");
@@ -299,7 +529,10 @@ export async function stopProbes(runDir: (label?: string) => string, id?: string
     const dest = join(dir, "probe.ndjson");
     try { copyFileSync(r.out, dest); } catch (e: any) { r.final = `${r.id}: could not read the recording: ${e.message}`; out.push(r.final); continue; }
     r.runDir = dir;
-    try { r.final = analyzeProbe(dest, o); } catch (e: any) { r.final = `could not analyze ${dest}: ${e.message}`; }
+    // The complete stall log goes next to the capture it explains (eye_report summary / explain read it there).
+    const st = readStalls(dest, r.target.name, r.target.pid);
+    if (st) for (const d of new Set([dir, ...(o.capture_csv ? [dirname(o.capture_csv)] : [])])) { try { writeFileSync(join(d, "stalls.json"), JSON.stringify(st)); } catch { /* gone */ } }
+    try { r.final = analyzeProbe(dest, { ...o, name: r.target.name }); } catch (e: any) { r.final = `could not analyze ${dest}: ${e.message}`; }
     out.push(r.final);
   }
   return out;
@@ -315,7 +548,10 @@ export function registerProbeTools(server: any, d: Deps) {
     description: [
       "Load the-eye's layer probe INTO a running app (if not loaded yet) and start recording, on every display refresh, the",
       "PRESENTATION geometry (live animated values) of the app's layers: frame, opacity, shape/mask bounds, in display-local points.",
-      "No pixels. Use it when you need to know WHICH layer moved/stuttered, not just that the screen did. Returns at once;",
+      "No pixels. It also times the app's MAIN THREAD from inside: every run-loop turn longer than a frame is logged with stack",
+      "samples of what was running, and every report of a capture taken meanwhile (eye_act, eye_record, eye_stop, eye_report) then",
+      "says WHY each freeze happened — the blocking function, or that the main thread was free. Use it whenever you need a cause,",
+      "or to know WHICH layer moved/stuttered. Costs ~0.2ms a frame plus nothing while the main thread is healthy. Returns at once;",
       "eye_peek shows the live state (call ~every 0.5s while acting), eye_act can aim at layers (`on`) and read them (`L('label')`),",
       "eye_stop ends it and returns the per-layer report (aligned to a running eye_record capture automatically).",
       "Needs a debuggable target (Debug build, get-task-allow) whose signing certificate is in your keychain. If Xcode is already",
@@ -336,10 +572,8 @@ export function registerProbeTools(server: any, d: Deps) {
       duplicates: z.enum(["ask", "quit_others", "relaunch", "allow"]).optional().describe(duplicatesSchemaDescription),
       app_path: z.string().optional().describe("For duplicates:\"relaunch\": the .app to start instead of the target's own."),
     },
-  }, async (p: any) => {
+  }, driving("eye_probe", fail, async (p: any) => {
     try {
-      const busy = claimDriver("eye_probe");
-      if (busy) return fail(busy);
       const c = await checkInstances(p.process, p.duplicates, p.app_path);
       if (!c.ok) return fail(c.error);
       const t = await resolveTarget(c.pid ?? p.process);
@@ -380,7 +614,7 @@ export function registerProbeTools(server: any, d: Deps) {
       }
       return fail("the probe did not start within 2s (is the app's main thread blocked?)");
     } catch (e: any) { return fail(e.message); }
-  });
+  }));
 }
 
 export function probeRunsStatus(): string[] {

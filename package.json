@@ -1,17 +1,28 @@
 {
   "name": "the-eye",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server that measures what is visible on a macOS screen over time: real on-screen fps, stalls, hitches and motion extent per displayed frame.",
   "type": "module",
-  "bin": { "the-eye": "src/index.ts" },
+  "bin": {
+    "the-eye": "src/index.ts"
+  },
   "scripts": {
     "start": "node src/index.ts",
+    "typecheck": "tsc -p .",
     "build:native": "mkdir -p bin && swiftc -O -swift-version 5 swift/EyeCapture.swift -o bin/eye-capture"
   },
-  "engines": { "node": ">=23.6" },
-  "os": ["darwin"],
+  "engines": {
+    "node": ">=23.6"
+  },
+  "os": [
+    "darwin"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
     "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^5.9.3"
   }
 }

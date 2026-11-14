@@ -16,6 +16,10 @@
 //       W  = [[windowNumber,x,y,w,h]], c = changed layers [[id,x,y,w,h,opacity,sx,sy,sw,sh]]
 //            (s* = bounds of the layer's shape path, or of its CAShapeLayer mask; null if none)
 //       g  = ids that disappeared (hidden / removed)
+//   {"k":"H","t","ms","n","s","ongoing"?}             a main-thread stall: one run-loop turn that began at t and
+//       lasted ms; s = n stack samples taken while it lasted, each a list of frame indexes, leaf first
+//       (ongoing = still blocked: rewritten once a second, the last line for a t wins)
+//   {"k":"F","i","s","b","a"}                        frame i: symbol, image, a = 1 when the image is the app's own
 //   {"k":"E","reason"}                               end
 import AppKit
 import QuartzCore
@@ -41,6 +45,7 @@ final class EyeProbeRecording: NSObject {
     let onFinish: (EyeProbeRecording, String) -> Void
 
     private var link: CADisplayLink?
+    private var watchdog: EyeMainWatchdog?
     private let handle: FileHandle
     private let io = DispatchQueue(label: "eye.probe.io")
     private var buf = ""
@@ -49,6 +54,7 @@ final class EyeProbeRecording: NSObject {
     private var last: [Int: [Double]] = [:]
     private var nextId = 1
     private var wantedCache: [Int: Bool] = [:]
+    private var noted = Set<String>()
     /// Focus mode (match given): a full tree walk only every `rescanEvery` ticks to (re)discover the
     /// labelled layers (match ∪ watch); the ticks in between re-measure just those, so the probe's main-thread
     /// cost stays tiny however big the app's layer tree is. `watch` alone never narrows what is logged.
@@ -124,6 +130,7 @@ final class EyeProbeRecording: NSObject {
             "walk_us_p50": costs.isEmpty ? 0 : costs[costs.count / 2],
             "walk_us_max": costs.last ?? 0,
             "layers_tracked": last.count,
+            "stalls": watchdog?.count ?? 0, "stall_worst_ms": round3(watchdog?.worstMs ?? 0),
             "moving_count": moving.count,
             "moving": moving.prefix(16).map(entry),
             "watched": watched.prefix(24).map(entry),
@@ -140,8 +147,16 @@ final class EyeProbeRecording: NSObject {
         head += ",\"screen\":[\(sf.minX),\(sf.minY),\(sf.width),\(sf.height)],\"scale\":\(screen.backingScaleFactor)"
         head += ",\"hz\":\(screen.maximumFramesPerSecond),\"focus\":\(focus)"
         if let r = rect { head += ",\"rect\":[\(r.minX),\(r.minY),\(r.width),\(r.height)]" }
+        // A turn of the main run loop longer than a frame and a quarter is a stall worth explaining.
+        let threshold = max(0.008, 1.25 / Double(max(screen.maximumFramesPerSecond, 30)))
+        head += ",\"stall_ms\":\(String(format: "%.2f", threshold * 1000)),\"stacks\":\(EyeMainWatchdog.stacks)"
         head += ",\"match\":[\(match.map(json).joined(separator: ","))]}\n"
         buf += head
+        let h = handle, q = io
+        watchdog = EyeMainWatchdog(threshold: threshold) { line in
+            let data = Data(line.utf8)
+            q.async { try? h.write(contentsOf: data) }
+        }
         let l = screen.displayLink(target: self, selector: #selector(tick(_:)))
         l.add(to: .main, forMode: .common)
         link = l
@@ -151,6 +166,7 @@ final class EyeProbeRecording: NSObject {
         guard !finished else { return }
         finished = true
         link?.invalidate(); link = nil
+        watchdog?.stop(); watchdog = nil
         buf += "{\"k\":\"E\",\"reason\":\(json(reason)),\"ticks\":\(ticks),\"t\":\(CACurrentMediaTime())}\n"
         flush()
         io.sync { try? handle.close() }
@@ -208,7 +224,7 @@ final class EyeProbeRecording: NSObject {
         // Focus mode: only labelled-in layers are measured (the label test is a cached lookup; geometry is not).
         if !focus || labelWanted(id) {
             if focus { discovered.append(Tracked(layer: m, id: id, window: ctx.window.windowNumber)) }
-            record(id, measure(m, p, ctx), changed: &changed, changedIds: &changedIds, present: &present)
+            if record(id, measure(m, p, ctx), changed: &changed, changedIds: &changedIds, present: &present) { noteAnimations(m, id) }
         }
         guard let subs = m.sublayers else { return }
         for sub in subs {
@@ -232,8 +248,70 @@ final class EyeProbeRecording: NSObject {
             }
             guard attached, !hidden else { continue }
             visits += 1
-            record(t.id, measure(m, p, ctx), changed: &changed, changedIds: &changedIds, present: &present)
+            if record(t.id, measure(m, p, ctx), changed: &changed, changedIds: &changedIds, present: &present) { noteAnimations(m, t.id) }
         }
+    }
+
+    /// What the app itself asked for: the Core Animation animations attached to a layer that is changing right now,
+    /// with their declared parameters. Logged once per animation ("A" line). Only layers whose geometry or opacity
+    /// just changed are asked, so a still tree costs nothing. (An app that drives values itself every frame, as
+    /// SwiftUI does on macOS, attaches none: then only the measured values speak.)
+    private func noteAnimations(_ m: CALayer, _ id: Int) {
+        guard let keys = m.animationKeys(), !keys.isEmpty else { return }
+        for key in keys {
+            guard let a = m.animation(forKey: key) else { continue }
+            let seen = "\(id)|\(key)|\(a.beginTime)|\(a.duration)"
+            if noted.contains(seen) { continue }
+            if noted.count > 4096 { noted.removeAll() }
+            noted.insert(seen)
+            var o = describe(a)
+            o["k"] = "A"; o["id"] = id; o["key"] = key; o["t"] = fin(CACurrentMediaTime())
+            guard JSONSerialization.isValidJSONObject(o), let d = try? JSONSerialization.data(withJSONObject: o),
+                  let line = String(data: d, encoding: .utf8) else { continue }
+            buf += line + "\n"
+        }
+    }
+
+    private func fin(_ d: Double) -> Any { d.isFinite ? d : NSNull() }
+
+    private func animValue(_ v: Any?) -> Any {
+        guard let v else { return NSNull() }
+        if let n = v as? NSNumber { return fin(n.doubleValue) }
+        if let nv = v as? NSValue { return String(String(describing: nv).prefix(80)) }
+        return NSNull()
+    }
+
+    private func describe(_ a: CAAnimation) -> [String: Any] {
+        var o: [String: Any] = ["cls": String(describing: type(of: a)), "dur": fin(a.duration), "begin": fin(a.beginTime),
+                                "speed": fin(Double(a.speed))]
+        if a.repeatCount != 0 { o["repeat"] = a.repeatCount.isFinite ? Double(a.repeatCount) as Any : "forever" }
+        if a.autoreverses { o["autoreverses"] = true }
+        if let tf = a.timingFunction {
+            var c1: [Float] = [0, 0], c2: [Float] = [0, 0]
+            tf.getControlPoint(at: 1, values: &c1); tf.getControlPoint(at: 2, values: &c2)
+            o["tf"] = [fin(Double(c1[0])), fin(Double(c1[1])), fin(Double(c2[0])), fin(Double(c2[1]))]
+        }
+        if let pa = a as? CAPropertyAnimation {
+            o["kp"] = pa.keyPath ?? NSNull()
+            if pa.isAdditive { o["additive"] = true }
+        }
+        if let b = a as? CABasicAnimation {
+            o["from"] = animValue(b.fromValue); o["to"] = animValue(b.toValue)
+            if b.byValue != nil { o["by"] = animValue(b.byValue) }
+        }
+        if let s = a as? CASpringAnimation {
+            o["mass"] = fin(Double(s.mass)); o["stiffness"] = fin(Double(s.stiffness)); o["damping"] = fin(Double(s.damping))
+            o["v0"] = fin(Double(s.initialVelocity)); o["settle"] = fin(s.settlingDuration)
+        }
+        if let k = a as? CAKeyframeAnimation {
+            o["values"] = k.values?.count ?? 0
+            if let kt = k.keyTimes { o["keyTimes"] = kt.map { fin($0.doubleValue) } }
+            o["mode"] = k.calculationMode.rawValue
+            if k.path != nil { o["path"] = true }
+        }
+        if let g = a as? CAAnimationGroup { o["group"] = (g.animations ?? []).prefix(12).map { describe($0) } }
+        if let t = a as? CATransition { o["transition"] = t.type.rawValue }
+        return o
     }
 
     private func measure(_ m: CALayer, _ p: CALayer, _ ctx: Ctx) -> (CGRect, CGRect?, Float) {
@@ -251,21 +329,26 @@ final class EyeProbeRecording: NSObject {
         return (r, s, p.opacity)
     }
 
+    /// True when this layer's values changed since the last tick (it is in motion, not merely first seen).
+    @discardableResult
     private func record(_ id: Int, _ g: (CGRect, CGRect?, Float), changed: inout [String], changedIds: inout [Int],
-                        present: inout Set<Int>) {
+                        present: inout Set<Int>) -> Bool {
         let (r, s, opacity) = g
-        if let rect, !r.intersects(rect), !(s?.intersects(rect) ?? false) { return }
-        if !focus, !labelWanted(id) { return }
+        if let rect, !r.intersects(rect), !(s?.intersects(rect) ?? false) { return false }
+        if !focus, !labelWanted(id) { return false }
         present.insert(id)
         let v: [Double] = [r.minX, r.minY, r.width, r.height, Double(opacity),
                            s.map { Double($0.minX) } ?? .nan, s.map { Double($0.minY) } ?? .nan,
                            s.map { Double($0.width) } ?? .nan, s.map { Double($0.height) } ?? .nan]
         if differs(last[id], v) {
             // The first sighting is not motion.
-            if last[id] != nil { changedIds.append(id) }
+            let moved = last[id] != nil
+            if moved { changedIds.append(id) }
             last[id] = v
             changed.append("[\(id),\(v.map(num).joined(separator: ","))]")
+            return moved
         }
+        return false
     }
 
     /// Label filter (cached per layer id): match ∪ watch in focus mode, match alone otherwise (empty = all).
@@ -333,6 +416,174 @@ private func json(_ s: String) -> String {
     let data = try? JSONSerialization.data(withJSONObject: [s], options: [])
     let arr = data.flatMap { String(data: $0, encoding: .utf8) } ?? "[\"\"]"
     return String(arr.dropFirst().dropLast())
+}
+
+@_silgen_name("swift_demangle")
+private func eyeDemangle(_ name: UnsafePointer<CChar>?, _ length: UInt, _ out: UnsafeMutablePointer<CChar>?,
+                         _ outLength: UnsafeMutablePointer<UInt>?, _ flags: UInt32) -> UnsafeMutablePointer<CChar>?
+
+/// libc++abi's demangler, looked up at run time (every AppKit process has it loaded; the probe does not link it).
+private typealias CxxDemangle = @convention(c) (UnsafePointer<CChar>?, UnsafeMutablePointer<CChar>?, UnsafeMutablePointer<Int>?,
+                                                UnsafeMutablePointer<Int32>?) -> UnsafeMutablePointer<CChar>?
+private let cxxDemangle: CxxDemangle? = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "__cxa_demangle").map { unsafeBitCast($0, to: CxxDemangle.self) }
+private func eyeCxxDemangle(_ name: UnsafePointer<CChar>?, _ out: UnsafeMutablePointer<CChar>?, _ length: UnsafeMutablePointer<Int>?,
+                            _ status: UnsafeMutablePointer<Int32>?) -> UnsafeMutablePointer<CChar>? {
+    cxxDemangle?(name, out, length, status)
+}
+
+/// WHY a frame was late, measured where it happens. A run-loop observer on the main thread marks when each turn
+/// starts and ends; a watcher thread notices a turn that outlives `threshold` (a bit over one display frame) and,
+/// while it lasts, samples the main thread's stack (suspend → walk frame pointers → resume: a few microseconds).
+/// A healthy app costs nothing but the two observer callbacks per turn. Each stall becomes one "H" line, with
+/// its frames in "F" lines, on the same mach clock as the ticks and as eye-capture's frames.
+final class EyeMainWatchdog {
+    static let depth = 48, maxSamples = 64
+    private let thread: thread_t
+    private let lo: UInt, hi: UInt
+    /// [0] start of the current run-loop turn (0 = waiting) · [1] start and [2] end of the last turn over the
+    /// threshold. Written by the main thread, read by the watcher: word-sized stores, no lock to deadlock on.
+    private let slots = UnsafeMutablePointer<Double>.allocate(capacity: 3)
+    private let pcs = UnsafeMutablePointer<UInt>.allocate(capacity: EyeMainWatchdog.depth)
+    private var observer: CFRunLoopObserver?
+    private var running = true
+    private let done = DispatchSemaphore(value: 0)
+    private let threshold: Double
+    private let emit: (String) -> Void
+    private var frameIndex: [UInt: Int] = [:]
+    private(set) var count = 0
+    private(set) var worstMs = 0.0
+    static var stacks: Bool {
+        #if arch(arm64)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// Must be created on the main thread (it is the thread it watches).
+    init(threshold: Double, emit: @escaping (String) -> Void) {
+        let me = pthread_self()
+        thread = pthread_mach_thread_np(me)
+        hi = UInt(bitPattern: pthread_get_stackaddr_np(me))
+        lo = hi - UInt(pthread_get_stacksize_np(me))
+        self.threshold = threshold; self.emit = emit
+        slots.initialize(repeating: 0, count: 3)
+        let s = slots, thr = threshold
+        let acts: CFRunLoopActivity = [.entry, .afterWaiting, .beforeWaiting, .exit]
+        observer = CFRunLoopObserverCreateWithHandler(nil, acts.rawValue, true, 0) { _, a in
+            let now = CACurrentMediaTime()
+            if a == .beforeWaiting {
+                let since = s[0]
+                if since > 0, now - since >= thr { s[2] = now; s[1] = since }
+                s[0] = 0
+            } else { s[0] = now }
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+        let t = Thread { [unowned self] in self.watch() }
+        t.name = "the-eye main-thread watchdog"; t.qualityOfService = .userInteractive
+        t.start()
+    }
+
+    /// Main thread. Waits for the watcher to write out a stall in progress.
+    func stop() {
+        if let o = observer { CFRunLoopRemoveObserver(CFRunLoopGetMain(), o, .commonModes) }
+        observer = nil; running = false
+        _ = done.wait(timeout: .now() + 0.2)
+    }
+
+    private func watch() {
+        var since = 0.0, samples: [[UInt]] = [], polls = 0, lastReport = 0.0, logged = 0.0
+        func close(ongoing: Bool) {
+            guard since > 0 else { return }
+            let now = CACurrentMediaTime()
+            let end = slots[1] == since ? slots[2] : now
+            if !ongoing || now - lastReport >= 1 { lastReport = now; report(since, end, samples, ongoing) }
+            if !ongoing { logged = since; since = 0; samples = []; polls = 0 }
+        }
+        while running {
+            usleep(3000)
+            let s = slots[0], now = CACurrentMediaTime()
+            if since > 0, s != since { close(ongoing: false) }
+            // A turn that crossed the threshold and ended between two polls: no time to sample it, still a stall.
+            let ended = slots[1]
+            if ended != logged, ended != since { logged = ended; report(ended, slots[2], [], false) }
+            guard s > 0, now - s >= threshold else { continue }
+            if since == 0 { lastReport = now }
+            since = s; polls += 1
+            // Dense at first (the first 100ms tell most of the story), then sparser so a long hang stays cheap.
+            if samples.count < EyeMainWatchdog.maxSamples, samples.count < 32 || polls % 8 == 0 {
+                let n = sample()
+                if n > 0 { samples.append(Array(UnsafeBufferPointer(start: pcs, count: n))) }
+            }
+            close(ongoing: true)
+        }
+        close(ongoing: false)
+        done.signal()
+    }
+
+    /// The main thread's call stack, leaf first, into `pcs`. Nothing here may allocate or lock: the main thread is
+    /// suspended and may hold the allocator's lock.
+    private func sample() -> Int {
+        #if arch(arm64)
+        guard thread_suspend(thread) == KERN_SUCCESS else { return 0 }
+        var st = arm_thread_state64_t()
+        var cnt = mach_msg_type_number_t(MemoryLayout<arm_thread_state64_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &st) {
+            $0.withMemoryRebound(to: natural_t.self, capacity: Int(cnt)) { thread_get_state(thread, ARM_THREAD_STATE64, $0, &cnt) }
+        }
+        var n = 0
+        if kr == KERN_SUCCESS {
+            let mask: UInt = 0x0000_7FFF_FFFF_FFFF // drop pointer-authentication bits
+            pcs[0] = UInt(st.__pc) & mask; n = 1
+            var fp = UInt(st.__fp)
+            while n < EyeMainWatchdog.depth, fp >= lo, fp &+ 16 <= hi, fp & 7 == 0 {
+                let rec = UnsafePointer<UInt>(bitPattern: fp)!
+                let ret = rec[1] & mask
+                if ret < 4096 { break }
+                pcs[n] = ret; n += 1
+                let next = rec[0]
+                if next <= fp { break }
+                fp = next
+            }
+        }
+        thread_resume(thread)
+        return n
+        #else
+        return 0
+        #endif
+    }
+
+    private func frame(_ pc: UInt, leaf: Bool) -> Int {
+        if let i = frameIndex[pc] { return i }
+        let i = frameIndex.count
+        frameIndex[pc] = i
+        var info = Dl_info()
+        var sym = String(format: "0x%lx", pc), image = "?", own = false
+        // A return address points just past the call: look one byte back to stay inside the caller.
+        if dladdr(UnsafeRawPointer(bitPattern: leaf ? pc : pc - 1), &info) != 0 {
+            if let f = info.dli_fname {
+                let path = String(cString: f)
+                image = (path as NSString).lastPathComponent
+                own = !(path.hasPrefix("/System/") || path.hasPrefix("/usr/lib/") || path.hasPrefix("/Library/Apple/")) && !image.hasPrefix("EyeProbe_")
+            }
+            if let s = info.dli_sname {
+                let raw = String(cString: s)
+                var status: Int32 = 0
+                if let d = eyeDemangle(s, UInt(strlen(s)), nil, nil, 0) { sym = String(cString: d); free(d) }
+                else if raw.hasPrefix("_Z"), let d = eyeCxxDemangle(s, nil, nil, &status), status == 0 { sym = String(cString: d); free(d) }
+                else { sym = raw }
+            } else if let base = info.dli_fbase { sym = String(format: "%@+0x%lx", image, pc - UInt(bitPattern: base)) }
+        }
+        emit("{\"k\":\"F\",\"i\":\(i),\"s\":\(json(String(sym.prefix(240)))),\"b\":\(json(image)),\"a\":\(own ? 1 : 0)}\n")
+        return i
+    }
+
+    private func report(_ since: Double, _ end: Double, _ samples: [[UInt]], _ ongoing: Bool) {
+        let ms = (end - since) * 1000
+        if !ongoing { count += 1; worstMs = max(worstMs, ms) }
+        let st = samples.map { s in "[" + s.enumerated().map { String(frame($0.element, leaf: $0.offset == 0)) }.joined(separator: ",") + "]" }
+        emit("{\"k\":\"H\",\"t\":\(since),\"ms\":\(num(ms)),\"n\":\(samples.count)\(ongoing ? ",\"ongoing\":true" : ""),\"s\":[\(st.joined(separator: ","))]}\n")
+    }
 }
 
 final class EyeProbeCore: NSObject {

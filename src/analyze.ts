@@ -7,11 +7,14 @@
 // So inside an animation, idle refreshes are real visible stalls; unobserved ones are not
 // counted against the app.
 import { readFileSync, existsSync } from "node:fs";
+import { track } from "./track.ts";
 
 export type Row = {
   t: number; s: "c" | "i"; interval: number; diff: number; frac: number; luma: number;
   x0: number; y0: number; x1: number; y1: number; w: number; h: number;
   aw: number; ah: number; acx: number; // top-anchored extent (0 when absent)
+  /** What changed since the previous frame: its box and its centre of change (mx1 = 0 when nothing did, or an old run). */
+  mx0: number; my0: number; mx1: number; my1: number; mcx: number; mcy: number;
 };
 
 export type Meta = { refresh_hz?: number; [k: string]: unknown };
@@ -26,7 +29,9 @@ export function loadRun(csv: string): { rows: Row[]; meta: Meta } {
     const n = (k: number) => (p[k] === "" ? 0 : Number(p[k]));
     rows.push({ t: n(0), s: p[1] === "i" ? "i" : "c", interval: n(2), diff: n(3), frac: n(4), luma: n(5),
       x0: n(6), y0: n(7), x1: n(8), y1: n(9), w: n(10), h: n(11),
-      aw: p.length > 12 ? n(12) : 0, ah: p.length > 13 ? n(13) : 0, acx: p.length > 14 ? n(14) : 0 });
+      aw: p.length > 12 ? n(12) : 0, ah: p.length > 13 ? n(13) : 0, acx: p.length > 14 ? n(14) : 0,
+      mx0: p.length > 20 ? n(15) : 0, my0: p.length > 20 ? n(16) : 0, mx1: p.length > 20 ? n(17) : 0, my1: p.length > 20 ? n(18) : 0,
+      mcx: p.length > 20 ? n(19) : 0, mcy: p.length > 20 ? n(20) : 0 });
   }
   let meta: Meta = {};
   try { meta = JSON.parse(readFileSync(csv + ".meta.json", "utf8")); } catch { /* still recording or missing */ }
@@ -36,6 +41,7 @@ export function loadRun(csv: string): { rows: Row[]; meta: Meta } {
 export type Options = {
   refresh_hz?: number;
   motion_threshold?: number; // changed-pixel fraction that counts as "visibly moving"
+  drift_threshold?: number;  // mean brightness change per frame (0..255) that counts as moving when no pixel steps: a fade
   split_gap_ms?: number;     // a pause longer than this ends an animation segment
   min_frames?: number;
   from_s?: number;
@@ -49,6 +55,7 @@ const q = (v: number[], p: number) => {
 };
 const r1 = (x: number) => Math.round(x * 10) / 10;
 const r2 = (x: number) => Math.round(x * 100) / 100;
+const r5 = (x: number) => Math.round(x * 1e5) / 1e5; // segment bounds stay exact enough to select their own frames
 
 export type Segment = {
   start_s: number; end_s: number; duration_ms: number;
@@ -85,7 +92,11 @@ export function analyze(rows: Row[], meta: Meta, o: Options = {}): Analysis {
   const idleRows = win.filter(r => r.s === "i");
 
   // Segments = runs of visibly-changing new frames.
-  const moving = complete.filter(r => r.frac > thr);
+  // A fade moves no edge: every pixel drifts by a level or two per frame, under the per-pixel step that `frac`
+  // counts, and only the mean difference shows it. A run of such frames is a motion all the same (a lone one is
+  // not: runs shorter than min_frames are dropped below).
+  const drift = o.drift_threshold ?? 0.004;
+  const moving = complete.filter(r => r.frac > thr || r.diff >= drift);
   const groups: Row[][] = [];
   let cur: Row[] = [];
   for (const r of moving) {
@@ -100,7 +111,16 @@ export function analyze(rows: Row[], meta: Meta, o: Options = {}): Analysis {
   const segs: Segment[] = [];
   for (const g of groups) {
     if (g.length < minFrames) continue;
-    const a = g[0].t, b = g[g.length - 1].t;
+    let a = g[0].t;
+    const b = g[g.length - 1].t;
+    // What led up to the motion is not the motion: a button lighting up under the press, then a pause, then the
+    // animation. Following the thing itself (track.ts) says where it really began; counting from the press would
+    // charge the pause to the animation as missing frames.
+    {
+      const span = complete.filter(r => r.t >= a - 1e-6 && r.t <= b + 1e-6);
+      const tr = track(span, Number(meta.sample_step ?? 2) / Number(meta.scale ?? 2), period / 1000);
+      if (tr.tracks.length && tr.elsewhere && span.length - tr.onset >= minFrames) a = span[tr.onset].t;
+    }
     const durMs = (b - a) * 1000;
     if (durMs <= 0) continue;
     const inSeg = (r: Row) => r.t > a && r.t <= b;
@@ -113,7 +133,7 @@ export function analyze(rows: Row[], meta: Meta, o: Options = {}): Analysis {
     // the capture actually observed it (idle) — the unobserved ones are reported separately.
     const stalled = idle;
     let jumps = 0;
-    const seq = [g[0], ...newF];
+    const seq = [g.find(r => r.t >= a - 1e-6) ?? g[0], ...newF];
     for (let k = 2; k < seq.length; k++) {
       const d1 = Math.max(seq[k - 1].t - seq[k - 2].t, 1e-4) * 1000, d2 = Math.max(seq[k].t - seq[k - 1].t, 1e-4) * 1000;
       for (const key of [WK, HK]) {
@@ -125,7 +145,7 @@ export function analyze(rows: Row[], meta: Meta, o: Options = {}): Analysis {
     const ws = seq.map(r => r[WK]), hs = seq.map(r => r[HK]);
     const observed = newF.length + idle;
     segs.push({
-      start_s: r2(a), end_s: r2(b), duration_ms: Math.round(durMs),
+      start_s: r5(a), end_s: r5(b), duration_ms: Math.round(durMs),
       new_frames: newF.length, idle_refreshes: idle, unobserved_refreshes: unobserved, expected_refreshes: expected,
       fps: r1(newF.length / (durMs / 1000)), observed_rate_hz: r1(observed / (durMs / 1000)),
       stalled_refreshes: stalled, stall_pct: r1(observed ? (100 * stalled) / observed : 0),
@@ -144,7 +164,7 @@ export function analyze(rows: Row[], meta: Meta, o: Options = {}): Analysis {
     const st = segs.reduce((s, x) => s + x.stalled_refreshes, 0);
     const obs = nf + st;
     const allGaps: number[] = [];
-    for (const s of segs) for (const r of complete) if (r.t > s.start_s - 1e-6 && r.t <= s.end_s + 1e-6 && r.interval > 0) allGaps.push(r.interval);
+    for (const s of segs) for (const r of complete) if (r.t > s.start_s + 1e-6 && r.t <= s.end_s + 1e-6 && r.interval > 0) allGaps.push(r.interval); // not the wait before its first frame
     const hitches = segs.reduce((s, x) => s + x.hitches, 0);
     overall = {
       animating_ms: ms, fps: r1(nf / (ms / 1000)), target_fps: hz, pct_of_target: r1((100 * nf) / (ms / 1000) / hz),
@@ -164,7 +184,7 @@ export function formatAnalysis(a: Analysis, label: string, maxSegments = 25): st
   const L: string[] = [];
   L.push(`# ${label}`);
   L.push(`display ${a.refresh_hz}Hz (period ${a.period_ms}ms) · span ${a.span_s}s · ${a.new_frames} new frames · ${a.idle_refreshes} idle refreshes · ${a.segments.length} animation segments · extent: ${a.extent_source}`);
-  if (!a.overall) { L.push("No visible animation detected in the region (nothing moved above the motion threshold)."); return L.join("\n"); }
+  if (!a.overall) return L.join("\n");
   const o = a.overall;
   L.push("");
   L.push(`WHILE ANIMATING (${(o.animating_ms / 1000).toFixed(2)}s): ${o.fps} fps of ${o.target_fps} (${o.pct_of_target}%) · stalled refreshes ${o.stalled_refreshes} (${o.stall_pct}% of observed) · unobserved ${o.unobserved_refreshes}`);
@@ -176,8 +196,6 @@ export function formatAnalysis(a: Analysis, label: string, maxSegments = 25): st
     L.push(`${String(i).padStart(3)} ${s.start_s.toFixed(2).padStart(8)} ${String(s.duration_ms).padStart(7)} ${String(s.new_frames).padStart(7)} ${s.fps.toFixed(1).padStart(6)} ${s.observed_rate_hz.toFixed(0).padStart(7)} ${s.stall_pct.toFixed(1).padStart(7)} ${s.gap_p50_ms.toFixed(1).padStart(5)} ${s.gap_p95_ms.toFixed(1).padStart(5)} ${s.gap_max_ms.toFixed(1).padStart(5)} ${String(s.hitches).padStart(6)} ${String(s.long_hitches).padStart(4)} ${String(s.velocity_jumps).padStart(6)}   ${e.w_from}→${e.w_to} [${e.w_min}..${e.w_max}]   ${e.h_from}→${e.h_to} [${e.h_min}..${e.h_max}]`);
   });
   if (a.segments.length > maxSegments) L.push(`  … ${a.segments.length - maxSegments} more segments`);
-  L.push("");
-  L.push("Legend: fps vs target is the headline — every refresh without a new image is a frame the viewer did not get. frames = new images shown; obs_hz = refreshes the capture observed; stall% = observed refreshes that showed NO new image mid-animation (lower bound: on ProMotion a late frame often makes the display skip the refresh entirely, which shows up as 'unobserved', not idle); hitch = gap ≥1.5 frames, long = ≥3; jumps = abrupt changes in the moving extent's speed; w/h = extent in points — top-anchored (width of the change along the top edge around the display centre × how far it hangs down: e.g. the open notch) when recorded, else the bbox of everything differing from the first frame.");
   return L.join("\n");
 }
 
