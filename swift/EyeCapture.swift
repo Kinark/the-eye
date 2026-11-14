@@ -2071,7 +2071,11 @@ final class Watch {
                                         "com.apple.SecurityAgent", "com.apple.accessibility.universalAccessAuthWarn"]
 
     let asJSON = argv.contains("--json")
-    let values = argv.contains("--values")
+    /// Timeline mode (recordings): every event carries the moment its notification ARRIVED, value changes are
+    /// batched per element instead of throttled to one a second, and focus and menus are reported too.
+    let exact = argv.contains("--exact")
+    let values = argv.contains("--values") || argv.contains("--exact")
+    var batch: [AXKey: (first: Double, last: Double, n: Int)] = [:]
     let untils: [String] = argv.indices.filter { argv[$0] == "--until" && $0 + 1 < argv.count }.map { argv[$0 + 1].lowercased() }
     let apps: [String] = argv.indices.filter { argv[$0] == "--app" && $0 + 1 < argv.count }.map { argv[$0 + 1].lowercased() }
     var observers: [pid_t: AXObserver] = [:]
@@ -2097,13 +2101,16 @@ final class Watch {
 
     // MARK: output
 
-    func emit(_ event: String, _ pid: pid_t, _ fields: [String: Any] = [:], initial: Bool = false) {
+    func emit(_ event: String, _ pid: pid_t, _ fields: [String: Any] = [:], initial: Bool = false, at: Double? = nil) {
         let app = names[pid] ?? NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
         var text = "\(event) \(app)"
         if let k = fields["kind"] as? String, !event.hasPrefix(k) { text += " \(k)" }
         if let t = fields["title"] as? String, !t.isEmpty { text += " \"\(t)\"" }
         if let old = fields["from"] as? String { text = "\(event) \(app) \"\(old)\" → \"\(fields["title"] as? String ?? "")\"" }
         if let v = fields["value"] as? String { text += " = \"\(v)\"" }
+        if let n = fields["n"] as? Int, n > 1, let a = fields["t"] as? Double, let b = fields["t_last"] as? Double {
+            text += " (changed \(n)× in \(Int(((b - a) * 1000).rounded()))ms)"
+        }
         if let ts = fields["texts"] as? [String], !ts.isEmpty { text += " — " + ts.map { "\"\($0)\"" }.joined(separator: " ") }
         if let bs = fields["buttons"] as? [String], !bs.isEmpty { text += " [" + bs.joined(separator: " | ") + "]" }
         let matched = !untils.isEmpty && untils.contains { text.lowercased().contains($0) }
@@ -2113,7 +2120,7 @@ final class Watch {
         lastLine = (text, t)
         if asJSON {
             var o = fields; o["event"] = initial ? "already-" + event : event; o["app"] = app; o["pid"] = pid
-            o["t"] = Date().timeIntervalSince1970; if matched { o["matched"] = true }
+            o["t"] = at ?? Date().timeIntervalSince1970; o["text"] = text; if matched { o["matched"] = true }
             print(json(o))
         } else {
             print("\(clock.string(from: Date())) \(initial ? "already " : "")\(text)")
@@ -2171,6 +2178,7 @@ final class Watch {
     // MARK: AX callbacks
 
     func handle(_ el: AXUIElement, _ note: String, _ info: CFDictionary?) {
+        let at = Date().timeIntervalSince1970   // before any question is put to the app: this is when it happened
         let pid = AXI.pid(el)
         if debugRaw { FileHandle.standardError.write("raw \(note) \(AXI.summary(el))\(info.map { " info=\(($0 as NSDictionary).description.replacingOccurrences(of: "\n", with: " "))" } ?? "")\n".data(using: .utf8)!) }
         switch note {
@@ -2180,35 +2188,84 @@ final class Watch {
                 guard windows[AXKey(el: el)] == nil else { return }
                 let f = describe(el, pid)
                 track(el, pid, f)
-                emit(note == kAXSheetCreatedNotification ? "sheet-opened" : "window-opened", pid, f)
+                emit(note == kAXSheetCreatedNotification ? "sheet-opened" : "window-opened", pid, f, at: at)
             }
         case kAXUIElementDestroyedNotification:
             guard let w = windows.removeValue(forKey: AXKey(el: el)) else { return }
             var f: [String: Any] = ["title": w.title]; if w.kind != "window" { f["kind"] = w.kind }
-            emit(w.kind == "sheet" ? "sheet-closed" : "window-closed", w.pid, f)
+            emit(w.kind == "sheet" ? "sheet-closed" : "window-closed", w.pid, f, at: at)
         case kAXTitleChangedNotification:
             let k = AXKey(el: el)
             guard var w = windows[k] else { return }
             let t = Watch.title(el)
             guard t != w.title else { return }
-            emit("title-changed", pid, ["from": w.title, "title": t])
+            emit("title-changed", pid, ["from": w.title, "title": t], at: at)
             w.title = t; windows[k] = w
         case kAXFocusedWindowChangedNotification:
             if lastActivate.pid == pid && now() - lastActivate.at < 0.6 { return }   // already said by app-focused
             if windows[AXKey(el: el)] == nil && Watch.role(el).role == "AXWindow" { return }   // brand new: window-opened says it
             let t = Watch.title(el)
-            if !t.isEmpty { emit("window-focused", pid, ["title": t]) }   // untitled = a sheet or a window mid-close: noise
+            if !t.isEmpty { emit("window-focused", pid, ["title": t], at: at) }   // untitled = a sheet or a window mid-close: noise
         case kAXWindowMiniaturizedNotification:
-            emit("window-minimized", pid, ["title": Watch.title(el)])
+            emit("window-minimized", pid, ["title": Watch.title(el)], at: at)
         case kAXAnnouncementRequestedNotification:
             // Apps send either a String or an NSAttributedString (Calculator: "Result, 46" with a priority attribute).
             let raw = (info as? [String: Any])?[kAXAnnouncementKey as String]
             let text = ((raw as? NSAttributedString)?.string ?? raw as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { emit("announced", pid, ["title": text]) }
+            if !text.isEmpty { emit("announced", pid, ["title": text], at: at) }
         case kAXValueChangedNotification:
-            valueChanged(el, pid)
+            if exact { valueExact(el, pid, at) } else { valueChanged(el, pid) }
+        case kAXFocusedUIElementChangedNotification:
+            let (r, _) = Watch.role(el)
+            if !r.isEmpty { emit("focus-moved", pid, ["kind": String(r.dropFirst(2)), "title": Watch.label(el)], at: at) }
+        case kAXMenuOpenedNotification:
+            emit("menu-opened", pid, ["title": Watch.title(el)], at: at)
+        case kAXMenuClosedNotification:
+            emit("menu-closed", pid, ["title": Watch.title(el)], at: at)
         default: break
         }
+    }
+
+    static func label(_ el: AXUIElement) -> String {
+        let keys = [kAXTitleAttribute, kAXDescriptionAttribute, kAXIdentifierAttribute]
+        let v = AXI.many(el, keys)
+        return keys.lazy.compactMap { AXI.text(v[$0], max: 60) }.first { !$0.isEmpty } ?? ""
+    }
+
+    /// Timeline mode. The first change of an element is reported at once; changes that follow within a quarter
+    /// second are only counted (no question put to an app that is busy drawing) and reported as one line carrying
+    /// the first and last moment and how many there were.
+    func valueExact(_ el: AXUIElement, _ pid: pid_t, _ at: Double) {
+        let k = AXKey(el: el)
+        if var b = batch[k] { b.last = at; b.n += 1; batch[k] = b; return }
+        if let last = lastValue[k], at - last.at < 0.25 {
+            batch[k] = (at, at, 1)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [self] in
+                guard let b = batch.removeValue(forKey: k) else { return }
+                reportValue(el, pid, k, first: b.first, last: b.last, n: b.n)
+            }
+            return
+        }
+        reportValue(el, pid, k, first: at, last: at, n: 1)
+    }
+    func reportValue(_ el: AXUIElement, _ pid: pid_t, _ k: AXKey, first: Double, last: Double, n: Int) {
+        let (r, _) = Watch.role(el)
+        // A text being typed into, a web page and a scroll bar change value all the time without saying anything.
+        guard !r.isEmpty, !["AXTextArea", "AXWebArea", "AXScrollBar", "AXScrollArea"].contains(r) else { return }
+        let v = AXI.raw(el, kAXValueAttribute)
+        var shown = AXI.text(v, max: 100) ?? (v as? NSNumber)?.stringValue ?? ""
+        if r == "AXProgressIndicator", let num = v as? NSNumber {
+            let mx = (AXI.raw(el, kAXMaxValueAttribute) as? NSNumber)?.doubleValue ?? 1
+            shown = "\(Int((num.doubleValue / (mx > 0 ? mx : 1) * 100).rounded()))%"
+        }
+        guard !shown.isEmpty else { return }
+        if n == 1, lastValue[k]?.text == shown { return }
+        lastValue[k] = (last, shown)
+        var f: [String: Any] = ["kind": String(r.dropFirst(2)), "value": shown, "el": CFHash(el)]
+        let name = Watch.label(el)
+        if !name.isEmpty, name != shown { f["title"] = name }
+        if n > 1 { f["n"] = n; f["t"] = first; f["t_last"] = last }
+        emit("value-changed", pid, f, at: first)
     }
 
     /// Value changes are leading-edge + trailing throttled per element (≤1/s), so a progress bar reports its
@@ -2268,6 +2325,7 @@ final class Watch {
         var notes = [kAXWindowCreatedNotification, kAXSheetCreatedNotification, kAXDrawerCreatedNotification, kAXTitleChangedNotification,
                      kAXFocusedWindowChangedNotification, kAXWindowMiniaturizedNotification, kAXAnnouncementRequestedNotification]
         if values { notes.append(kAXValueChangedNotification) }
+        if exact { notes += [kAXFocusedUIElementChangedNotification, kAXMenuOpenedNotification, kAXMenuClosedNotification] }
         var ok = 0
         for n in notes where AXObserverAddNotification(obs, root, n as CFString, nil) == .success { ok += 1 }
         guard ok > 0 else { return false }   // not answering AX (yet)
@@ -2327,7 +2385,7 @@ final class Watch {
         let list = observers.keys.compactMap { names[$0] }.sorted()
         let what = apps.isEmpty ? "\(list.count) apps + system dialogs" : list.isEmpty ? "nothing running yet (\(apps.joined(separator: ", ")))" : list.joined(separator: ", ")
         let until = untils.isEmpty ? "" : " until " + untils.map { "\"\($0)\"" }.joined(separator: " or ")
-        if asJSON { print(json(["event": "ready", "apps": list, "until": untils])) }
+        if asJSON { print(json(["event": "ready", "apps": list, "until": untils, "t": Date().timeIntervalSince1970])) }
         else { print("\(clock.string(from: Date())) ready watching \(what)\(until)") }
     }
 }
@@ -2336,7 +2394,7 @@ var watcher: Watch!
 func cmdWatch() {
     if argv.contains("--help") || argv.contains("-h") {
         print("""
-        usage: watch [--app NAME|BUNDLE_ID|PID]... [--until TEXT]... [--seconds N] [--values] [--json]
+        usage: watch [--app NAME|BUNDLE_ID|PID]... [--until TEXT]... [--seconds N] [--values] [--exact] [--json]
           One line per UI event, as it happens: app-launched/quit/focused, window-opened/closed/focused/minimized,
           sheet-opened/closed, title-changed, announced (VoiceOver announcements), and with --values
           value-changed for text, progress and level indicators. Dialogs, sheets and banners include what they
@@ -2345,6 +2403,8 @@ func cmdWatch() {
           --until TEXT (repeatable, case-insensitive substring of the line): print the first matching line and
           exit 0. A window that already matches when the watch starts counts ("already …").
           --seconds N: stop after N s; exit 124 if an --until never matched.
+          --exact: for a timeline. Every value change (any control, batched per element, never throttled), focus
+          moves and menus; with --json each line carries "t", the moment its notification arrived.
         """)
         exit(0)
     }

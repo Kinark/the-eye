@@ -7,7 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -59,7 +59,7 @@ const rectSchema = z.object({
 }).describe("Screen region in display-local POINTS, top-left origin. Keep it tight around what you want to measure.");
 
 const profileSchema = z.object({
-  process: z.string().describe("App process name or pid to attach Instruments to (e.g. 'NOOTCH!')."),
+  process: z.coerce.string().describe("App process name or pid to attach Instruments to (e.g. 'NOOTCH!')."),
   template: z.string().optional().describe("Instruments template (default 'Time Profiler')."),
   hitches: z.boolean().optional().describe("Add the Hitches instrument (default true)."),
   keep_trace: z.boolean().optional().describe("Keep the raw .trace (default false: it embeds the app's environment, which may contain secrets)."),
@@ -70,7 +70,7 @@ const axOpts = {
   ax: z.boolean().optional().describe("Accessibility context: log the element under the pointer (live + hover.jsonl) and snapshot the element tree of the observed windows. Default true, false when `profile` is set. COST: makes SwiftUI apps maintain their AX graph (~18% more main-thread time, up to −25% fps) — set false for final fps numbers and A/B comparisons."),
   ax_hz: z.number().optional().describe("Hover hit-tests per second when ax is on (default 10)."),
   tree: treeSchema.optional().describe("Element tree of the observed windows at start: basic (labeled elements + bounds, default when ax on), full (every node + actions), none."),
-  process: z.string().optional().describe("Focus the AX tree on this app (name or pid). Default: whatever is actually visible in rect."),
+  process: z.coerce.string().optional().describe("Focus the AX tree on this app (name or pid). Default: whatever is actually visible in rect."),
   cursor: z.boolean().optional().describe("Log the pointer position to cursor.csv (default true; false also disables ax)."),
 };
 
@@ -93,6 +93,8 @@ function runDir(label?: string) {
 type Capture = {
   id: string; label: string; dir: string; csv: string; child: ChildProcess; done: Promise<string>; started: number;
   trace?: Trace; profileNote?: string; stopping?: boolean;
+  /** `eye-capture watch --exact` on the recorded app, writing events.jsonl beside the frames. */
+  events?: ChildProcess;
 };
 const captures = new Map<string, Capture>();
 /**
@@ -149,6 +151,21 @@ function startCapture(p: {
   return c;
 }
 
+/**
+ * What the app tells accessibility while it is recorded (a value changed, focus moved, a window or sheet came or
+ * went, an announcement), each line stamped the moment it arrived, so the report can put it on the frames' clock.
+ * An observer only listens: unlike `ax` (which asks the app what is under the pointer ten times a second) it puts
+ * a question to the app only when something changed.
+ */
+function startEvents(c: Capture, pid: number, seconds: number) {
+  try {
+    const fd = openSync(join(c.dir, "events.jsonl"), "w");
+    c.events = spawn(BIN, ["watch", "--app", String(pid), "--json", "--exact", "--seconds", String(Math.ceil(seconds))], { stdio: ["ignore", fd, "ignore"] });
+    closeSync(fd);
+    c.events.on("error", () => {});
+  } catch { /* a recording without the app's words is still a recording */ }
+}
+
 /** Instruments alongside the capture: Time Profiler (+ Hitches) attached to the app. */
 function startTrace(dir: string, p: ProfileOpts, limitS: number): Trace {
   const path = join(dir, "trace.trace");
@@ -192,6 +209,7 @@ async function endChild<T>(child: ChildProcess, done: Promise<T>, sig: NodeJS.Si
 
 async function stopCapture(c: Capture) {
   c.stopping = true;
+  c.events?.kill("SIGTERM");
   const { out, killed } = await endChild(c.child, c.done, "SIGTERM", 6000);
   if (killed) c.profileNote = `${c.profileNote ?? ""}\nWARNING: capture helper did not exit on SIGTERM and was killed${existsSync(c.csv + ".meta.json") ? "" : " (no meta written)"}`.trim();
   if (c.trace) {
@@ -477,6 +495,8 @@ type RecordParams = {
   seconds?: number; max_seconds?: number; background?: boolean;
   /** Record this app's windows alone, over mid grey (nothing behind or over them). */
   only_pid?: number;
+  /** The recorded app: its accessibility events go on the recording's clock (events.jsonl). `events: false` = don't listen. */
+  events_pid?: number; events?: boolean;
 } & Options;
 
 function startJob(p: RecordParams): Job {
@@ -524,6 +544,7 @@ function startJob(p: RecordParams): Job {
       job.state = "done"; job.final = `capture failed${retried.length ? ` after ${attempt} tries` : ""}: ${why}`;
       return job.final;
     }
+    if (p.events_pid && p.events !== false && !job.stopped) startEvents(c, p.events_pid, capOpts.seconds + 5);
     if (retried.length) job.startNote = (`capture retried ${retried.length}× (ScreenCaptureKit refused to start: ${retried[0]})`);
     const treeMode = p.tree ?? (ax ? "basic" : "none");
     if (treeMode !== "none" && !job.stopped) {
@@ -611,7 +632,8 @@ AT REST. A look at a window (eye_glance, live eye_snapshot) ends with "## at res
 
 WHAT MOVED IT. Under each motion, "moved by:" names the physics behind the frames, fitted to them without being asked: a SPRING (damping ratio, response, and the SwiftUI call / stiffness + damping that reproduce it; how it feels), a TIMING CURVE (the named one, or its cubic-bezier, and its duration) or a PER-FRAME LERP (its factor and half-life), then what it measurably did: settle time, overshoot, where it was fastest. "or equally:" means the frames cannot tell two engines apart (a critically damped spring and an ease-out look alike); "nothing simple" means no one engine reproduces it (driven by hand, retargeted mid-flight, several animations at once). The motion line says what was seen to move ("what moved travelled 401pt right", "grew 60pt×44pt → 300pt×140pt"): a slide, a growth in both dimensions and a single moving edge are each read the way that suits them, and the "read from" note says which. "frame-rate dependent" on a lerp means it stepped once per callback and fell behind where frames dropped. These are measurements; whether that is the right motion for the thing is your call: compare the numbers with what the code asked for, and with what the platform would do (.smooth = bounce 0, .snappy 0.15, .bouncy 0.3, all 0.5s). A BOUNCE is gravity and a floor (acceleration in pt/s², when it first lands, the share of speed each rebound keeps): it lands hard and never passes its target, which is how it differs from a spring. A motion line that says "nothing moved: it dimmed/brightened in place, a fade" is an opacity or colour change: the engine under it was read from brightness alone. FROM INSIDE THE APP (eye_probe running): the eye_stop / eye_report probe report gives, per moving layer and stretch of motion, "declared:" = the Core Animation animation the app's own code attached (class, key path, from → to, duration, timing function, or a spring's mass / stiffness / damping), the same "moved by:" fit made on the layer's exact values at every display tick (no pixels, so it is exact where the screen reading is approximate), and a verdict: "✓ it ran as declared" or "≠ …" when what ran is not what the code asked for (interrupted, retargeted, stacked, slowed by dropped frames). No "declared:" line means the app drives the value itself each frame (SwiftUI on macOS, a display link): then the fit is the only account, and it is still exact. A layer that covered much of its way in ONE step gets "moved by: cannot be told" with the step, the wait before it and the main-thread block that swallowed the in-between positions; the screen reading says the same as "N% of the way went in a single frame". The probe report ends with "declared by the app's code": every Core Animation animation found, on whichever layer. RECORDED ALONE: eye_act's own recording and eye_record {process} capture only that app's windows over mid grey, so nothing behind a see-through window (an overlay, a notch) or over the app is mistaken for its motion; eye_record isolate:false records the screen as it is.
 
-WHY IT HAPPENED. eye_probe {process} once (Debug build) puts a watchdog inside the app. From then on every freeze in every report carries its cause as "why:" lines: how long the app's main thread was blocked, the app function that was running (share of stack samples) and the stack — or that the main thread was free, so the frames were lost after the app (render server, GPU, window server). No Instruments, nothing to set up per run. eye_report {view:"explain"} joins the worst frames with pointer, element, step and main thread. For a whole-run CPU profile add profile:{process} to eye_record (Instruments; takes seconds to start).
+WHY IT HAPPENED. eye_probe {process} once (a Debug build; with System Integrity Protection off, any app at all, Apple's included) puts a watchdog inside the app. From then on every freeze in every report carries its cause as "why:" lines: how long the app's main thread was blocked, the app function that was running (share of stack samples) and the stack — or that the main thread was free, so the frames were lost after the app (render server, GPU, window server). No Instruments, nothing to set up per run. eye_report {view:"explain"} joins the worst frames with pointer, element, step and main thread. For a whole-run CPU profile add profile:{process} to eye_record (Instruments; takes seconds to start).
+WHAT THE APP SAID. A recording of an app (eye_act's own, eye_record {process}) also listens to what the app tells accessibility: a value changed, focus moved, a window, sheet or menu came or went, an announcement. Each is put on the recording's clock under "what the app told accessibility": how long after the step, and how far into which motion. Under each "answered …" line, who was first: "the app knew first" (it told accessibility N ms before the screen began to change: the wait was in drawing, not deciding), "the screen changed first", or "yet the app reported a change" when nothing visible answered. If it says the app told accessibility nothing, assistive technology was not told what the steps changed. events:false does not listen.
 
 USE IT BY DEFAULT: this is how you test a macOS app's UI (SwiftUI or AppKit) yourself. After a UI change builds, launch the app and verify it here: find the element, drive it, read what it looked like. Don't hand the check to the user ("try it and tell me"). Only skip the-eye when the user says they'll drive the test.
 
@@ -637,7 +659,7 @@ KNOW THESE
 - ONE APP COPY, checked by the server itself. An app counts every copy AND every other build of it (NOOTCH!-Dev, NOOTCH!, a Setapp build…): they all draw and answer AX. Before eye_act (target_process or the probe's target), eye_probe and eye_record {process} it checks and, if several run, STOPS with the list and the choices: duplicates:"quit_others" (keep the target), "relaunch" (quit all, start the target's .app fresh, or app_path = the build you just made), "allow", or stop and ask the user (one may be theirs). Recordings also flag duplicated apps found in their rect. Once it has seen an app it watches it: a copy launched later (by you, Xcode or the user) shows up as ⚠ in the next tool result and in eye_status. To start the app, prefer eye_app {action:"launch", app_path}: it never makes a second copy.
 - Needs Screen Recording (capture) and Accessibility (AX, input, lock) permission for the host app.
 - WAITING ON THE SCREEN: don't loop eye_glance / eye_inspect to wait for a dialog, a window, a title or a status text. \`${WATCH_CMD}\` prints one line per UI event as it happens (app-launched/quit/focused, window-opened/closed/focused, sheet-opened/closed, title-changed, announced, and with --values text/progress value-changed). Dialogs, sheets and banners include their text and [buttons]. It only reads AX, so it takes no turn, locks nothing and needs no screenshots. --app NAME limits it to apps (repeatable). Stream it with your Monitor tool if you have one, or for a single "tell me when": run it in the background with --until "TEXT" (case-insensitive substring of a line; exits 0 on the first match, including a window already showing it) and --seconds N (exits 124 if nothing matched). Example: ${WATCH_CMD} --app Xcode --until "Build Succeeded" --values --seconds 600.
-- Run files live in ~/Library/Caches/the-eye/runs/<time>_<label>/: frames.csv, cursor.csv, hover.jsonl, ax_tree_start.txt/.json, actions.jsonl, keyframes/.
+- Run files live in ~/Library/Caches/the-eye/runs/<time>_<label>/: frames.csv, cursor.csv, hover.jsonl, ax_tree_start.txt/.json, actions.jsonl, events.jsonl (what the app told accessibility), keyframes/.
 
 TOOLS: eye_status · eye_inspect · eye_snapshot · eye_glance · eye_record · eye_peek · eye_act · eye_stop · eye_report · eye_lock · eye_probe · eye_app
 `.trim();
@@ -679,7 +701,7 @@ server.registerTool("eye_inspect", {
     x: z.number().optional(), y: z.number().optional().describe("Point to inspect (global points). Default: the pointer."),
     rect: rectSchema.optional().describe("Tree of the windows visible in this display-local rect (clipped to it)."),
     display: z.number().int().optional(),
-    process: z.string().optional().describe("Only this app's windows (name substring or pid), visible or not."),
+    process: z.coerce.string().optional().describe("Only this app's windows (name substring or pid), visible or not."),
     tree: treeSchema.optional().describe("basic (default with rect): labeled elements only, unlabeled layout groups folded. full: every node + its actions. none."),
     depth: z.number().int().optional().describe("Max tree depth (default 40 basic / 60 full)."),
     max_nodes: z.number().int().optional().describe("Max printed nodes (default 250 basic / 2000 full)."),
@@ -773,6 +795,7 @@ server.registerTool("eye_record", {
   inputSchema: {
     rect: rectSchema.optional().describe("Region to record, display-local points. Omit it and pass `process` to record that app's window, wherever it is."),
     window: z.string().optional().describe("Without rect: which of the app's windows (title substring). Default its main window, else the largest."),
+    events: z.boolean().optional().describe("With a process: also listen to what the app tells accessibility while it is recorded (values, focus, windows, sheets, menus, announcements) and place each on the recording's clock, next to the motion and the steps (default true; false = don't attach an observer)."),
     isolate: z.boolean().optional().describe("With process and no rect: record that app's own windows only, over mid grey, so nothing behind a see-through window or over the app is mistaken for its motion (default true). false = the screen as it is, other apps included."),
     label: z.string().optional().describe("Name for this run (used in the run folder and reports)."),
     display: z.number().int().optional().describe("Display id from eye_status (default main)."),
@@ -799,6 +822,7 @@ server.registerTool("eye_record", {
     if (!c.ok) return fail(c.error);
     instNote = c.note ?? "";
     if (c.pid && (c.note?.startsWith("relaunched") || /^\d+$/.test(String(p.process)))) p.process = String(c.pid);
+    try { (p as RecordParams).events_pid = c.pid ?? (await resolvePid(p.process)).pid; } catch { /* reported below, or recorded by rect alone */ }
   }
   if (!p.rect) {
     if (!p.process) return fail("pass rect, or process (records that app's window)");
@@ -987,6 +1011,7 @@ server.registerTool("eye_act", {
     label: z.string().optional().describe("Phase name recorded with these steps in the run's action log (eye_report view:'explain' groups by it)."),
     ax: z.boolean().optional().describe("Report the element under the pointer after each step (default: the recording's ax setting, true without a recording)."),
     tree: treeSchema.optional().describe("After the steps, also dump the AX tree of the recorded region (or the window under the pointer). Default none."),
+    events: z.boolean().optional().describe("With its own recording: also listen to what the app tells accessibility while it is recorded (values, focus, windows, sheets, menus, announcements) and place each on the recording's clock, next to the motion and the steps (default true; false = don't attach an observer)."),
     see: z.boolean().optional().describe("With no eye_record running: record target_process's window for these steps and report what it looked like (default true; costs ~0.3s before the first step and up to 1.5s after the last, while motion settles)."),
     lock: z.boolean().optional().describe("Block all physical input for exactly the duration of these steps (default true)."),
     lock_style: z.enum(["full", "quick"]).optional().describe("full: 1.5s 3·2·1 warning, orange overlay. quick: \"Just a sec…\" — no countdown, small pill. Default: quick when front:true and the steps take ≤5s, else full."),
@@ -1015,7 +1040,7 @@ server.registerTool("eye_act", {
   if (p.see !== false && target && !activeJob(p.id)) {
     const w = await windowRect(target.pid, p.window);
     if (w.ok) {
-      auto = startJob({ rect: w.rect, display: w.display, label: p.label ?? "act", ax: false, tree: "none", max_seconds: Math.ceil(budget / 1000) + 30, only_pid: target.pid });
+      auto = startJob({ rect: w.rect, display: w.display, label: p.label ?? "act", ax: false, tree: "none", max_seconds: Math.ceil(budget / 1000) + 30, only_pid: target.pid, events_pid: target.pid, events: p.events });
       for (let i = 0; i < 60 && auto.state === "starting"; i++) await sleep(50);
       if (auto.state === "running") { autoWhat = `${target.name} ${w.what}, its own windows only`; p.ax ??= true; p.id = auto.id; }
       else { auto.stopped ??= "not ready in time"; auto.stopNow(); auto = undefined; autoNote = "(could not record the window for these steps: the capture did not start within 3s — the steps ran unwatched; eye_record first for the visible result)"; }
@@ -1447,7 +1472,7 @@ function cleanup() {
   actor?.child.kill("SIGTERM");
   for (const j of jobs.values()) j.cmd?.kill("SIGTERM");
   for (const l of locks.values()) l.child.kill("SIGTERM");
-  for (const c of captures.values()) c.child.kill("SIGTERM");
+  for (const c of captures.values()) { c.child.kill("SIGTERM"); c.events?.kill("SIGTERM"); }
 }
 startLeaseHeartbeat(() => [...jobs.values()].some(running) || locks.size > 0 || activeProbeTarget() !== null);
 process.on("exit", cleanup);

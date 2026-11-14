@@ -10,6 +10,8 @@
 //   Drop    the ball is let go 250pt above a floor: constant acceleration 3125pt/s² (lands after 0.4s), each rebound
 //           keeps 0.6 of its speed; position computed from the clock every frame (display link). Pressed again: lifted back.
 //   Fade    the tile's opacity, 1 ↔ 0.2: CABasicAnimation, easeInEaseOut, 0.4s (nothing moves, it only dims)
+// Every press also SAYS two things to accessibility without drawing anything (test/said-e2e.mjs): the status text
+// (black on black) becomes "<name> started" in the button's action, and "<name> at 200" is announced 200ms later.
 import AppKit
 
 final class Stage: NSView {
@@ -20,6 +22,7 @@ final class Stage: NSView {
     static let ballTop: CGFloat = 345, ballFloor: CGFloat = 95, gravity = 3125.0, restitution = 0.6
     var link: CADisplayLink?
     var width: CGFloat = 40
+    let status = NSTextField(labelWithString: "idle")
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -48,6 +51,9 @@ final class Stage: NSView {
         ball.bounds = CGRect(x: 0, y: 0, width: 30, height: 30)
         ball.position = CGPoint(x: 480, y: Stage.ballTop)
         layer?.addSublayer(ball)
+        status.textColor = .black
+        status.frame = NSRect(x: 8, y: 366, width: 220, height: 18)
+        addSubview(status)
         for (i, name) in ["Spring", "Smooth", "Ease", "Lerp", "Slide", "Glide", "Grow", "Drop", "Fade"].enumerated() {
             let b = NSButton(title: name, target: self, action: #selector(go(_:)))
             b.frame = NSRect(x: 6 + i * 57, y: 20, width: 55, height: 40)
@@ -72,6 +78,14 @@ final class Stage: NSView {
     }
 
     @objc func go(_ sender: NSButton) {
+        let name = sender.title
+        status.stringValue = "\(name) started"
+        NSAccessibility.post(element: status, notification: .valueChanged)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let w = self?.window else { return }
+            NSAccessibility.post(element: w, notification: .announcementRequested,
+                                 userInfo: [.announcement: "\(name) at 200", .priority: NSAccessibilityPriorityLevel.high.rawValue])
+        }
         if sender.title == "Drop" {
             dropped.toggle()
             fall?.invalidate(); fall = nil

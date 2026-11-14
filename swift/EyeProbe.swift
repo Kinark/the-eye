@@ -492,21 +492,23 @@ final class EyeMainWatchdog {
     }
 
     private func watch() {
-        var since = 0.0, samples: [[UInt]] = [], polls = 0, lastReport = 0.0, logged = 0.0
+        var since = 0.0, samples: [[UInt]] = [], polls = 0, lastReport = 0.0, closed = 0.0, seen = 0.0
         func close(ongoing: Bool) {
             guard since > 0 else { return }
             let now = CACurrentMediaTime()
             let end = slots[1] == since ? slots[2] : now
             if !ongoing || now - lastReport >= 1 { lastReport = now; report(since, end, samples, ongoing) }
-            if !ongoing { logged = since; since = 0; samples = []; polls = 0 }
+            if !ongoing { closed = since; since = 0; samples = []; polls = 0 }
         }
         while running {
             usleep(3000)
             let s = slots[0], now = CACurrentMediaTime()
             if since > 0, s != since { close(ongoing: false) }
             // A turn that crossed the threshold and ended between two polls: no time to sample it, still a stall.
+            // (Each such turn once; not the one just written out with its samples; and not "none yet": a turn that
+            // ran straight into the next without waiting never lands in this slot at all.)
             let ended = slots[1]
-            if ended != logged, ended != since { logged = ended; report(ended, slots[2], [], false) }
+            if ended > 0, ended != seen { seen = ended; if ended != closed, ended != since { report(ended, slots[2], [], false) } }
             guard s > 0, now - s >= threshold else { continue }
             if since == 0 { lastReport = now }
             since = s; polls += 1
@@ -534,8 +536,14 @@ final class EyeMainWatchdog {
         var n = 0
         if kr == KERN_SUCCESS {
             let mask: UInt = 0x0000_7FFF_FFFF_FFFF // drop pointer-authentication bits
+            // arm64e (Apple's own apps): the thread state holds signed pointers under other names.
+            #if _ptrauth(_arm64e)
+            pcs[0] = UInt(bitPattern: st.__opaque_pc) & mask; n = 1
+            var fp = UInt(bitPattern: st.__opaque_fp) & mask
+            #else
             pcs[0] = UInt(st.__pc) & mask; n = 1
             var fp = UInt(st.__fp)
+            #endif
             while n < EyeMainWatchdog.depth, fp >= lo, fp &+ 16 <= hi, fp & 7 == 0 {
                 let rec = UnsafePointer<UInt>(bitPattern: fp)!
                 let ret = rec[1] & mask

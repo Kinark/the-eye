@@ -11,7 +11,13 @@ import { fitMotion, formatFit } from "./physics.ts";
 import { correlation, track } from "./track.ts";
 
 export type Percept = { t: number; sev: 0 | 1 | 2 | 3; kind: string; text: string; from?: number; to?: number; why?: string[]; more?: string[] };
-export type Seen = { grade: "still" | "smooth" | "minor" | "rough" | "broken"; verdict: string; percepts: Percept[] };
+export type Seen = { grade: "still" | "smooth" | "minor" | "rough" | "broken"; verdict: string; percepts: Percept[];
+  /** What the app told accessibility meanwhile, in order, each placed against the steps and the motion. */
+  said?: { from: number; lines: string[]; silent?: string } };
+
+/** One thing the app told accessibility while it was recorded (run clock; `n` changes between `t` and `last`). */
+export type Said = { t: number; last: number; n: number; event: string; text: string; el?: number; value?: string; head?: string };
+export type Heard = { from: number; app: string; events: Said[] };
 
 /** One main-thread stall measured inside the app by the probe's watchdog (mach seconds). */
 export type Stall = { t: number; ms: number; n: number; ongoing?: boolean; app: [string, number][]; leaf: [string, number][]; stack: string[] };
@@ -28,6 +34,63 @@ export function loadActions(dir: string, t0Wall: number): Action[] {
   }
   return out;
 }
+/**
+ * events.jsonl: what `eye-capture watch --exact` heard from the recorded app, each line stamped when its
+ * notification arrived. A value that kept changing (a counter, a progress bar) arrives as several lines for one
+ * element: they are told as one, first value → last.
+ */
+export function loadSaid(dir: string, t0Wall: number): Heard | null {
+  const p = join(dir, "events.jsonl");
+  if (!existsSync(p) || !t0Wall) return null;
+  let from: number | null = null, app = "";
+  const all: Said[] = [];
+  for (const l of readFileSync(p, "utf8").split("\n")) {
+    if (!l) continue;
+    let o: any;
+    try { o = JSON.parse(l); } catch { continue; /* torn line */ }
+    if (o.event === "ready") { from = o.t - t0Wall; app = o.apps?.[0] ?? ""; continue; }
+    if (typeof o.t !== "number" || o.event === "timeout" || String(o.event).startsWith("already-")) continue;
+    const text = String(o.text ?? o.event).replace(`${o.event} ${o.app} `, `${o.event} `).replace(new RegExp(` ${o.app}$`), "");
+    const cut = text.indexOf(' = "');
+    all.push({ t: o.t - t0Wall, last: (o.t_last ?? o.t) - t0Wall, n: o.n ?? 1, event: o.event, text, el: o.el,
+      value: typeof o.value === "string" ? o.value : undefined, head: cut >= 0 ? text.slice(0, cut) : undefined });
+  }
+  if (from === null) return null;
+  all.sort((a, b) => a.t - b.t);
+  const events: Said[] = [], open = new Map<number, Said>();
+  for (const e of all) {
+    const prev = e.event === "value-changed" && e.el !== undefined ? open.get(e.el) : undefined;
+    if (prev && e.t - prev.last < 0.5 && prev.head !== undefined && e.value !== undefined) {
+      const first = prev.text.match(/ = "(.*?)"(?: →| \(|$)/)?.[1] ?? prev.value ?? "";
+      prev.n += e.n; prev.last = e.last; prev.value = e.value;
+      prev.text = `${prev.head} = "${first}" → "${e.value}" (${prev.n} changes in ${ms((prev.last - prev.t) * 1000)})`;
+      continue;
+    }
+    events.push(e);
+    if (e.event === "value-changed" && e.el !== undefined) open.set(e.el, e);
+  }
+  return { from, app, events };
+}
+
+/** Where one of the app's words falls: against the step that came before it, and against what was moving. */
+export function placeSaid(e: Said, segs: { start_s: number; end_s: number }[], actions: Action[]): string {
+  const out: string[] = [];
+  const act = [...actions].reverse().find((x) => RESPONSIVE.has(x.op) && x.t0 <= e.t + 0.004 && e.t - x.t0 < 2);
+  if (act) out.push(`${ms(Math.max(0, e.t - act.t0) * 1000)} after ${act.op}${act.note ? ` "${act.note}"` : ""}`);
+  const name = (i: number) => (segs.length > 1 ? `motion ${i + 1}` : "the motion");
+  const si = segs.findIndex((s) => e.t >= s.start_s - 1e-6 && e.t <= s.end_s + 1e-6);
+  if (si >= 0) {
+    const s = segs[si], dur = Math.max(1e-3, s.end_s - s.start_s);
+    out.push(`${Math.round((100 * (e.t - s.start_s)) / dur)}% into ${name(si)} (${ms(dur * 1000)} long)`);
+  } else {
+    const next = segs.findIndex((s) => s.start_s > e.t), prev = next < 0 ? segs.length - 1 : next - 1;
+    if (next >= 0 && segs[next].start_s - e.t <= 0.5) out.push(`${ms((segs[next].start_s - e.t) * 1000)} before ${name(next)} began`);
+    else if (prev >= 0 && e.t - segs[prev].end_s <= 1) out.push(`${ms((e.t - segs[prev].end_s) * 1000)} after ${name(prev)} came to rest`);
+    else if (segs.length) out.push("while nothing was moving");
+  }
+  return out.join(" · ");
+}
+
 export function loadStalls(dir: string): Stalls | null {
   try { return JSON.parse(readFileSync(join(dir, "stalls.json"), "utf8")); } catch { return null; }
 }
@@ -69,6 +132,8 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
   const t0Mach = Number(meta.t0_mach ?? 0), t0Wall = Number(meta.t0_wall ?? 0);
   const stalls = o.dir ? loadStalls(o.dir) : null;
   const actions = o.dir ? loadActions(o.dir, t0Wall).filter((x) => inWin({ t: x.t0 } as Row)) : [];
+  const heard = o.dir ? loadSaid(o.dir, t0Wall) : null;
+  const said = heard ? heard.events.filter((e) => inWin({ t: e.t } as Row)) : [];
   const P: Percept[] = [];
   const key = a.extent_source === "top-anchored" ? (["aw", "ah"] as const) : (["w", "h"] as const);
   const dimName = ["width", "height"];
@@ -287,13 +352,27 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
   }
 
   // 7. Response: how long the screen took to answer each press / scroll / gesture.
+  let answered = 0;
   for (const act of actions) {
     if (!RESPONSIVE.has(act.op) || act.ok === false) continue;
     const hit = moving.find((r) => r.t >= act.t0);
     const lat = hit ? (hit.t - act.t0) * 1000 : Infinity;
     const what = `${act.op}${act.note ? ` "${act.note}"` : ""} at ${at(act.t0)}`;
-    if (lat > 1000) P.push({ t: act.t0, sev: 0, kind: "no-response", text: `nothing visible changed within 1s of ${what}` });
-    else P.push({ t: act.t0, sev: lat > 300 ? 2 : lat > 150 ? 1 : 0, kind: "response",
+    // The app's own word on it: the first thing it told accessibility after the step, before the next step.
+    // Whether it knew before the screen showed it says where a slow answer was lost: in deciding, or in drawing.
+    const nextAct = actions.find((x) => RESPONSIVE.has(x.op) && x.t0 > act.t0 + 1e-6)?.t0 ?? Infinity;
+    const word = heard && act.t0 >= heard.from ? said.find((e) => e.t >= act.t0 - 0.004 && e.t < Math.min(nextAct, act.t0 + 1.5)) : undefined;
+    let more: string[] | undefined;
+    if (word) {
+      const told = ms(Math.max(0, word.t - act.t0) * 1000), lead = hit ? (hit.t - word.t) * 1000 : 0;
+      more = [lat > 1000 ? `yet the app reported a change ${told} after the step (${word.text}): it happened, and nothing in the recorded region showed it`
+        : lead > 1.5 * period ? `the app knew first: it told accessibility ${told} after the step (${word.text}), ${ms(lead)} before the screen began to change`
+        : lead < -1.5 * period ? `the screen changed first: the app told accessibility ${told} after the step (${word.text}), ${ms(-lead)} after the first visible change`
+        : `the app told accessibility at the same moment the screen began to change, ${told} after the step (${word.text})`];
+    }
+    if (lat <= 1000) answered++;
+    if (lat > 1000) P.push({ t: act.t0, sev: 0, kind: "no-response", more, text: `nothing visible changed within 1s of ${what}` });
+    else P.push({ t: act.t0, sev: lat > 300 ? 2 : lat > 150 ? 1 : 0, kind: "response", more,
       text: `${lat > 150 ? `${lat > 300 ? "LAGGED" : "slow:"} first visible change ${ms(lat)} after` : `answered ${ms(lat)} after`} ${what} (from the moment the step was sent)` });
   }
 
@@ -329,7 +408,13 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
     : !o2 ? `NO ANIMATION, only instant changes (${P.filter((p) => p.kind === "pop").length} pop${P.filter((p) => p.kind === "pop").length === 1 ? "" : "s"}).${tally ? ` Also: ${tally}.` : ""}`
     : grade === "smooth" ? `LOOKED SMOOTH: ${a.segments.length} motion${a.segments.length > 1 ? "s" : ""} at ${o2.fps} fps of ${o2.target_fps}, nothing a viewer would notice${o2.pct_of_target < 90 ? " (the missing frames are spread too thin to see; the table below has them)" : ""}.`
     : `LOOKED ${grade === "broken" ? "BROKEN" : grade === "rough" ? "ROUGH" : "MOSTLY SMOOTH"}: ${tally}${grade === "minor" ? " (visible only if you look for it)" : ""} · ${o2.fps} fps of ${o2.target_fps} while moving.`;
-  return { grade, verdict, percepts: P };
+  const toldOf = heard ? {
+    from: heard.from,
+    lines: said.map((e) => { const where = placeSaid(e, a.segments, actions); return `${at(e.t)} ${e.text}${where ? ` · ${where}` : ""}`; }),
+    silent: !said.length && answered > 0 && actions.some((x) => x.t0 >= heard.from)
+      ? `${heard.app || "the app"} told accessibility nothing while this happened (no value, focus, window, sheet, menu or announcement event): whatever the steps changed, assistive technology was not told` : undefined,
+  } : undefined;
+  return { grade, verdict, percepts: P, said: toldOf };
 }
 
 /** Verdict, then what was noticed (worst first, causes indented under each), then the plain facts. */
@@ -339,10 +424,17 @@ export function formatSeen(s: Seen, max = 10): string {
   for (const p of bad.slice(0, max)) {
     L.push(`${p.sev >= 2 ? "✗" : "~"} ${p.text}`);
     for (const w of p.why ?? []) L.push(`    ${w.startsWith(" ") ? w : `why: ${w}`}`);
+    for (const m of p.more ?? []) L.push(`    ${m}`);
   }
   if (bad.length > max) L.push(`  … ${bad.length - max} more`);
   if (bad.some((p) => p.kind === "freeze" && !p.why?.length)) L.push("  (cause not measured: eye_probe {process} before recording makes the report name what held the main thread — Debug builds)");
   for (const p of facts.slice(0, max)) { L.push(`· ${p.text}`); for (const m of p.more ?? []) L.push(`    ${m}`); }
   if (facts.length > max) L.push(`  … ${facts.length - max} more`);
+  if (s.said?.lines.length) {
+    const n = Math.max(3, Math.min(max, 8));
+    L.push(`what the app told accessibility (same clock):`);
+    for (const l of s.said.lines.slice(0, n)) L.push(`  ${l}`);
+    if (s.said.lines.length > n) L.push(`  … ${s.said.lines.length - n} more (events.jsonl in the run folder; eye_report view:"explain" lists them all)`);
+  } else if (s.said?.silent) L.push(`· ${s.said.silent}`);
   return L.join("\n");
 }

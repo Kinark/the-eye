@@ -4,7 +4,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { analyze, loadRun, type Row } from "./analyze.ts";
-import { loadStalls, whyGap } from "./notice.ts";
+import { loadActions as noticeActions, loadSaid, loadStalls, placeSaid, whyGap } from "./notice.ts";
 
 type Cursor = { t: number; x: number; y: number; buttons: number; pid: number; role: string; label: string };
 type Action = { t0: number; t1: number; op: string; note?: string; x?: number; y?: number };
@@ -63,7 +63,8 @@ export function explain(csv: string, o: ExplainOptions = {}): string {
     ? `while animating: ${a.overall.fps} fps of ${hz} · hitches ${a.overall.hitches} (long ${a.overall.long_hitches}) · p95 gap ${a.overall.gap_p95_ms}ms · max ${a.overall.gap_max_ms}ms · ${a.segments.length} segments`
     : "no animation detected");
   const stalls = loadStalls(dir);
-  L.push(`sources: frames ${rows.length} · cursor samples ${cursor.length} · agent actions ${actions.length} · main-thread stalls ${stalls ? `${stalls.stalls.length} (probe watchdog in ${stalls.name})` : "— (eye_probe {process} before recording: it times and samples every stall)"} · Instruments samples ${prof?.samples.length ?? "— (profile: {process})"}`);
+  const heard = loadSaid(dir, t0Wall);
+  L.push(`sources: frames ${rows.length} · cursor samples ${cursor.length} · agent actions ${actions.length} · accessibility events ${heard ? heard.events.length : "— (recorded by process: the app's own words go on this clock)"} · main-thread stalls ${stalls ? `${stalls.stalls.length} (probe watchdog in ${stalls.name})` : "— (eye_probe {process} before recording: it times and samples every stall)"} · Instruments samples ${prof?.samples.length ?? "— (profile: {process})"}`);
   const stallLines: string[] = [];
   if (stalls?.stalls.length) {
     // Every long stall gets listed, whether or not the screen showed it as one gap: the capture can deliver
@@ -128,6 +129,19 @@ export function explain(csv: string, o: ExplainOptions = {}): string {
   }
 
   L.push(...stallLines);
+
+  // What the app itself said, on the same clock: each word against the step before it and the motion around it.
+  if (heard) {
+    const said = heard.events.filter((e) => (o.from_s === undefined || e.t >= o.from_s) && (o.to_s === undefined || e.t <= o.to_s));
+    const acts = noticeActions(dir, t0Wall);
+    L.push("", `## what ${heard.app || "the app"} told accessibility (listening from ${heard.from.toFixed(3)}s)`);
+    if (!said.length) L.push("nothing");
+    for (const e of said.slice(0, 60)) {
+      const where = placeSaid(e, a.segments, acts);
+      L.push(`- t=${e.t.toFixed(3)}s · ${e.text}${where ? ` · ${where}` : ""} · ${describeCursor(at(e.t))}`);
+    }
+    if (said.length > 60) L.push(`  … ${said.length - 60} more (events.jsonl)`);
+  }
 
   // 2. Smoothness by what the cursor was over, and by agent action.
   const groups = (keyOf: (t: number) => string) => {

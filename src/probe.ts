@@ -3,7 +3,7 @@
 // swift/EyeProbe.swift, loaded into the target through a debugger (lldb, or Xcode's own session).
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
@@ -45,14 +45,25 @@ async function buildProbe(): Promise<{ v: string; path: string }> {
   if (existsSync(path)) return { v, path };
   mkdirSync(dirname(path), { recursive: true });
   // Module name carries the version: a rebuilt probe loaded next to an old one must not clash.
-  const r = await run("swiftc", ["-O", "-swift-version", "5", "-emit-library", "-module-name", `EyeProbe_${v}`, SRC(), "-o", path], 180_000);
+  const build = (out: string, target: string[]) => run("swiftc", ["-O", "-swift-version", "5", ...target, "-emit-library", "-module-name", `EyeProbe_${v}`, SRC(), "-o", out], 180_000);
+  const r = await build(path, []);
   if (r.code !== 0) throw new Error(`building EyeProbe failed:\n${r.stderr}`);
+  // Apple's own apps are arm64e and load nothing else: add that slice, so the probe fits them too. (Without it
+  // the probe still serves every third-party app; the loader's refusal names the architecture.)
+  if (process.arch === "arm64") {
+    const e = `${path}.arm64e`, fat = `${path}.fat`;
+    const b = await build(e, ["-target", "arm64e-apple-macos14.0"]);
+    if (b.code === 0 && (await run("lipo", ["-create", path, e, "-output", fat], 30_000)).code === 0) renameSync(fat, path);
+    rmSync(e, { force: true }); rmSync(fat, { force: true });
+  }
   return { v, path };
 }
 
 // ---- target
 
-type Target = { pid: number; exe: string; app?: string; bundleId?: string; sandboxed: boolean; dir: string; name: string };
+type Target = { pid: number; exe: string; app?: string; bundleId?: string; sandboxed: boolean; dir: string; name: string;
+  /** Set when the app is signed by a certificate we hold no key for: the probe went in signed ad hoc. */
+  foreign?: string };
 
 async function resolveTarget(proc: string | number): Promise<Target> {
   const ps = await run("/bin/ps", ["-axo", "pid=,comm="], 5000);
@@ -98,9 +109,10 @@ async function stageFor(t: Target, built: { v: string; path: string }): Promise<
   if (existsSync(leaf)) {
     identity = createHash("sha1").update(readFileSync(leaf)).digest("hex").toUpperCase();
     const ids = await run("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"], 8000);
-    if (!ids.stdout.toUpperCase().includes(identity)) {
-      throw new Error(`the target is signed by a certificate whose private key is not in your keychain (${identity}); the probe can't be signed to pass its library validation`);
-    }
+    // Someone else's app (a release build, an App Store or system app): the probe cannot carry its signature.
+    // Signed ad hoc it still loads where library validation is not enforced, which a debugger attached with
+    // System Integrity Protection off brings about; elsewhere dlopen refuses it and the caller says so.
+    if (!ids.stdout.toUpperCase().includes(identity)) { t.foreign = identity; identity = "-"; }
   }
   const r = await run("/usr/bin/codesign", ["-f", "-s", identity, dest], 30_000);
   if (r.code !== 0) throw new Error(`codesign failed: ${r.stderr}`);
@@ -554,8 +566,10 @@ export function registerProbeTools(server: any, d: Deps) {
       "or to know WHICH layer moved/stuttered. Costs ~0.2ms a frame plus nothing while the main thread is healthy. Returns at once;",
       "eye_peek shows the live state (call ~every 0.5s while acting), eye_act can aim at layers (`on`) and read them (`L('label')`),",
       "eye_stop ends it and returns the per-layer report (aligned to a running eye_record capture automatically).",
-      "Needs a debuggable target (Debug build, get-task-allow) whose signing certificate is in your keychain. If Xcode is already",
-      "debugging the app, this returns lldb commands to send through Xcode's InvokeDebuggerCommand; do that and call eye_probe again.",
+      "REACH: with System Integrity Protection on, a debuggable target (Debug build, get-task-allow) whose signing certificate is in",
+      "your keychain. With SIP off (csrutil status), ANY app the user runs: release builds, hardened and sandboxed third-party apps,",
+      "and Apple's own (the probe is built arm64 + arm64e and goes in signed ad hoc). If Xcode is already debugging the app, this",
+      "returns lldb commands to send through Xcode's InvokeDebuggerCommand; do that and call eye_probe again.",
       "LIMIT: effects the window server renders itself (system glass, backdrops) are not in the app's layer tree.",
     ].join(" "),
     inputSchema: {
@@ -596,7 +610,11 @@ export function registerProbeTools(server: any, d: Deps) {
         args.push("-o", "process detach");
         const r = await run("lldb", args, 60_000);
         for (let i = 0; i < 20 && !alive(t, v); i++) await sleep(150);
-        if (!alive(t, v)) return fail(`lldb could not load the probe.\n${(r.stdout + r.stderr).trim().slice(-1500)}\n\nIf a debugger owns the process, or attaching needs Developer Tools access:\n${viaXcode}`);
+        if (!alive(t, v)) {
+          const sip = (await run("/usr/bin/csrutil", ["status"], 5000)).stdout.trim();
+          const reach = /disabled/i.test(sip) ? "" : `\n\n${sip} With it on, only debuggable builds (get-task-allow)${t.foreign ? " signed by a certificate in your keychain" : ""} can be probed${t.foreign ? `; ${t.name} is signed by someone else (${t.foreign})` : ""}. With it off, any app can.`;
+          return fail(`lldb could not load the probe.\n${(r.stdout + r.stderr).trim().slice(-1500)}${reach}\n\nIf a debugger owns the process, or attaching needs Developer Tools access:\n${viaXcode}`);
+        }
       }
       retireOthers(t, v);
       const id = `probe${++seq}_${Date.now().toString(36)}`;

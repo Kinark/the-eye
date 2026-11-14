@@ -256,6 +256,20 @@ timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` 
   the report says `moved by: cannot be told`, the step, how long it had gone without an update, and the main-thread
   block that swallowed those positions (function included). The screen reading refuses the same way when over 40% of
   the way went in a single frame. The report ends with everything the app declared to Core Animation, on any layer.
+- **What the app said, on the same clock.** A recording of an app also runs `eye-capture watch --exact` on it and
+  writes `events.jsonl`: every value change, focus move, window, sheet, menu and announcement, stamped the moment its
+  accessibility notification arrived. The report lists them under `what the app told accessibility`, each against
+  the step before it and the motion around it (`304ms after click "Ease" · 57% into the motion`), and says under each
+  response who was first: `the app knew first` (it reported the change before the screen began to show it), `the
+  screen changed first`, or `yet the app reported a change` when nothing visible answered. A run in which the steps
+  changed the screen and the app said nothing is flagged: assistive technology was not told. `events:false` on
+  `eye_act` / `eye_record` does not attach the observer; fps on the fixture reads the same with and without it.
+  Test: `node test/said-e2e.mjs` (the fixture changes a value in its action and announces 200ms later; both are
+  200ms gap between them reads 207–208ms).
+- **The probe reaches any app when SIP is off.** With System Integrity Protection on, `eye_probe` needs a debuggable
+  build signed by a certificate in your keychain. With it off the debugger may attach to anything, and the probe
+  (built arm64 + arm64e, signed ad hoc when the app is someone else's) loads into release builds, hardened and
+  sandboxed third-party apps and Apple's own arm64e apps: layers, main-thread stalls and symbolized stacks included.
 - **Recorded alone.** `eye_act`'s own recording and `eye_record {process}` capture only the target app's windows,
   over mid grey (`--only-pid` in the helper): what shows through a see-through overlay window, or sits over the app,
   is not measured as its motion. `isolate:false` on `eye_record` records the screen as it is.
