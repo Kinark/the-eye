@@ -189,6 +189,23 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     var identical = 0 // compositor re-deliveries with unchanged pixels (counted in idle)
     var firstT = 0.0, lastT = 0.0
     var streamError: String?
+    /// The stream is down right now (it stopped with an error and has not been brought back).
+    var streamDead = false
+    var restarts = 0
+    /// Called on `q` when ScreenCaptureKit stops the stream under us.
+    var onStreamDied: (() -> Void)?
+    /// Mach seconds of the last sample callback of any kind (0 = none yet). A live stream calls back every refresh,
+    /// idle frames included, so a growing age means the eye is shut, whatever the last reading said.
+    var lastCallback = 0.0
+    /// Stretches of the recording's clock in which the stream was down: what happened in them was not seen.
+    var blindSpans: [[String: Any]] = []
+    var blindFrom: Double?
+    /// Close the open blind stretch at `rel` (a frame arrived again, or the recording ends).
+    func closeBlind(_ rel: Double, ended: Bool = false) {
+        guard let from = blindFrom else { return }
+        blindSpans.append(["from": from, "to": max(from, rel), "why": streamError ?? "the capture stream stopped", "to_end": ended])
+        blindFrom = nil
+    }
     let q = DispatchQueue(label: "eye.capture")
     // Live state (for <out>.live.json): recent callbacks and the current visible extent.
     var recent: [(t: Double, complete: Bool, interval: Double, frac: Double)] = []
@@ -216,7 +233,15 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         buf = ""
     }
 
-    func stream(_ stream: SCStream, didStopWithError error: Error) { streamError = error.localizedDescription }
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        let why = error.localizedDescription
+        q.async {
+            self.streamError = why; self.streamDead = true
+            // On the recording's clock: from now until the first frame of a restarted stream, nothing is observed.
+            self.blindFrom = self.t0.map { machSeconds(mach_absolute_time()) - $0 } ?? 0
+            self.onStreamDied?()
+        }
+    }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen,
@@ -224,6 +249,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
               let info = atts.first,
               let raw = info[.status] as? Int, let status = SCFrameStatus(rawValue: raw) else { return }
         let t = (info[.displayTime] as? UInt64).map(machSeconds) ?? CMSampleBufferGetPresentationTimeStamp(sb).seconds
+        lastCallback = machSeconds(mach_absolute_time())
         if t0 == nil {
             t0 = t; firstT = t
             // Anchor the frame clock (mach seconds) to wall time so Instruments traces can be aligned.
@@ -231,6 +257,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         lastT = t
         let rel = t - t0!
+        if blindFrom != nil { closeBlind(rel) }
         switch status {
         case .idle:
             idle += 1
@@ -383,6 +410,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             o["anchored_screen"] = NSNull()
         }
         o["anchor"] = ["x": anchorX, "row_pt": anchorRowPt]
+        // Is the eye open? Everything above is the LAST reading; these say how old it is and whether the stream lives.
+        if lastCallback > 0 { o["age_s"] = machSeconds(mach_absolute_time()) - lastCallback } else { o["age_s"] = NSNull() }
+        if streamDead { o["stream_error"] = streamError ?? "the capture stream stopped" } else { o["stream_error"] = NSNull() }
+        o["stream_restarts"] = restarts
+        o["blind"] = blindSpans
         o["ax"] = axEnabled
         if axEnabled {
             hoverLock.lock(); let hv = liveHover, hp = liveHoverAt, ht = liveHoverT; hoverLock.unlock()
@@ -861,10 +893,11 @@ func cmdCapture() async {
             FileHandle.standardError.write("eye-capture: --only-pid \(pid) is not an app ScreenCaptureKit can single out; recording everything in the rect\n".data(using: .utf8)!)
         }
     }
-    let stream = SCStream(filter: filter, configuration: cfg, delegate: rec)
+    let theFilter = filter
+    let live = StreamBox(SCStream(filter: theFilter, configuration: cfg, delegate: rec))
     do {
-        try stream.addStreamOutput(rec, type: .screen, sampleHandlerQueue: rec.q)
-        try await stream.startCapture()
+        try live.stream.addStreamOutput(rec, type: .screen, sampleHandlerQueue: rec.q)
+        try await live.stream.startCapture()
     } catch { fail("capture start failed: \(error.localizedDescription)") }
     startedFlag.withLock { started = true }
     let wallStart = Date()
@@ -891,7 +924,7 @@ func cmdCapture() async {
             wrote.lock()
             guard !written else { wrote.unlock(); return }
             written = true
-            rec.q.sync { rec.flush() }
+            rec.q.sync { rec.flush(); rec.closeBlind(rec.t0.map { machSeconds(mach_absolute_time()) - $0 } ?? 0, ended: true) }
             try? rec.out.close()
             let meta: [String: Any] = [
                 "csv": outPath, "display_id": d.displayID, "display_name": screenName(d.displayID),
@@ -903,22 +936,50 @@ func cmdCapture() async {
                 "span_seconds": rec.lastT - rec.firstT, "keyframes": rec.keyframes, "keyframes_dir": keyDir ?? NSNull(),
                 "t0_mach": rec.t0 ?? 0, "t0_wall": rec.t0Wall, "cursor_csv": cursor?.path ?? NSNull(),
                 "stream_error": rec.streamError ?? NSNull(),
+                "stream_dead": rec.streamDead, "stream_restarts": rec.restarts, "blind": rec.blindSpans,
                 "stop_timed_out": stopTimedOut,
             ]
             let mj = json(meta)
             try? mj.write(toFile: outPath + ".meta.json", atomically: true, encoding: .utf8)
             print(mj)
             fflush(stdout)
-            exit(0)
+            exit(rec.streamDead ? 5 : 0)   // 5: it ended blind
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + 2) { writeMetaAndExit(true) }
         Task {
-            try? await stream.stopCapture()
+            try? await live.stream.stopCapture()
             writeMetaAndExit(false)
         }
     }
     onTerminate(finish)
     DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { finish() }
+    // ScreenCaptureKit drops a stream now and then ("application connection being interrupted"). A recording that
+    // carries on as if nothing happened reports a calm screen it is no longer looking at, so: open the eye again,
+    // and if it will not open, end the recording blind rather than stay up pretending.
+    rec.onStreamDied = {
+        let why = rec.streamError ?? "unknown"
+        DispatchQueue.main.async {
+            guard !finished else { return }
+            guard rec.restarts < 3 else {
+                FileHandle.standardError.write("eye-capture: the capture stream died again (\(why)); giving up after 3 restarts\n".data(using: .utf8)!)
+                finish(); return
+            }
+            rec.restarts += 1
+            FileHandle.standardError.write("eye-capture: the capture stream died (\(why)); restarting it\n".data(using: .utf8)!)
+            Task {
+                let s = SCStream(filter: theFilter, configuration: cfg, delegate: rec)
+                do {
+                    try s.addStreamOutput(rec, type: .screen, sampleHandlerQueue: rec.q)
+                    try await s.startCapture()
+                    live.stream = s
+                    rec.q.async { rec.streamDead = false }
+                } catch {
+                    FileHandle.standardError.write("eye-capture: could not restart the capture stream: \(error.localizedDescription)\n".data(using: .utf8)!)
+                    DispatchQueue.main.async { finish() }
+                }
+            }
+        }
+    }
     let flushTimer = DispatchSource.makeTimerSource(queue: rec.q)
     flushTimer.schedule(deadline: .now() + 0.5, repeating: 0.5)
     flushTimer.setEventHandler { rec.flush() }
@@ -934,6 +995,8 @@ func cmdCapture() async {
     liveTimer.resume()
     keep.append(liveTimer)
 }
+/// The stream in use: replaced when ScreenCaptureKit drops it and it is started again.
+final class StreamBox { var stream: SCStream; init(_ s: SCStream) { stream = s } }
 var keep: [Any] = []
 var axEnabled = false
 
@@ -1659,9 +1722,15 @@ enum Win {
             var ids = [CGDirectDisplayID](repeating: 0, count: 8), n: UInt32 = 0
             CGGetDisplaysWithPoint(CGPoint(x: f.midX, y: f.midY), 8, &ids, &n)
             let disp = n > 0 ? ids[0] : CGMainDisplayID(), b = CGDisplayBounds(disp)
+            // Is there anything of it to look at? On screen at ANY layer (an overlay or a notch window is not at layer 0);
+            // a window on another Space or of a hidden app is not, and neither is anything on a sleeping or locked display.
+            let shown = (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? [])
+                .contains { ($0[kCGWindowNumber as String] as? Int) == num }
+            let locked = ((CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool) == true
             return ["ok": true, "op": "raise", "pid": Int(pid), "number": num, "title": AXI.text(AXI.raw(w, kAXTitleAttribute)) ?? "",
                     "frame": [f.minX, f.minY, f.width, f.height], "minimized": minimized,
-                    "on_top": !minimized && before.first?.number == num, "on_screen": before.contains { $0.number == num },
+                    "on_top": !minimized && before.first?.number == num, "on_screen": shown,
+                    "display_asleep": CGDisplayIsAsleep(disp) != 0, "screen_locked": locked,
                     "display": Int(disp), "display_bounds": [b.minX, b.minY, b.width, b.height]]
         }
         let wasFront = !minimized && frontApp == pid && before.first?.number == num
@@ -1752,6 +1821,512 @@ enum Win {
 }
 
 
+// MARK: - the hand: one unbroken motion, steered while it flies, feeling what it passes over
+//
+// eye_act's steps are points with a stop and a thought between each. A hand does not work like that: it flies a whole
+// stroke (a "wing"), aims at THINGS rather than coordinates, keeps its momentum from one target to the next, and
+// knows what is under it the whole way. Two threads keep that alive between commands: one integrates position and
+// velocity 120 times a second (velocity eases toward what was asked, so a change of direction is an arc, not a
+// corner), the other hit-tests accessibility under the pointer about every point travelled and keeps the trail.
+// The hand reads the recording's live file itself: when the eye is shut it brakes, by itself, wherever it is.
+
+final class Buttons {
+    private let l = NSLock()
+    private var s = Set<String>()
+    func contains(_ b: String) -> Bool { l.lock(); defer { l.unlock() }; return s.contains(b) }
+    func insert(_ b: String) { l.lock(); s.insert(b); l.unlock() }
+    func remove(_ b: String) { l.lock(); s.remove(b); l.unlock() }
+    var all: [String] { l.lock(); defer { l.unlock() }; return Array(s) }
+}
+
+extension AXI {
+    /// Is what the finger would touch (`hit`) the thing it reached for? The thing itself, something inside it, or a
+    /// container that takes the touches for it — never something as loose as the window.
+    static func related(_ hit: AXUIElement, _ thing: AXUIElement) -> Bool {
+        if CFEqual(hit, thing) { return true }
+        guard pid(hit) == pid(thing) else { return false }
+        var cur = hit
+        for _ in 0..<12 {
+            guard let p = raw(cur, kAXParentAttribute), isElement(p) else { break }
+            cur = p as! AXUIElement
+            if CFEqual(cur, thing) { return true }
+        }
+        cur = thing
+        for _ in 0..<4 {
+            guard let p = raw(cur, kAXParentAttribute), isElement(p) else { break }
+            cur = p as! AXUIElement
+            if CFEqual(cur, hit) { let r = text(raw(hit, kAXRoleAttribute)); return r != "AXWindow" && r != "AXApplication" }
+        }
+        return false
+    }
+    /// Everything with a name in the app's windows inside `bounds`: what is there to reach for.
+    static func sight(pid: pid_t, bounds: CGRect, maxNodes: Int = 2000) -> [(el: AXUIElement, node: [String: Any])] {
+        var out: [(el: AXUIElement, node: [String: Any])] = []
+        var visited = 0
+        func go(_ el: AXUIElement, _ depth: Int) {
+            guard visited < maxNodes, depth < 60 else { return }
+            visited += 1
+            let vals = many(el, nodeAttrs + [kAXChildrenAttribute])
+            let f = frame(vals)
+            if let f, f.width > 0, f.height > 0, !f.intersects(bounds) { return }
+            let n = node(vals, maxText: 80)
+            if depth > 0, let f, f.width > 0, f.height > 0, label(n) != nil { out.append((el, n)) }
+            for k in (vals[kAXChildrenAttribute] as? [AnyObject] ?? []) where isElement(k) { go(k as! AXUIElement, depth + 1) }
+        }
+        for w in observedWindows(bounds, process: String(pid), limit: 6) { go(w.root, 0) }
+        return out
+    }
+    static let pressable: Set<String> = ["AXButton", "AXCheckBox", "AXRadioButton", "AXMenuItem", "AXLink", "AXPopUpButton",
+                                         "AXTextField", "AXMenuButton", "AXTab", "AXSlider", "AXDisclosureTriangle", "AXCell",
+                                         "AXTextArea", "AXComboBox", "AXSwitch", "AXToggle"]
+    /// The thing called `q`: exact name beats a name starting with it beats one containing it; among equals, something
+    /// you can press. `id`: match the identifier alone. `role`: only that role ("Button").
+    static func pick(_ all: [(el: AXUIElement, node: [String: Any])], q: String, role: String?, id: Bool)
+        -> (el: AXUIElement, node: [String: Any], ties: Int)? {
+        let want = q.lowercased()
+        var best: (Double, Int)? = nil, ties = 0
+        for (i, c) in all.enumerated() {
+            let n = c.node
+            let r = n["role"] as? String ?? ""
+            if let role, r.replacingOccurrences(of: "AX", with: "", options: .anchored).lowercased() != role.lowercased() { continue }
+            var s = 0.0
+            if id { s = (n["identifier"] as? String)?.lowercased() == want ? 3 : 0 } else {
+                for k in ["title", "description", "value", "identifier", "help"] {
+                    guard let v = (n[k] as? String)?.lowercased() else { continue }
+                    s = max(s, v == want ? 3 : v.hasPrefix(want) ? 2 : v.contains(want) ? 1 : 0)
+                }
+            }
+            guard s > 0 else { continue }
+            if pressable.contains(r) { s += 0.5 }
+            if best == nil || s > best!.0 { best = (s, i); ties = 1 } else if s == best!.0 { ties += 1 }
+        }
+        guard let b = best else { return nil }
+        return (all[b.1].el, all[b.1].node, ties)
+    }
+}
+
+final class Hand {
+    enum Aim { case rest, heading(CGVector), point(CGPoint, stop: Bool) }
+    struct Seg { var t0: Double, t1: Double, from: CGPoint, to: CGPoint, label: String, frame: CGRect?, el: AXUIElement?, n: Int }
+    let lock = NSLock()
+    let buttons: Buttons
+    let post: (CGEvent?) -> Void
+    let src: CGEventSource?
+    var pos = CGPoint.zero, vel = CGVector.zero
+    var aim = Aim.rest, arrived = true, edge = false, lastDist = Double.infinity
+    var speed = 700.0
+    var bounds: CGRect? = nil
+    var deadman = Double.infinity, coasted = false
+    var scrollRate = CGVector.zero, scrollAcc = CGVector.zero, scrollOpen = false
+    var trail: [Seg] = [], dropped = 0
+    var livePath: String? = nil, blind: String? = nil, screenMoving = false
+    var targetPid: pid_t = 0
+    var senseUntil = 0.0
+    var started = false
+    let tau = 0.04 // how fast velocity follows what was asked: the hand's mass
+
+    init(buttons: Buttons, src: CGEventSource?, post: @escaping (CGEvent?) -> Void) { self.buttons = buttons; self.src = src; self.post = post }
+    static func pointer() -> CGPoint { CGEvent(source: nil)?.location ?? .zero }
+    func now() -> Double { machSeconds(mach_absolute_time()) }
+    var resting: Bool { if case .rest = aim { return hypot(vel.dx, vel.dy) < 0.5 }; return false }
+
+    func postMove(_ p: CGPoint) {
+        let l = buttons.contains("left"), r = buttons.contains("right")
+        let type: CGEventType = l ? .leftMouseDragged : r ? .rightMouseDragged : .mouseMoved
+        post(CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: p, mouseButton: r && !l ? .right : .left))
+    }
+    func postScroll(_ phase: Int64, _ y: Int32, _ x: Int32, at p: CGPoint) {
+        guard let e = CGEvent(scrollWheelEvent2Source: src, units: .pixel, wheelCount: 2, wheel1: y, wheel2: x, wheel3: 0) else { return }
+        e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        e.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
+        e.location = p
+        post(e)
+    }
+
+    func start() {
+        guard !started else { return }
+        started = true
+        Thread { [self] in motion() }.start()
+        Thread { [self] in sense() }.start()
+    }
+
+    private func motion() {
+        var last = now()
+        while true {
+            usleep(8333)
+            let t = now(), dt = min(0.05, t - last)
+            last = t
+            lock.lock()
+            if resting, scrollRate == .zero, !scrollOpen { vel = .zero; lock.unlock(); continue }
+            // The eye shut, or nobody steering any more: brake where it is (velocity eases out, it does not snap).
+            if blind != nil { aim = .rest; scrollRate = .zero }
+            if t > deadman { deadman = .infinity; if case .heading = aim { aim = .rest; coasted = true } }
+            var vd = CGVector.zero
+            switch aim {
+            case .rest: break
+            case .heading(let d): vd = CGVector(dx: d.dx * speed, dy: d.dy * speed)
+            case .point(let p, let stop):
+                let dx = p.x - pos.x, dy = p.y - pos.y, dist = hypot(dx, dy)
+                if stop {
+                    if dist < 1.2, hypot(vel.dx, vel.dy) < 90 {
+                        pos = p; vel = .zero; aim = .rest; arrived = true
+                        lock.unlock(); postMove(p); continue
+                    }
+                    // Closing speed proportional to what is left: with the hand's mass that is a spring landing
+                    // (damping ratio ≈ 0.67: it arrives with a few percent of overshoot and settles, like a wrist).
+                    // Never slower than a crawl, so the last points do not take for ever.
+                    let v = min(speed, max(70, dist * 14))
+                    if dist > 0 { vd = CGVector(dx: dx / dist * v, dy: dy / dist * v) }
+                } else {
+                    // A point to pass through, not to stop at: close enough is there, and it keeps flying.
+                    let r = max(8, speed * tau)
+                    if dist < r || (dist < 3 * r && dist > lastDist) {
+                        arrived = true
+                        let s = max(1, hypot(vel.dx, vel.dy))
+                        aim = .heading(CGVector(dx: vel.dx / s, dy: vel.dy / s)); deadman = t + 0.35
+                        vd = vel
+                    } else if dist > 0 { vd = CGVector(dx: dx / dist * speed, dy: dy / dist * speed) }
+                    lastDist = dist
+                }
+            }
+            let a = 1 - exp(-dt / tau)
+            vel.dx += (vd.dx - vel.dx) * a; vel.dy += (vd.dy - vel.dy) * a
+            var np = CGPoint(x: pos.x + vel.dx * dt, y: pos.y + vel.dy * dt)
+            if let b = bounds {
+                let x = min(max(np.x, b.minX + 1), b.maxX - 1), y = min(max(np.y, b.minY + 1), b.maxY - 1)
+                if x != np.x { vel.dx = 0 }
+                if y != np.y { vel.dy = 0 }
+                if x != np.x || y != np.y {
+                    np = CGPoint(x: x, y: y)
+                    if case .heading = aim { aim = .rest; edge = true; arrived = true }
+                }
+            }
+            let moved = hypot(np.x - pos.x, np.y - pos.y) > 0.01
+            pos = np
+            var scrolls: [(Int64, Int32, Int32)] = []
+            if scrollRate != .zero {
+                if !scrollOpen { scrollOpen = true; scrolls.append((1, 0, 0)) }
+                scrollAcc.dx += scrollRate.dx * dt; scrollAcc.dy += scrollRate.dy * dt
+                let iy = Int32(scrollAcc.dy), ix = Int32(scrollAcc.dx)
+                scrollAcc.dy -= Double(iy); scrollAcc.dx -= Double(ix)
+                if iy != 0 || ix != 0 { scrolls.append((2, iy, ix)) }
+            } else if scrollOpen { scrollOpen = false; scrollAcc = .zero; scrolls.append((4, 0, 0)) }
+            lock.unlock()
+            if moved { postMove(np) }
+            for s in scrolls { postScroll(s.0, s.1, s.2, at: np) }
+        }
+    }
+
+    /// `Button "7"`, or for a nameless leaf the nearest named thing around it; other apps say whose they are.
+    func describe(_ el: AXUIElement?) -> (label: String, frame: CGRect?) {
+        guard let el else { return ("nothing", nil) }
+        let n = AXI.node(AXI.many(el, AXI.nodeAttrs), maxText: 60)
+        var s = AXI.short(n)
+        if AXI.label(n) == nil {
+            var cur = el
+            for _ in 0..<3 {
+                guard let p = AXI.raw(cur, kAXParentAttribute), AXI.isElement(p) else { break }
+                cur = p as! AXUIElement
+                let pn = AXI.node(AXI.many(cur, AXI.nodeAttrs), maxText: 60)
+                if AXI.label(pn) != nil { s += " in " + AXI.short(pn); break }
+            }
+        }
+        let p = AXI.pid(el)
+        if targetPid != 0, p != targetPid { s = "⟨\(NSRunningApplication(processIdentifier: p)?.localizedName ?? "pid \(p)"), not the app⟩ " + s }
+        let f = (n["frame"] as? [Double]).map { CGRect(x: $0[0], y: $0[1], width: $0[2], height: $0[3]) }
+        return (s, f)
+    }
+
+    func readLive() {
+        guard let path = livePath else { lock.lock(); blind = nil; lock.unlock(); return }
+        var why: String? = nil, mv = false
+        if let at = try? FileManager.default.attributesOfItem(atPath: path), let m = at[.modificationDate] as? Date,
+           let d = FileManager.default.contents(atPath: path), let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+            let age = Date().timeIntervalSince(m)
+            if let e = o["stream_error"] as? String { why = "the capture stream died (\(e))" }
+            else if age > 1.5 { why = String(format: "the recording ended, or its helper stopped, %.1fs ago", age) }
+            else if (o["frames_total"] as? NSNumber)?.intValue == 0 { why = "the recording has not delivered a single image" }
+            mv = (o["moving"] as? Bool) ?? false
+        } else { why = "the recording has no live reading" }
+        lock.lock(); blind = why; screenMoving = mv; lock.unlock()
+    }
+
+    private func sense() {
+        var lastP = CGPoint(x: -1e9, y: -1e9), lastT = 0.0, lastLive = 0.0
+        while true {
+            usleep(4000)
+            let t = now()
+            if t - lastLive > 0.1 { lastLive = t; if t < senseUntil { readLive() } }
+            lock.lock()
+            let on = t < senseUntil, p = resting ? Hand.pointer() : pos
+            lock.unlock()
+            guard on else { continue }
+            if hypot(p.x - lastP.x, p.y - lastP.y) < 1, t - lastT < 0.25 { continue }
+            lastP = p; lastT = t
+            let el = AXI.hit(p)
+            lock.lock()
+            let same = trail.last.map { s in (s.el == nil && el == nil) || (s.el != nil && el != nil && CFEqual(s.el!, el!)) } ?? false
+            if same { trail[trail.count - 1].to = p; trail[trail.count - 1].t1 = t; trail[trail.count - 1].n += 1; lock.unlock(); continue }
+            lock.unlock()
+            let d = describe(el)
+            lock.lock()
+            trail.append(Seg(t0: t, t1: t, from: p, to: p, label: d.label, frame: d.frame, el: el, n: 1))
+            if trail.count > 300 { trail.removeFirst(); dropped += 1 }
+            lock.unlock()
+        }
+    }
+
+    static func fr(_ f: CGRect?) -> Any { f.map { [AXI.r1($0.minX), AXI.r1($0.minY), AXI.r1($0.width), AXI.r1($0.height)] as [Double] } ?? NSNull() }
+
+    /// What lies on the line the hand is flying, and how soon.
+    func ahead(from p: CGPoint, dir: CGVector, speed v: Double) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        var cur = AXI.hit(p)
+        var d = 6.0
+        while d <= 600, out.count < 4 {
+            let q = CGPoint(x: p.x + dir.dx * d, y: p.y + dir.dy * d)
+            if let b = bounds, !b.contains(q) { out.append(["label": "the window's edge", "in_pt": d, "in_ms": d / max(1, v) * 1000]); break }
+            let el = AXI.hit(q)
+            let same = (cur == nil && el == nil) || (cur != nil && el != nil && CFEqual(cur!, el!))
+            if !same {
+                cur = el
+                let de = describe(el)
+                out.append(["label": de.label, "frame": Hand.fr(de.frame), "in_pt": d, "in_ms": d / max(1, v) * 1000])
+            }
+            d += 6
+        }
+        return out
+    }
+
+    /// One wing: the moves in order, as one motion. Returns what was done, what was passed over, where it is now.
+    func wing(_ c: [String: Any], pressAllowed: (CGPoint) -> String?) -> [String: Any] {
+        let moves = c["moves"] as? [[String: Any]] ?? []
+        let t0 = now()
+        let coast = ((c["coast_ms"] as? NSNumber)?.doubleValue ?? 1500) / 1000
+        let limit = t0 + ((c["max_ms"] as? NSNumber)?.doubleValue ?? 20000) / 1000
+        lock.lock()
+        targetPid = (c["pid"] as? NSNumber)?.int32Value ?? 0
+        if let b = c["bounds"] as? [NSNumber], b.count == 4 { bounds = CGRect(x: b[0].doubleValue, y: b[1].doubleValue, width: b[2].doubleValue, height: b[3].doubleValue) } else { bounds = nil }
+        livePath = c["live"] as? String
+        senseUntil = t0 + 60
+        if resting { pos = Hand.pointer() }
+        deadman = .infinity; edge = false; coasted = false
+        if let v = (c["speed"] as? NSNumber)?.doubleValue { speed = max(20, min(4000, v)) }
+        lock.unlock()
+        readLive()
+        start()
+
+        var marks: [[String: Any]] = []
+        var stopped: String? = nil
+        var inSight: [String]? = nil
+        var thing: AXUIElement? = nil, thingName = ""
+        var done = 0
+        func locked<T>(_ f: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return f() }
+        func set(_ a: Aim) { locked { if resting { pos = Hand.pointer() }; aim = a; arrived = false; edge = false; lastDist = .infinity; deadman = .infinity } }
+        func inside(_ p: CGPoint) -> CGPoint {
+            guard let b = bounds else { return p }
+            return CGPoint(x: min(max(p.x, b.minX + 2), b.maxX - 2), y: min(max(p.y, b.minY + 2), b.maxY - 2))
+        }
+        /// nil when `cond` came true; otherwise why it did not.
+        func wait(_ seconds: Double, _ cond: () -> Bool) -> String? {
+            let end = min(limit, now() + seconds)
+            while true {
+                if let b = locked({ blind }) { return "the eye went blind: \(b)" }
+                if cond() { return nil }
+                if now() > end { return now() >= limit ? "the wing ran out of time" : "it did not get there" }
+                usleep(3000)
+            }
+        }
+        func halt() {
+            locked { if case .heading = aim { aim = .rest }; deadman = .infinity }
+            _ = wait(0.7) { locked { hypot(vel.dx, vel.dy) < 3 } }
+        }
+        func here() -> CGPoint { locked { resting ? Hand.pointer() : pos } }
+        func mark(_ i: Int, _ k: String, _ wall0: Double, _ what: String) {
+            let p = here()
+            marks.append(["i": i, "k": k, "t": now(), "wall0": wall0, "wall1": Date().timeIntervalSince1970, "x": p.x, "y": p.y, "what": what])
+        }
+        func stopsAfter(_ i: Int) -> Bool {
+            guard i + 1 < moves.count, let k = moves[i + 1]["k"] as? String else { return true }
+            return !["to", "thing", "dir", "speed"].contains(k)
+        }
+        func fly(to p: CGPoint, stop: Bool) -> String? {
+            let from = here(), q = inside(p)
+            set(.point(q, stop: stop))
+            return wait(hypot(q.x - from.x, q.y - from.y) / max(20, speed) * 4 + 2) { locked { arrived } }
+        }
+
+        loop: for (i, m) in moves.enumerated() {
+            guard let k = m["k"] as? String else { continue }
+            let f = { (key: String, def: Double) -> Double in (m[key] as? NSNumber)?.doubleValue ?? def }
+            let wall0 = Date().timeIntervalSince1970
+            if let b = locked({ blind }) { stopped = "the eye went blind: \(b)"; break }
+            if now() > limit { stopped = "the wing ran out of time"; break }
+            switch k {
+            case "speed": locked { speed = max(20, min(4000, f("v", 700))) }
+            case "to":
+                thing = nil
+                if let why = fly(to: CGPoint(x: f("x", here().x), y: f("y", here().y)), stop: stopsAfter(i)) { stopped = why; break loop }
+            case "dir":
+                thing = nil
+                let deg = f("deg", 0) * .pi / 180
+                let d = CGVector(dx: cos(deg), dy: sin(deg))
+                if let dist = (m["dist"] as? NSNumber)?.doubleValue {
+                    let p = here()
+                    if let why = fly(to: CGPoint(x: p.x + d.dx * dist, y: p.y + d.dy * dist), stop: stopsAfter(i)) { stopped = why; break loop }
+                } else { set(.heading(d)) }
+            case "thing":
+                guard let b = bounds, targetPid != 0 else { stopped = "no app to look for things in"; break loop }
+                let q = m["q"] as? String ?? ""
+                let all = AXI.sight(pid: targetPid, bounds: b)
+                guard let hit = AXI.pick(all, q: q, role: m["role"] as? String, id: (m["id"] as? Bool) == true) else {
+                    stopped = "there is no \(m["role"] as? String ?? "thing") called \"\(q)\" in sight"
+                    var seenNames = Set<String>()
+                    inSight = all.filter { AXI.pressable.contains($0.node["role"] as? String ?? "") }.map { AXI.short($0.node) }
+                        .filter { seenNames.insert($0).inserted }.prefix(40).map { $0 }
+                    break loop
+                }
+                thing = hit.el; thingName = AXI.short(hit.node)
+                guard var fr0 = AXI.frame(AXI.many(hit.el, [kAXPositionAttribute, kAXSizeAttribute])) else { stopped = "\(thingName) has no place on screen"; break loop }
+                // Reaching for it is looking at it: if something else would take the touch there, the hand does not go.
+                let c0 = inside(CGPoint(x: fr0.midX, y: fr0.midY))
+                // (An app asked for the first time can take longer than the hit-test's patience: ask again before believing "nothing".)
+                var top = AXI.hit(c0)
+                for _ in 0..<3 where top == nil { usleep(80000); top = AXI.hit(c0) }
+                if let top, !AXI.related(top, hit.el) {
+                    stopped = "\(thingName) is there but not in sight: \(describe(top).label) is over it at \(Int(c0.x)),\(Int(c0.y))"; break loop
+                }
+                let stop = stopsAfter(i)
+                let from = here()
+                set(.point(c0, stop: stop))
+                var lastLook = now(), gone = false
+                let why = wait(hypot(c0.x - from.x, c0.y - from.y) / max(20, speed) * 4 + 3) {
+                    if now() - lastLook > 0.03 {
+                        lastLook = now()
+                        // It may be moving (a list scrolling, a view animating in): keep the eyes on it, steer to where it is NOW.
+                        if let fn = AXI.frame(AXI.many(hit.el, [kAXPositionAttribute, kAXSizeAttribute])) {
+                            if abs(fn.midX - fr0.midX) + abs(fn.midY - fr0.midY) > 0.5 {
+                                fr0 = fn
+                                let q = inside(CGPoint(x: fn.midX, y: fn.midY))
+                                locked { if !arrived { aim = .point(q, stop: stop) } }
+                            }
+                        } else { gone = true; return true }
+                    }
+                    return locked { arrived }
+                }
+                if gone { halt(); stopped = "\(thingName) went away while the hand was on its way"; break loop }
+                if let why { stopped = why; break loop }
+                if hit.ties > 1 { mark(i, "note", wall0, "\(hit.ties) things answer to \"\(q)\"; went to \(thingName) at [\(Int(fr0.minX)),\(Int(fr0.minY)) \(Int(fr0.width))×\(Int(fr0.height))] (say Role:\"name\" or #identifier to choose)") }
+            case "rest":
+                if let why = wait(f("ms", 200) / 1000 + 0.01, { false }), !why.hasPrefix("it did not") { stopped = why; break loop }
+            case "halt": halt()
+            case "settle":
+                // Until the screen has been still for 200ms (the recording's own reading), 2s at most.
+                var stillSince = now()
+                let r = wait(f("ms", 2000) / 1000) {
+                    if locked({ screenMoving }) { stillSince = now() }
+                    return now() - stillSince > 0.2
+                }
+                if let r, !r.hasPrefix("it did not") { stopped = r; break loop }
+                if r != nil { mark(i, "note", wall0, "still moving after \(Int(f("ms", 2000)))ms") }
+            case "tap", "down":
+                halt()
+                let p = here()
+                // The finger presses what is under it. If it reached for a thing, that thing has to be what is there.
+                if let t = thing {
+                    guard let top = AXI.hit(p) else { stopped = "nothing under the hand at \(Int(p.x)),\(Int(p.y)) to press"; break loop }
+                    if !AXI.related(top, t) { stopped = "did not press: under the hand is \(describe(top).label), not \(thingName)"; break loop }
+                }
+                if let why = pressAllowed(p) { stopped = why; break loop }
+                let b = m["button"] as? String ?? "left"
+                let right = b == "right"
+                let what = describe(AXI.hit(p)).label
+                if k == "down" {
+                    post(CGEvent(mouseEventSource: src, mouseType: right ? .rightMouseDown : .leftMouseDown, mouseCursorPosition: p, mouseButton: right ? .right : .left))
+                    buttons.insert(b)
+                    mark(i, "down", wall0, what)
+                } else {
+                    let n = max(1, Int(f("count", 1)))
+                    for j in 1...n {
+                        let e1 = CGEvent(mouseEventSource: src, mouseType: right ? .rightMouseDown : .leftMouseDown, mouseCursorPosition: p, mouseButton: right ? .right : .left)
+                        e1?.setIntegerValueField(.mouseEventClickState, value: Int64(j)); post(e1)
+                        usleep(useconds_t(f("hold_ms", 60) * 1000))
+                        let e2 = CGEvent(mouseEventSource: src, mouseType: right ? .rightMouseUp : .leftMouseUp, mouseCursorPosition: p, mouseButton: right ? .right : .left)
+                        e2?.setIntegerValueField(.mouseEventClickState, value: Int64(j)); post(e2)
+                        if j < n { usleep(40000) }
+                    }
+                    mark(i, n > 1 ? "tap×\(n)" : right ? "right-tap" : "tap", wall0, what)
+                }
+            case "up":
+                let p = here()
+                for b in buttons.all {
+                    post(CGEvent(mouseEventSource: src, mouseType: b == "right" ? .rightMouseUp : .leftMouseUp, mouseCursorPosition: p, mouseButton: b == "right" ? .right : .left))
+                    buttons.remove(b)
+                }
+                mark(i, "up", wall0, describe(AXI.hit(p)).label)
+            case "scroll":
+                halt()
+                let p = here()
+                if let why = pressAllowed(p) { stopped = why.replacingOccurrences(of: "press", with: "scroll"); break loop }
+                let dy = f("dy", 0), dx = f("dx", 0), rate = max(60, f("rate", 1200)), total = hypot(dx, dy)
+                guard total > 0 else { break }
+                locked { scrollAcc = .zero; scrollRate = CGVector(dx: dx / total * rate, dy: dy / total * rate) }
+                let r = wait(total / rate + 0.001, { false })
+                locked { scrollRate = .zero }
+                _ = wait(0.1) { locked { !scrollOpen } }
+                mark(i, "scroll", wall0, describe(AXI.hit(p)).label)
+                if let r, !r.hasPrefix("it did not") { stopped = r; break loop }
+            default: stopped = "unknown move \(k)"; break loop
+            }
+            done = i + 1
+        }
+
+        let ending = (c["end"] as? Bool) == true
+        if stopped != nil || ending { halt() }
+        if ending {
+            let p = here()
+            for b in buttons.all {
+                post(CGEvent(mouseEventSource: src, mouseType: b == "right" ? .rightMouseUp : .leftMouseUp, mouseCursorPosition: p, mouseButton: b == "right" ? .right : .left))
+                buttons.remove(b)
+            }
+            locked { scrollRate = .zero }
+        }
+        // Still flying on a heading: it keeps going while the next wing is being thought of, for `coast` at most.
+        var course = CGVector.zero, pace = 0.0
+        let flying: Bool = locked {
+            if case .heading(let d) = aim { deadman = now() + coast; course = d; pace = speed; return true }
+            return false
+        }
+        let tEnd = now()
+        lock.lock()
+        let p = resting ? Hand.pointer() : pos, v = vel, hitEdge = edge
+        let segs = trail, lost = dropped
+        trail = []; dropped = 0
+        if ending { senseUntil = 0; livePath = nil; blind = nil }
+        let dark = blind
+        lock.unlock()
+        var length = 0.0, samples = 0
+        var tr: [[String: Any]] = []
+        for s in segs {
+            length += hypot(s.to.x - s.from.x, s.to.y - s.from.y); samples += s.n
+            tr.append(["t": s.t0, "ms": (s.t1 - s.t0) * 1000, "x0": s.from.x, "y0": s.from.y, "x1": s.to.x, "y1": s.to.y,
+                       "label": s.label, "frame": Hand.fr(s.frame), "n": s.n])
+        }
+        let under = describe(AXI.hit(p))
+        let sp = hypot(v.dx, v.dy)
+        var o: [String: Any] = ["ok": true, "op": "wing", "done": done, "of": moves.count, "ms": (tEnd - t0) * 1000, "t0": t0,
+                                "marks": marks, "trail": tr, "trail_dropped": lost, "path_pt": length, "samples": samples,
+                                "x": p.x, "y": p.y, "vx": v.dx, "vy": v.dy, "speed": sp, "flying": flying, "edge": hitEdge,
+                                "over": under.label, "over_frame": Hand.fr(under.frame), "held": buttons.all]
+        if let stopped { o["stopped"] = stopped }
+        if let inSight { o["in_sight"] = inSight }
+        if let dark { o["blind"] = dark }
+        // What it is heading into, at the pace it was given (it may still be picking that pace up).
+        if flying { o["ahead"] = ahead(from: p, dir: course, speed: pace); o["coast_ms"] = coast * 1000; o["course"] = [course.dx, course.dy]; o["pace"] = pace }
+        return o
+    }
+}
+
 // MARK: - input actor
 //
 // `input` reads one JSON command per stdin line and answers one JSON line when it has finished:
@@ -1765,6 +2340,7 @@ enum Win {
 //   {"op":"rotate","degrees":45,"ms":300}           two-finger rotation (+ = clockwise)
 //   {"op":"smart_zoom"}                              two-finger double-tap
 //   {"op":"swipe","direction":"left|right|up|down"}  navigation swipe (back / forward)
+//   {"op":"wing","moves":[…],"pid":…,"bounds":[x,y,w,h],"live":path}   one unbroken motion of many moves (see Hand)
 //   {"op":"pos"}                                    current pointer position
 //   {"op":"owner","x"?,"y"?}                         topmost window under a point {pid, owner, layer, number}
 //   {"op":"inspect","x"?,"y"?,"brief"?}              AX element under a point (everything it exposes) + its window
@@ -1776,7 +2352,7 @@ enum Win {
 func cmdInput() {
     setvbuf(stdout, nil, _IOLBF, 0)
     let src = CGEventSource(stateID: .hidSystemState)
-    var buttonsDown = Set<String>()
+    let buttonsDown = Buttons()
     func pointer() -> CGPoint { CGEvent(source: nil)?.location ?? .zero }
     func send(_ e: CGEvent?) {
         guard let e else { return }
@@ -1791,6 +2367,7 @@ func cmdInput() {
         send(CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: p, mouseButton: buttonsDown.contains("right") ? .right : .left))
     }
     func reply(_ o: [String: Any]) { print(json(o)) }
+    let hand = Hand(buttons: buttonsDown, src: src, post: send)
     /// A press with `require_pid` is only posted when that process owns the topmost window at the point.
     func pressAllowed(_ c: [String: Any], at p: CGPoint) -> String? {
         guard let want = (c["require_pid"] as? NSNumber)?.intValue else { return nil }
@@ -2004,6 +2581,10 @@ func cmdInput() {
             reply(["ok": true, "op": op, "x": p.x, "y": p.y, "ms": Int(Date().timeIntervalSince(t0) * 1000),
                    "peak_force": curve.max() ?? 0, "force_clicked": maxStage == 2]); continue
         case "pos": break
+        case "wing":
+            // One unbroken motion made of many moves (see Hand). The hand goes on living between wings.
+            if !AXIsProcessTrusted() { reply(["ok": false, "error": "Accessibility permission missing for the host app"]); continue }
+            reply(hand.wing(c) { p in pressAllowed(c, at: p) }); continue
         case "raise": reply(Win.raiseOp(c)); continue
         case "restore": reply(Win.restoreOp(c)); continue
         case "inspect":
@@ -2052,6 +2633,10 @@ func cmdInput() {
         }
         let p = pointer()
         reply(["ok": true, "op": op, "x": p.x, "y": p.y, "ms": Int(Date().timeIntervalSince(t0) * 1000)])
+    }
+    // Whoever was driving is gone: never leave a button held down behind it.
+    for b in buttonsDown.all {
+        send(CGEvent(mouseEventSource: src, mouseType: b == "right" ? .rightMouseUp : .leftMouseUp, mouseCursorPosition: pointer(), mouseButton: b == "right" ? .right : .left))
     }
     exit(0)
 }

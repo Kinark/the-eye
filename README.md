@@ -192,7 +192,7 @@ the accessibility tree costs the app frames. Judging what the numbers mean stays
 
 ## Tools
 
-Twelve tools. The server's MCP `instructions` carry the full "what / when / how" guide agents see on connect.
+Thirteen tools. The server's MCP `instructions` carry the full "what / when / how" guide agents see on connect.
 
 | tool | what |
 |---|---|
@@ -202,6 +202,7 @@ Twelve tools. The server's MCP `instructions` carry the full "what / when / how"
 | `eye_glance` | **a quick look at a window that may be covered**: "Just a sec…" lock → raise the window → `look` (`image`, `tree`, `element` at x/y) and optional short `steps` → put the window back exactly → release. Reports how long the user was held and where the time went (typically 0.3–0.4s) |
 | `eye_record` | record a region (`rect`), or an app's window wherever it is (`process`, optional `window` title; no rect needed). No command/seconds → background, returns an id at once (with the AX tree). `seconds` → blocking. `command` → runs your input driver while recording, optional `lock_input`, returns output + report. `background:true` for long runs |
 | `eye_peek` | live state of a running recording or probe: moving, extent, recent fps/hitches, **element under the pointer** (`hover:"full"` for every attribute), command output, probe layers, optional fresh AX `tree` |
+| `eye_drive` | **a hand that stays on the mouse**: each call flies one *wing*, a line of words that is one unbroken motion (`"7" tap "Add" tap "3" tap "Equals" tap settle`). It aims at things by name, follows them if they move, feels every element it passes over, presses only what is under it. The recording, the lock and the hand stay up between calls, so the agent steers. See [Driving live](#driving-live-eye_drive) |
 | `eye_act` | **interactive driving**: `move`, `click`, `down`/`up`, `scroll` (two-finger, optional `momentum` fling), two-finger gestures `pinch {scale}`, `rotate {degrees}`, `smart_zoom`, `swipe {direction}`, Force Touch `press {force:[…]}` / `force_click`, `wait`, `wait_until`, `assert`. After **every** step: pointer, element under it, visible state. **With no recording running it records the target's window for those steps itself** (`see`, default on: ~0.3s before the first step, up to 1.5s after the last while motion settles, all inside the lock) and ends with what it looked like. Expressions get `h` (the element). Presses and gestures only on `target_process` (the owner of the element under the point is checked right before posting); a press aimed at a probe layer (`on`) must still be inside it; scrolls only inside the open area or `scroll_zones` |
 | `eye_stop` | end a recording and/or probe run (all if no id), kill a running command, return the report(s); the probe report is aligned to the capture |
 | `eye_report` | re-analyze (default: the most recent run; a run folder works as `csv`): `summary`, `timeline`, `explain` (worst gaps × cursor × element × eye_act step × main thread), `hover` (element-under-pointer changes), `compare` (runs), `probe` (probe.ndjson / one layer) |
@@ -435,6 +436,51 @@ tap, this one included. Events posted by any process pass through,
 including Peekaboo, `cliclick` and your own CGEvent drivers. With `allow: "tagged"`, only events carrying
 `eventSourceUserData == 0x45594521` ("EYE!") pass.
 
+### Driving live: `eye_drive`
+
+`eye_act` is a list of points with a stop after each. A hand does not move like that, and an agent should not have to
+either. `eye_drive` flies a **wing**: one line of words, one motion, nothing decided between its points.
+
+```
+eye_drive {target_process:"Calculator", wing:'"Clear" tap "7" tap "Add" tap "3" tap "Equals" tap settle'}
+eye_drive {wing:'"Volume" down E 80 rest 200 W 30 up'}      a drag, steered
+eye_drive {wing:'slow E'}                                    keep going east…
+eye_drive {wing:'S'}                                         …now bend south, from the speed it has
+eye_drive {end:true}                                         let go, free the input, verdict for the whole drive
+```
+
+| word | what the hand does |
+|---|---|
+| `"Name"` · `Button:"Name"` · `#identifier` | fly to that thing, found in the app's accessibility tree as it is right now; exact name beats prefix beats substring, things that can be pressed win ties |
+| `x,y` | fly to a point (global points) |
+| `N NE E SE S SW W NW` or `↑↗→↘↓↙←↖` | with a distance: that far that way. Without: keep flying that way until the next wing, the window's edge, or `coast_ms` |
+| `tap` `tap2` `tap3` `rtap` `down` `up` | press what is under the finger |
+| `scroll up\|down\|left\|right <px>` | a phased two-finger scroll at the pointer |
+| `rest <ms>` · `settle` · `halt` | let time pass (a heading keeps flying) · wait until the screen is still · brake |
+| `slow` `walk` `brisk` `fast` `<n>/s` | pace from here on (220 / 450 / 700 / 1200 pt/s) |
+
+How it moves (`Hand` in `swift/EyeCapture.swift`): a thread integrates position and velocity 120 times a second, and
+velocity eases toward what was asked with a 40ms time constant: the hand has mass. A target followed by another target
+is passed through, not stopped at, so a change of direction is an arc. A target followed by a press is landed on:
+closing speed proportional to the distance left, which with that mass is a spring of damping ratio ≈ 0.67. A named
+thing is looked at again every 30ms while the hand flies, and the aim moves with it.
+
+What it will not do, by construction rather than by a check bolted on: reach for a thing that is not in sight. A name
+that matches nothing ends the wing with the list of what *is* there; a thing with something else over it is not flown
+to ("Button "7" is there but not in sight: Finder's sidebar is over it"); a `tap` after a named thing presses only if
+that thing is what is under the finger at that moment. The hand reads the recording's live file itself and brakes
+where it is when the capture stream drops.
+
+What comes back: every element the pointer passed over, in order, with the stretch it covered and for how long (a
+second thread hit-tests accessibility about every 2pt travelled); each press where it happened and on what; where the
+hand is now; if it is still flying, what lies ahead on its line and in how many milliseconds; the screen, what a
+viewer noticed during this wing, and what the app told accessibility. The element tree is shown when the drive opens
+(`look:true` shows it again).
+
+The drive ends with `end:true`, or by itself after `idle_s` (30) without a wing: a held button is released and the
+user's input is never kept while nobody is steering. The feeling costs the app the same as any accessibility client
+(see [AX context](#accessibility-ax-context)); for final frame-rate numbers use `eye_act` with `ax:false`.
+
 ### Two-finger gestures
 
 `pinch`, `rotate`, `smart_zoom` and `swipe` are `NSEventTypeGesture` CGEvents carrying undocumented CGS fields:
@@ -500,6 +546,17 @@ Claude Code: `claude mcp add the-eye -- node /Users/kinark/Desktop/AI_Playground
 
 **Permissions:** the host app (terminal or agent) needs **Screen Recording** for capture and **Accessibility** for
 the input lock.
+
+## The show-off page
+
+```
+npm run show-off
+```
+
+Serves `show-off/` on http://localhost:4173 and opens it (`SHOW_OFF_OPEN=0` to not open, `PORT` to move it). The page
+logs its own frames and reports on itself, fits a puck you fling with `src/physics.ts`, reads a corner you draw with
+`src/still.ts`, and replays one real recording with the report it produced. No build step, no dependencies; design
+notes are in `show-off/MASTER.md`.
 
 ## Example
 

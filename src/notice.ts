@@ -11,7 +11,7 @@ import { fitMotion, formatFit } from "./physics.ts";
 import { correlation, track } from "./track.ts";
 
 export type Percept = { t: number; sev: 0 | 1 | 2 | 3; kind: string; text: string; from?: number; to?: number; why?: string[]; more?: string[] };
-export type Seen = { grade: "still" | "smooth" | "minor" | "rough" | "broken"; verdict: string; percepts: Percept[];
+export type Seen = { grade: "blind" | "still" | "smooth" | "minor" | "rough" | "broken"; verdict: string; percepts: Percept[];
   /** What the app told accessibility meanwhile, in order, each placed against the steps and the motion. */
   said?: { from: number; lines: string[]; silent?: string };
   /** Root readings (dtrace, powermetrics) told against the motions. */
@@ -402,6 +402,34 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
     P.push({ t: lastSeg.end_s, sev: 0, kind: "cut", text: "still moving when the recording ended (the last motion may be cut short)" });
   }
 
+  // 9. Was the eye open? When ScreenCaptureKit drops the stream, nothing after that is observed until it is
+  // opened again: a gap there is the recording's, not the app's, and steps sent in it ran over a screen nobody
+  // watched. The helper writes those stretches down (meta.blind). Silence alone is not blindness: a healthy stream
+  // stops calling back on a motionless display. Recordings from before the helper wrote them: a stream error, and
+  // whatever was sent after the last row.
+  const sent = o.dir ? loadActions(o.dir, t0Wall).filter((x) => o.from_s === undefined || x.t0 >= o.from_s) : [];
+  const lastAny = rows[rows.length - 1]?.t ?? 0, lastSent = Math.max(0, ...sent.map((x) => x.t1));
+  const upTo = o.to_s === undefined || o.to_s >= lastAny - 0.5 ? Infinity : o.to_s; // a window that ends where the frames do runs on
+  let dark: { from: number; to: number }[] = [];
+  if (Array.isArray(meta.blind)) {
+    dark = (meta.blind as any[]).map((b) => ({ from: Number(b.from), to: b.to_end ? Math.max(Number(b.to), lastSent) : Number(b.to) }));
+  } else if (meta.stream_error) {
+    if (lastSent - lastAny > 0.5) dark.push({ from: lastAny, to: lastSent }); // that helper never reopened a dead stream
+  }
+  dark = dark.filter((d) => d.to > (o.from_s ?? 0) && d.from < upTo && d.to - d.from > 0);
+  const dur = (sec: number) => (sec >= 1 ? `${sec.toFixed(1)}s` : ms(sec * 1000));
+  const died = meta.stream_error ? ` (ScreenCaptureKit: "${meta.stream_error}")` : "";
+  let unseen = 0;
+  for (const d of dark) {
+    const ran = sent.filter((x) => x.t0 > d.from + 0.05 && x.t0 < d.to);
+    unseen += ran.length;
+    for (let i = P.length - 1; i >= 0; i--) if (P[i].from !== undefined && P[i].from! < d.to && P[i].to! > d.from) P.splice(i, 1);
+    P.push({ t: d.from, from: d.from, to: d.to, sev: 3, kind: "blind",
+      text: `THE EYE WAS SHUT for ${dur(d.to - d.from)} from ${at(d.from)}: the capture stream was down${died}, so nothing in that stretch was observed${ran.length ? ` — and ${ran.length} step${ran.length > 1 ? "s" : ""} ran in it unseen (${ran.slice(0, 8).map((x) => x.op).join(", ")}${ran.length > 8 ? ", …" : ""})` : ""}` });
+  }
+  // Not one image in the whole recording up to here (a window with no NEW image is just a still screen).
+  const sawNothing = !rows.some((r) => r.s === "c" && (o.to_s === undefined || r.t <= o.to_s));
+
   P.sort((x, y) => y.sev - x.sev || x.t - y.t);
   const worst = P[0]?.sev ?? 0;
   const bad = P.filter((p) => p.sev >= 1);
@@ -410,8 +438,14 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
     count("flash", "flash", "flashes"), count("response", "slow response", "slow responses"), count("low-rate", "low-rate motion", "low-rate motions"),
     count("wobble", "wobble", "wobbles"), count("sparse", "sparse motion", "sparse motions"), count("stall", "main-thread stall", "main-thread stalls")].filter(Boolean).join(", ");
   const o2 = a.overall;
-  const grade: Seen["grade"] = !o2 && !P.length ? "still" : worst === 3 ? "broken" : worst === 2 ? "rough" : worst === 1 ? "minor" : "smooth";
-  const verdict = grade === "still" ? "NOTHING MOVED in the region."
+  const pressed = sent.filter((x) => RESPONSIVE.has(x.op) && x.ok !== false).length;
+  // No motion and not even an instant change worth the name (a pixel or two of flicker is not "instant changes").
+  const nothing = !o2 && !P.some((p) => p.kind === "pop") && worst === 0;
+  const grade: Seen["grade"] = sawNothing || dark.length ? "blind" : nothing ? "still" : worst === 3 ? "broken" : worst === 2 ? "rough" : worst === 1 ? "minor" : "smooth";
+  const darkS = dark.reduce((t, d) => t + d.to - d.from, 0);
+  const verdict = sawNothing ? `SAW NOTHING: the recording holds no image of the region for this stretch${died}. This is not "nothing moved": there is no reading of the screen here at all${sent.length ? `, and ${sent.length} step${sent.length > 1 ? "s were" : " was"} sent into it` : ""}.`
+    : grade === "blind" ? `NOT SEEN IN FULL: the eye was shut for ${dur(darkS)}${unseen ? ` and ${unseen} step${unseen > 1 ? "s" : ""} ran unseen` : ""}. Nothing below speaks for that stretch; the rest is what was really observed.`
+    : grade === "still" ? `NOTHING MOVED in the region.${pressed ? ` ${pressed} press / scroll step${pressed > 1 ? "s were" : " was"} sent and not one pixel answered: either the app ignored ${pressed > 1 ? "them" : "it"}, or this recording is not looking at what ${pressed > 1 ? "they" : "it"} hit (check the rect, the window, the Space).` : ""}`
     : !o2 ? `NO ANIMATION, only instant changes (${P.filter((p) => p.kind === "pop").length} pop${P.filter((p) => p.kind === "pop").length === 1 ? "" : "s"}).${tally ? ` Also: ${tally}.` : ""}`
     : grade === "smooth" ? `LOOKED SMOOTH: ${a.segments.length} motion${a.segments.length > 1 ? "s" : ""} at ${o2.fps} fps of ${o2.target_fps}, nothing a viewer would notice${o2.pct_of_target < 90 ? " (the missing frames are spread too thin to see; the table below has them)" : ""}.`
     : `LOOKED ${grade === "broken" ? "BROKEN" : grade === "rough" ? "ROUGH" : "MOSTLY SMOOTH"}: ${tally}${grade === "minor" ? " (visible only if you look for it)" : ""} · ${o2.fps} fps of ${o2.target_fps} while moving.`;

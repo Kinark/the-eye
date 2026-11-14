@@ -16,6 +16,7 @@ import { explain } from "./explain.ts";
 import { formatSeen, notice } from "./notice.ts";
 import { ROOT_HINT, endUnder, startUnder, stopUnder, type Under } from "./under.ts";
 import { still, type Img } from "./still.ts";
+import { WING_WORDS, parseWing } from "./wing.ts";
 import {
   activeProbeLive, activeProbeTarget, analyzeProbe, describeProbeLive, isProbeRun, peekProbe, probeRunIds, probeRunsStatus,
   registerProbeTools, resolvePid, snapshotStalls, stopProbes,
@@ -489,7 +490,24 @@ type Job = {
 const jobs = new Map<string, Job>();
 const liveFile = (c: Capture) => c.csv + ".live.json";
 function readLive(c: Capture): any | null {
-  try { return JSON.parse(readFileSync(liveFile(c), "utf8")); } catch { return null; }
+  try {
+    const f = liveFile(c), live = JSON.parse(readFileSync(f, "utf8"));
+    live.file_age_s = (Date.now() - statSync(f).mtimeMs) / 1000; // the helper rewrites it 10×/s for as long as it lives
+    return live;
+  } catch { return null; }
+}
+/**
+ * Why this recording is NOT seeing right now ("" = it sees). A live reading is only the last thing the capture saw:
+ * when the stream dies it keeps saying "still" for ever. Silence alone proves nothing (on a motionless display a
+ * healthy stream stops calling back), so this goes by what is known: ScreenCaptureKit said the stream stopped, the
+ * helper is gone, or no image ever came.
+ */
+function blind(live: any): string {
+  if (!live) return "the recording has no live reading";
+  if (live.stream_error) return `the capture stream died (${live.stream_error})`;
+  if (live.file_age_s > 1.5) return `the recording ended, or its helper stopped, ${live.file_age_s.toFixed(1)}s ago`;
+  if (live.frames_total === 0) return "the recording has not delivered a single image";
+  return "";
 }
 const running = (j: Job) => j.state !== "done";
 
@@ -612,6 +630,8 @@ function startJob(p: RecordParams): Job {
 
 function describeLive(live: any): string {
   if (!live) return "live: (no data yet)";
+  const dark = blind(live);
+  if (dark) return `⚠ NOT SEEING: ${dark}. The last reading is from ${Number(live.t).toFixed(1)}s on the recording's clock; nothing after it was observed.`;
   const l = live.last_1s ?? {};
   const e = live.changed_extent_screen, a = live.anchored_screen;
   const anch = a ? `top-anchored: x ${a.x0.toFixed(0)}..${a.x1.toFixed(0)} (${a.w.toFixed(0)}pt wide), hangs ${a.h.toFixed(0)}pt down` : "top-anchored: nothing changed at the top edge";
@@ -631,10 +651,13 @@ function activeJob(id?: string): Job | undefined {
 const INSTRUCTIONS = `
 the-eye: your eyes and hands on a macOS screen. You act; it tells you what a person watching would have noticed, and why.
 
+TWO WAYS TO MOVE, and neither excludes the other. eye_drive is a hand that stays on the mouse: one call flies one WING, a line of words that is one unbroken motion ('"7" tap "Add" tap "3" tap "Equals" tap settle'). It aims at things by name as they are on screen right now, follows them if they move, never stops to think between points, feels every element it passes over and presses only what is under it; a thing that is not in sight is not reached for, and the reply says what is. Between wings the hand, the recording and the lock stay up, so you steer: look at what came back, send the next wing, end:true when done. Use it to explore, to react, to drag and steer by what you see. eye_act is the exact one: steps with coordinates, timings, guards, trackpad gestures and Force Touch, repeatable to the millisecond, for measuring and A/B.
+
 THE LOOP IS ONE CALL. eye_act {target_process, steps} presses / scrolls / drags in the app and returns:
 - after every step: the pointer, the element under it (accessibility), the visible state;
 - WHAT IT LOOKED LIKE: a verdict (SMOOTH · MOSTLY SMOOTH · ROUGH · BROKEN · NOTHING MOVED) and, worst first, each thing a viewer would have noticed: freezes, judder, jumps, flashes, slow answers to input, then the plain facts (how each motion travelled, overshoot, instant pops, how fast the screen answered each press). ✗ = clearly visible, ~ = visible if you look for it, · = a fact, not a defect.
-With no recording running, eye_act records the target's window for exactly those steps by itself (see:false turns that off). Read the verdict; go to the table, timeline or explain only when you need numbers.
+With no recording running, eye_act records the target's window for exactly those steps by itself (see:false turns that off).
+NEVER UNSEEN. eye_act refuses (NOT RUN, nothing sent) when it has nothing to watch: no recording and no target, a window that is minimized, hidden or on another Space, a display that is asleep or locked, a capture that will not start. If the capture stream drops mid-run it waits for it to reopen ("THE EYE BLINKED") or stops at that step and lists the steps it did not send. A verdict of NOT SEEN IN FULL or SAW NOTHING, or a line "⚠ NOT SEEING", means exactly that: do not report on that stretch as if you had watched it. A bare "all N steps done" means every one of them was watched. Read the verdict; go to the table, timeline or explain only when you need numbers.
 
 AT REST. A look at a window (eye_glance, live eye_snapshot) ends with "## at rest": what the one frame says by itself, measured from its pixels and accessibility frames without being asked. Text sizes in points and the weakest contrast (WCAG ratio, with both colours); text under 10.5pt; contrast under 4.5:1; a thing 0.5–3pt off the line its neighbours hold; a row whose gaps are not equal; siblings that overlap; a label that runs past its window; and the shape of every visible corner (square, capsule, "r≈18 circular arc", "r≈19 continuous"). The numbers are approximate (text ±5%, arc radius ±1%, continuous radius ±8%) and the rules are narrow on purpose, so an empty line means "nothing plainly off", not "perfect". Whether a faint secondary label or a circular corner is a defect is your call, not the tool's.
 
@@ -670,7 +693,7 @@ KNOW THESE
 - WAITING ON THE SCREEN: don't loop eye_glance / eye_inspect to wait for a dialog, a window, a title or a status text. \`${WATCH_CMD}\` prints one line per UI event as it happens (app-launched/quit/focused, window-opened/closed/focused, sheet-opened/closed, title-changed, announced, and with --values text/progress value-changed). Dialogs, sheets and banners include their text and [buttons]. It only reads AX, so it takes no turn, locks nothing and needs no screenshots. --app NAME limits it to apps (repeatable). Stream it with your Monitor tool if you have one, or for a single "tell me when": run it in the background with --until "TEXT" (case-insensitive substring of a line; exits 0 on the first match, including a window already showing it) and --seconds N (exits 124 if nothing matched). Example: ${WATCH_CMD} --app Xcode --until "Build Succeeded" --values --seconds 600.
 - Run files live in ~/Library/Caches/the-eye/runs/<time>_<label>/: frames.csv, cursor.csv, hover.jsonl, ax_tree_start.txt/.json, actions.jsonl, events.jsonl (what the app told accessibility), keyframes/.
 
-TOOLS: eye_status · eye_inspect · eye_snapshot · eye_glance · eye_record · eye_peek · eye_act · eye_stop · eye_report · eye_lock · eye_probe · eye_app
+TOOLS: eye_status · eye_inspect · eye_snapshot · eye_glance · eye_record · eye_peek · eye_drive · eye_act · eye_stop · eye_report · eye_lock · eye_probe · eye_app
 `.trim();
 
 const server = new McpServer({ name: "the-eye", version: "0.3.0" }, { instructions: INSTRUCTIONS });
@@ -970,6 +993,8 @@ function evalExpr(expr: string, s: ReturnType<typeof scope>): boolean {
 }
 function short(live: any): string {
   if (!live) return "no live capture";
+  const dark = blind(live);
+  if (dark) return `⚠ NOT SEEING: ${dark}`;
   const a = live.anchored_screen, l = live.last_1s ?? {};
   return `${a ? `open-extent ${a.w.toFixed(0)}×${a.h.toFixed(0)} @x${a.x0.toFixed(0)}..${a.x1.toFixed(0)}` : "top edge unchanged"} · ${live.moving ? "MOVING" : "still"} · 1s: ${l.new_frames}f/${l.idle}i, max gap ${Number(l.max_gap_ms).toFixed(1)}ms`;
 }
@@ -1009,6 +1034,9 @@ server.registerTool("eye_act", {
     "path, app, enabled, focused, selected, actions) or null, live = raw live JSON, pr / L('label') = probe layers.",
     "e.g. wait_until {expr:\"h?.identifier=='close'\"}. Find targets first with eye_inspect. SAFETY: presses and gestures only on target_process;",
     "scroll only inside `a` or scroll_zones unless force. Blocks ALL the user's physical input (trackpad + keyboard) while it runs.",
+    "IT DOES NOT ACT ON WHAT IT CANNOT SEE: the call is refused (NOT RUN, nothing sent) when there is nothing to watch — no recording and no",
+    "target, the window minimized / hidden / on another Space, the display asleep or locked, the capture not starting — and it stops at the step",
+    "where a recording goes blind, saying which steps were not sent. see:false is the only way to act unwatched.",
     "With no eye_record running it records target_process's window for these steps itself and ends with WHAT IT LOOKED LIKE: a verdict",
     "and what a viewer would have noticed, worst first (freezes with their cause when eye_probe is loaded, judder, jumps, flashes, how fast",
     "the screen answered each press). Input is synthetic (see the guide if a bug won't reproduce with it).",
@@ -1023,7 +1051,7 @@ server.registerTool("eye_act", {
     tree: treeSchema.optional().describe("After the steps, also dump the AX tree of the recorded region (or the window under the pointer). Default none."),
     events: z.boolean().optional().describe("With its own recording: also listen to what the app tells accessibility while it is recorded (values, focus, windows, sheets, menus, announcements) and place each on the recording's clock, next to the motion and the steps (default true; false = don't attach an observer)."),
     root: z.boolean().optional().describe("With an app recording, when sudo runs dtrace and powermetrics without a password: also time the app's commits and the window server's frame swaps as root, count which display frames carried a change of THIS app's windows, and read whole-machine GPU/CPU power. Default true; false = leave them out (the signposts and the app's own energy need no root and are always read)."),
-    see: z.boolean().optional().describe("With no eye_record running: record target_process's window for these steps and report what it looked like (default true; costs ~0.3s before the first step and up to 1.5s after the last, while motion settles)."),
+    see: z.boolean().optional().describe("With no eye_record running: record target_process's window for these steps and report what it looked like (default true; costs ~0.3s before the first step and up to 1.5s after the last, while motion settles). false = act unwatched on purpose: nothing is checked and nothing in the reply says what the screen did."),
     lock: z.boolean().optional().describe("Block all physical input for exactly the duration of these steps (default true)."),
     lock_style: z.enum(["full", "quick"]).optional().describe("full: 1.5s 3·2·1 warning, orange overlay. quick: \"Just a sec…\" — no countdown, small pill. Default: quick when front:true and the steps take ≤5s, else full."),
     front: z.boolean().optional().describe("Bring target_process's window to the very front before the steps and put everything back after (z-order, focus, frame, minimized). Default: automatic — only when a press is refused because another app covers the target. false = never."),
@@ -1046,16 +1074,26 @@ server.registerTool("eye_act", {
   const budget = p.steps.reduce((t, s) => t + (s.ms ?? 0) + (s.timeout_ms ?? (s.op === "wait_until" ? 2000 : 0)) + (s.hold_ms ?? 0) + 400, 0);
   if (p.front && !target) return fail("front:true needs target_process (the app whose window to bring forward)");
   // Hands without eyes are no use: with no recording running, watch the target's window for exactly these steps
-  // (started before the lock, so the user is not held while ScreenCaptureKit warms up).
-  let auto: Job | undefined, autoWhat = "", autoNote = "";
-  if (p.see !== false && target && !activeJob(p.id)) {
-    const w = await windowRect(target.pid, p.window);
-    if (w.ok) {
-      auto = startJob({ rect: w.rect, display: w.display, label: p.label ?? "act", ax: false, tree: "none", max_seconds: Math.ceil(budget / 1000) + 30, only_pid: target.pid, events_pid: target.pid, events: p.events, root: p.root });
-      for (let i = 0; i < 60 && auto.state === "starting"; i++) await sleep(50);
-      if (auto.state === "running") { autoWhat = `${target.name} ${w.what}, its own windows only`; p.ax ??= true; p.id = auto.id; }
-      else { auto.stopped ??= "not ready in time"; auto.stopNow(); auto = undefined; autoNote = "(could not record the window for these steps: the capture did not start within 3s — the steps ran unwatched; eye_record first for the visible result)"; }
-    } else autoNote = `(not watching these steps: ${w.error})`;
+  // (started before the lock, so the user is not held while ScreenCaptureKit warms up). It never acts unseen. Either a recording is watching (and really is, right now), or it records the target's
+  // window itself, or the caller said see:false. What it cannot watch it does not run: a moveset over a window that
+  // is not there reports "all steps done" about nothing.
+  let auto: Job | undefined, autoWhat = "";
+  const watching = activeJob(p.id);
+  const unseen = (why: string) => fail(`NOT RUN, nothing was sent: ${why}. eye_act does not act on what it cannot see (see:false runs the steps unwatched, on purpose).`);
+  if (watching) {
+    const dark = blind(readLive(watching.capture));
+    if (dark && p.see !== false) return unseen(`recording ${watching.id} "${watching.label}" is not seeing — ${dark}; eye_stop it and record again`);
+  } else if (p.see !== false) {
+    if (!target) return unseen("no recording is running and there is no target_process whose window to watch");
+    const w = await windowRect(target.pid, p.window, p.front === true);
+    if (!w.ok) return unseen(w.error);
+    auto = startJob({ rect: w.rect, display: w.display, label: p.label ?? "act", ax: false, tree: "none", max_seconds: Math.ceil(budget / 1000) + 30, only_pid: target.pid, events_pid: target.pid, events: p.events, root: p.root });
+    // The user is not locked yet, so waiting for ScreenCaptureKit (it retries by itself) costs them nothing.
+    for (let i = 0; i < 300 && auto.state === "starting"; i++) await sleep(50);
+    for (let i = 0; i < 20 && auto.state === "running" && blind(readLive(auto.capture)); i++) await sleep(50);
+    const dark = auto.state === "running" ? blind(readLive(auto.capture)) : `the capture did not start (${String(auto.final ?? "no answer from ScreenCaptureKit in 15s").slice(0, 300)})`;
+    if (dark) { auto.stopped ??= "not seeing"; auto.stopNow(); return unseen(`could not watch ${target.name}'s window — ${dark}`); }
+    autoWhat = `${target.name} ${w.what}, its own windows only`; p.ax ??= true; p.id = auto.id;
   }
   const settleMs = auto ? 1700 : 0;
   let strictLock: Lock | undefined;
@@ -1076,6 +1114,9 @@ server.registerTool("eye_act", {
       if (!r.ok) return fail(`front: ${r.error}`);
       front.raised = r;
       if (auto) await sleep(150); // let the raise itself draw before the steps: it is not what we came to see
+      // Brought forward, and is it there now? (A window that was hidden or minimized was let through on this promise.)
+      const there = p.see === false ? null : await windowRect(target.pid, p.window);
+      if (there && !there.ok) return unseen(`after bringing it forward, ${there.error}`);
     }
     if (auto) seenFrom = readLive(auto.capture)?.t ?? 0;
     result = await actSteps({ ...p, auto_seen: !!auto }, target, front);
@@ -1101,7 +1142,7 @@ server.registerTool("eye_act", {
       }
     }
   }
-  return withNotes(result!, instNote, autoNote);
+  return withNotes(result!, instNote);
 }));
 
 // ---- bring a window forward, put it back
@@ -1119,11 +1160,18 @@ async function restoreWindow(raised: any): Promise<string> {
   if (!r.ok) return `⚠ could not put the window back: ${r.error}`;
   return r.order_restored === false ? `⚠ window put back, but the z-order differs from before (${r.restored})` : `window put back (${r.restored})`;
 }
-/** Where an app's window is, as a display-local rect clipped to its display. Nothing is raised or moved. */
-async function windowRect(pid: number, window?: string): Promise<{ ok: true; rect: Rect; display: number; what: string; on_top: boolean } | { ok: false; error: string }> {
+/**
+ * Where an app's window is, as a display-local rect clipped to its display. Nothing is raised or moved. It answers
+ * only for a window there is something of to see: not minimized, on screen (not hidden, not on another Space), on a
+ * display that is awake and unlocked. `willRaise`: the caller brings it forward next, so hidden / minimized is fine.
+ */
+async function windowRect(pid: number, window?: string, willRaise = false): Promise<{ ok: true; rect: Rect; display: number; what: string; on_top: boolean } | { ok: false; error: string }> {
   const r = await actorSend({ op: "raise", locate: true, pid, ...(window ? { title: window } : {}) });
   if (!r.ok) return { ok: false, error: String(r.error) };
-  if (r.minimized) return { ok: false, error: `window "${r.title}" is minimized: nothing of it is on screen (eye_glance brings it up for a look)` };
+  if (r.screen_locked) return { ok: false, error: "the screen is locked: there is nothing to see or press until it is unlocked" };
+  if (r.display_asleep) return { ok: false, error: `the display "${r.title}" is on is asleep: nothing is being drawn` };
+  if (r.minimized && !willRaise) return { ok: false, error: `window "${r.title}" is minimized: nothing of it is on screen (front:true or eye_glance brings it up)` };
+  if (r.on_screen === false && !r.minimized && !willRaise) return { ok: false, error: `window "${r.title}" is not on screen (its app is hidden, or it is on another Space): there is nothing of it to see (front:true or eye_glance brings it up)` };
   const [fx, fy, fw, fh] = r.frame as number[], [dx, dy, dw, dh] = r.display_bounds as number[];
   const x0 = Math.max(fx, dx), y0 = Math.max(fy, dy), x1 = Math.min(fx + fw, dx + dw), y1 = Math.min(fy + fh, dy + dh);
   if (x1 - x0 < 8 || y1 - y0 < 8) return { ok: false, error: `window "${r.title}" is off screen` };
@@ -1150,6 +1198,7 @@ async function actSteps(p: any, target: { pid: number; name: string } | null, fr
   await look();
   const stamp = () => `${((Date.now() - t0) / 1000).toFixed(2)}s`;
   let stopped = "";
+  let heldButton: string | null = null, wentDark = "", blinks = 0;
   const wallNow = () => (performance.timeOrigin + performance.now()) / 1000;
   const logAction = (s: any, wall0: number, ok: boolean) => {
     if (!cap) return;
@@ -1164,6 +1213,21 @@ async function actSteps(p: any, target: { pid: number; name: string } | null, fr
     const stoppedBefore = stopped;
     let pressNote = "";
     try {
+      // The eye first: a step is only sent while the recording is really seeing. A dead stream goes on reading
+      // "still", so the steps after it would all look fine and none of them would have been watched.
+      let dark = cap ? blind(readNow()) : "";
+      if (dark) {
+        // The helper reopens a dropped stream in a few hundred ms: give it a moment before calling the run off.
+        const since = Date.now();
+        while (dark && Date.now() - since < 1500) { await sleep(50); dark = blind(readNow()); }
+        if (!dark) blinks++;
+        if (!dark) lines.push(`${stamp()} ⚠ THE EYE BLINKED: the capture stream dropped and was reopened (${Date.now() - since}ms waited). What step #${Math.max(0, i - 1)} did in that moment was not seen; the verdict below has the exact stretch.`);
+      }
+      if (dark) {
+        if (heldButton) { await actorSend({ op: "up", button: heldButton }); heldButton = null; wentDark = " The button it was holding was released."; }
+        stopped = `${tag}: NOT SENT — the eye went blind: ${dark}. Steps #${i}…#${p.steps.length - 1} were not run (${p.steps.length - i} of ${p.steps.length}); the lines above are what was really seen.${wentDark} Record again (eye_act does it by itself when no eye_record is running) and carry on from here.`;
+        break;
+      }
       if (s.guard && !evalExpr(s.guard, scope(readNow(), ptr, hover))) { stopped = `${tag}: guard failed: ${s.guard}`; break; }
       if (s.op === "wait") { await sleep(s.ms ?? 300); await look(); }
       else if (s.op === "wait_until" || s.op === "assert") {
@@ -1220,6 +1284,7 @@ async function actSteps(p: any, target: { pid: number; name: string } | null, fr
         }
         if (!r.ok) { stopped = `${tag}: ${r.error}${/REFUSED press/.test(String(r.error)) && front.want === false ? " (front:false — not raising it)" : ""}`; break; }
         ptr = { x: r.x, y: r.y };
+        if (s.op === "down") heldButton = s.button ?? "left"; else if (s.op === "up" || s.op === "click") heldButton = null;
         if (r.peak_force !== undefined) pressNote = ` · peak force ${r.peak_force}${r.force_clicked ? " (force click: reached stage 2)" : " (stage 1 only)"}`;
         await look();
       }
@@ -1228,6 +1293,8 @@ async function actSteps(p: any, target: { pid: number; name: string } | null, fr
     finally { if (s.op !== "assert") logAction(s, wall0, stopped === stoppedBefore); }
   }
   const live = readNow();
+  // Seeing at the start of the last step is not seeing its result.
+  if (cap && !stopped) { const dark = blind(live); if (dark) wentDark = `⚠ THE EYE WENT BLIND during the last step (${dark}): it was sent, what it did was not seen.`; }
   let recent = "";
   if (cap && !p.auto_seen) {
     try {
@@ -1246,13 +1313,242 @@ async function actSteps(p: any, target: { pid: number; name: string } | null, fr
   }
   return text([
     ...lines,
-    stopped ? `STOPPED — ${stopped}` : `all ${p.steps.length} steps done`,
+    stopped ? `STOPPED — ${stopped}` : wentDark || `all ${p.steps.length} steps done${blinks ? ` — but the eye blinked ${blinks}× on the way (⚠ above): not every one of them was watched` : ""}`,
     axOn && hover ? `element under the pointer now: ${hoverLine(hover, 6)}` : "",
-    cap ? describeLive(live) : diedCaptures.length ? `(capture ended early — ${diedCaptures[diedCaptures.length - 1]})` : "(no running eye_record — start one for the visible-state numbers)",
+    cap ? describeLive(live) : diedCaptures.length ? `(capture ended early — ${diedCaptures[diedCaptures.length - 1]})` : "UNWATCHED: no recording was running for these steps, so nothing here says what the screen did (eye_record, or leave `see` on).",
     recent,
     activeProbeLive() ? describeProbeLive(activeProbeLive(), 5) : "",
     tree,
   ].filter(Boolean).join("\n"));
+}
+
+// ---- eye_drive: a hand that stays on the mouse
+//
+// eye_act is a list of points with a stop after each. eye_drive is one motion: a WING is a line of words, flown
+// without a stop between them, by a hand (eye-capture's Hand) that aims at things by name, keeps its momentum from
+// one to the next, feels every element it passes over and presses only what is under it. The recording, the lock
+// and the hand stay up between wings, so the next one costs nothing to start and picks the motion up where it is.
+
+type Drive = {
+  job: Job; target: { pid: number; name: string }; window?: string; lock?: Lock; raised?: any; idle?: NodeJS.Timeout;
+  idleS: number; wings: number; evAt: number; what: string;
+};
+let drive: Drive | null = null;
+/** How a drive that ended by itself (nobody steering) went: handed over with the next eye_drive call. */
+let driveEnded = "";
+
+/** The window's place in global points, clipped to its display — the room the hand may move in. "" + why when it is not there to be seen. */
+async function driveRoom(d: { target: { pid: number }; window?: string }): Promise<{ bounds: number[] } | { error: string }> {
+  const w = await windowRect(d.target.pid, d.window);
+  if (!w.ok) return { error: w.error };
+  const r = await actorSend({ op: "raise", locate: true, pid: d.target.pid, ...(d.window ? { title: d.window } : {}) });
+  const [dx, dy] = r.display_bounds as number[];
+  return { bounds: [w.rect.x + dx, w.rect.y + dy, w.rect.w, w.rect.h] };
+}
+
+/** What the app told accessibility since the last wing (events.jsonl of the drive's recording). */
+function driveEvents(d: Drive): string {
+  const f = join(d.job.capture.dir, "events.jsonl");
+  let raw = "";
+  try { raw = readFileSync(f, "utf8"); } catch { return ""; }
+  const fresh = raw.slice(d.evAt);
+  const cut = fresh.lastIndexOf("\n");
+  if (cut < 0) return "";
+  d.evAt += cut + 1;
+  const out: string[] = [];
+  for (const l of fresh.slice(0, cut).split("\n")) {
+    let e: any; try { e = JSON.parse(l); } catch { continue; }
+    if (!e.event || e.event === "ready") continue;
+    // The helper's own one-line telling, when it has one: `value-changed Calculator StaticText "Edit field" = "10"`.
+    if (typeof e.text === "string" && e.text) { out.push(e.text.length > 140 ? e.text.slice(0, 140) + "…" : e.text); continue; }
+    const { event, t, pid, ...rest } = e;
+    const body = Object.entries(rest).filter(([, v]) => v !== "" && v != null && !(Array.isArray(v) && !v.length))
+      .map(([k, v]) => `${k} ${typeof v === "string" ? JSON.stringify(v.length > 70 ? v.slice(0, 70) + "…" : v) : JSON.stringify(v)}`).join(", ");
+    out.push(`${event}${body ? `: ${body}` : ""}`);
+  }
+  if (!out.length) return "";
+  const shown = out.length > 8 ? [...out.slice(0, 4), `… ${out.length - 8} more`, ...out.slice(-4)] : out;
+  return `the app told accessibility: ${shown.join(" · ")}`;
+}
+
+async function endDrive(why: string): Promise<string> {
+  const d = drive;
+  if (!d) return "";
+  drive = null;
+  clearTimeout(d.idle);
+  // The hand first: it brakes, lets go of anything it holds and stops feeling. Then the window, the user's input, the eye.
+  const r = await actorSend({ op: "wing", moves: [], end: true, pid: d.target.pid });
+  const back = d.raised ? await restoreWindow(d.raised) : "";
+  const freed = d.lock ? await stopLock(d.lock) : "";
+  d.job.stopped ??= "stopped by agent";
+  d.job.stopNow();
+  await d.job.finished;
+  let looked: string;
+  try { looked = seen(d.job.capture.csv, {}); } catch (e: any) { looked = `could not analyze: ${e.message}`; }
+  return [
+    `DRIVE ENDED (${why}) after ${d.wings} wing${d.wings === 1 ? "" : "s"}, ${((Date.now() - d.job.started) / 1000).toFixed(1)}s. The hand is at rest at (${Number(r.x ?? 0).toFixed(0)},${Number(r.y ?? 0).toFixed(0)})${back ? ` · ${back}` : ""}${freed ? " · input is the user's again" : ""}.`,
+    `WHAT IT LOOKED LIKE — ${d.what}, the whole drive (times on the recording's clock):\n${looked}`,
+    `run: ${d.job.capture.dir} · eye_report {view:"explain"} joins the worst frames with pointer, step and main thread`,
+  ].join("\n");
+}
+
+const pt = (x: number, y: number) => `(${x.toFixed(0)},${y.toFixed(0)})`;
+function compassOf(vx: number, vy: number) {
+  return ["E", "SE", "S", "SW", "W", "NW", "N", "NE"][((Math.round(Math.atan2(vy, vx) / (Math.PI / 4)) % 8) + 8) % 8];
+}
+/** What one wing did, as the hand lived it: every element it passed over, each press where it happened, where it is now. */
+function wingText(words: string[], r: any): string[] {
+  const L: string[] = [];
+  const secs = (Number(r.ms) / 1000).toFixed(2);
+  L.push(r.stopped
+    ? `WING STOPPED at move ${r.done + 1} of ${r.of}${words[r.done] ? ` (${words[r.done]})` : ""}: ${r.stopped}. ${r.done ? `The ${r.done} before it ${r.done === 1 ? "was" : "were"} flown` : "Nothing was flown"}${r.of - r.done - 1 > 0 ? `; the ${r.of - r.done - 1} after it ${r.of - r.done - 1 === 1 ? "was" : "were"} not` : ""}.`
+    : `wing flown whole: ${r.of} move${r.of === 1 ? "" : "s"} in ${secs}s, one motion`);
+  const rows: { t: number; s: string }[] = [];
+  for (const s of r.trail ?? []) {
+    const still = Math.hypot(s.x1 - s.x0, s.y1 - s.y0) < 1;
+    rows.push({ t: s.t, s: `${still ? `at ${pt(s.x0, s.y0)}` : `${pt(s.x0, s.y0)}→${pt(s.x1, s.y1)}`}  ${s.label}${fr(s.frame ?? undefined)}${s.ms >= 1 ? `  ${Number(s.ms).toFixed(0)}ms` : ""}` });
+  }
+  const shownRows = rows.length > 44 ? [...rows.slice(0, 22), { t: rows[22].t, s: `… ${rows.length - 44} more elements crossed …` }, ...rows.slice(-22)] : rows;
+  for (const m of r.marks ?? []) {
+    shownRows.push({ t: m.t, s: m.k === "note" ? `· ${m.what}` : `● ${m.k === "scroll" ? words[m.i] ?? "scroll" : m.k} at ${pt(m.x, m.y)} on ${m.what}` });
+  }
+  shownRows.sort((a, b) => a.t - b.t);
+  if (shownRows.length) {
+    L.push(`what the hand passed over (${r.path_pt < 1 ? "it did not move" : `${Number(r.path_pt).toFixed(0)}pt travelled, felt every ${(Number(r.path_pt) / Math.max(1, r.samples)).toFixed(1)}pt`}${r.trail_dropped ? `, ${r.trail_dropped} oldest stretches dropped` : ""}):`);
+    for (const x of shownRows) L.push(`  ${x.t >= r.t0 ? "+" : "−"}${Math.abs(x.t - r.t0).toFixed(2)}s  ${x.s}`);
+  }
+  const held = r.held?.length ? `, HOLDING the ${r.held.join(" and ")} button` : "";
+  if (r.flying) {
+    L.push(`now: still flying ${compassOf(r.course[0], r.course[1])} at ${Number(r.pace).toFixed(0)}pt/s, at ${pt(r.x, r.y)} over ${r.over}${held}. It goes on while you choose the next wing and brakes by itself after ${(Number(r.coast_ms) / 1000).toFixed(1)}s.`);
+    if (r.ahead?.length) L.push(`ahead on this line: ${r.ahead.map((a: any) => `${a.label} in ${Number(a.in_pt).toFixed(0)}pt (${(Number(a.in_ms) / 1000).toFixed(2)}s)`).join(" · ")}`);
+  } else L.push(`now: at rest at ${pt(r.x, r.y)} on ${r.over}${fr(r.over_frame ?? undefined)}${held}${r.edge ? " — it ran into the window's edge and stopped there" : ""}`);
+  if (r.in_sight) L.push(`in sight instead: ${r.in_sight.join(" · ") || "nothing that can be pressed"}`);
+  return L;
+}
+
+server.registerTool("eye_drive", {
+  title: "Drive the pointer live: one flowing motion at a time",
+  description: [
+    "A hand that stays on the mouse. Each call flies one WING: a line of words that is ONE unbroken motion, with no stop and no thinking between its points.",
+    `Words: ${WING_WORDS}.`,
+    "e.g. wing:'\"7\" tap \"Add\" tap \"3\" tap \"Equals\" tap settle' · wing:'\"Volume\" down E 80 rest 200 W 30 up' (a drag, steered) · wing:'slow E' (keep going east; the next wing turns it).",
+    "The hand aims at THINGS, the way a person does: it finds the named thing in the app as it is on screen right now, keeps its eyes on it while it flies (a thing that moves is followed),",
+    "passes through the points on the way without stopping and lands like a wrist (a spring, with its own momentum). A press is always \"press what is under the finger\": a thing that is not there,",
+    "or has something else over it, is simply not reached for — the wing ends there and says what IS in sight. No coordinates to check, nothing invisible to click.",
+    "It feels the whole way: the reply lists every element the pointer passed over, in order, with the stretch of pixels it covered and for how long, each press where it happened,",
+    "where the hand is now and on what — and, if it is still flying, what lies ahead on its line and how soon. Then the screen (moving / still, what a viewer noticed during this wing) and what the app told accessibility.",
+    "The first call opens the drive (records target_process's window, takes the input lock, shows the app's element tree); later calls only need `wing`. Between wings the recording, the lock and the hand stay up:",
+    "a hand left flying keeps flying (coast_ms), and the next wing bends the motion from the speed it has. If the eye shuts, the hand brakes by itself where it is.",
+    "end:true (or idle_s without a wing) ends it: the button is let go, input is freed, and WHAT IT LOOKED LIKE is given for the whole drive. eye_act stays for exact, scripted, repeatable steps and trackpad gestures; nothing here replaces it.",
+  ].join(" "),
+  inputSchema: {
+    wing: z.string().optional().describe("The motion, as words. Omit with end:true, or with look:true to only look."),
+    target_process: z.union([z.string(), z.number()]).optional().describe("The app to drive (name or pid). Needed on the first call; the drive keeps it."),
+    window: z.string().optional().describe("Which of the app's windows (title substring). Default its main window."),
+    speed: z.number().min(20).max(4000).optional().describe("Pace in points per second from this wing on (default 700; or the words slow / walk / brisk / fast / <n>/s inside the wing)."),
+    coast_ms: z.number().min(0).max(10000).optional().describe("How long a hand left flying on a heading keeps going after the reply before it brakes by itself (default 1500)."),
+    look: z.boolean().optional().describe("Also show the app's element tree as it is now (always shown when the drive opens)."),
+    end: z.boolean().optional().describe("End the drive after this wing: let go, free the user's input, report what the whole drive looked like."),
+    idle_s: z.number().min(3).max(300).optional().describe("The drive ends by itself when no wing comes for this long (default 30): input is never held while nobody is steering."),
+    front: z.boolean().optional().describe("Bring the window to the front when the drive opens and put it back when it ends."),
+    lock: z.boolean().optional().describe("Hold the user's physical input for the drive (default true). false = the user can move the pointer too, and will fight the hand."),
+    lock_style: z.enum(["full", "quick"]).optional().describe("full (default): 3·2·1 warning and the orange overlay. quick: the small pill, no countdown."),
+    label: z.string().optional().describe("Name of the recording."),
+    duplicates: z.enum(["ask", "quit_others", "relaunch", "allow"]).optional().describe(duplicatesSchemaDescription),
+    app_path: z.string().optional().describe("For duplicates:\"relaunch\": the .app to start instead of the target's own."),
+  },
+}, driving("eye_drive", fail, async (p) => {
+  const pre: string[] = [];
+  if (driveEnded) { pre.push(driveEnded); driveEnded = ""; }
+  if (drive) clearTimeout(drive.idle);
+  if (drive && !running(drive.job)) pre.push(await endDrive("its recording ended"));
+  if (!drive) {
+    if (p.wing === undefined && !p.look) return pre.length ? text(pre.join("\n\n")) : fail("no drive is open: give a wing and target_process");
+    if (p.target_process === undefined && !activeProbeTarget()) return fail("the first eye_drive call needs target_process (the app to drive)");
+    const named = p.target_process ?? activeProbeTarget()!.pid;
+    const c = await checkInstances(named, p.duplicates, p.app_path);
+    if (!c.ok) return fail(c.error);
+    if (c.note) pre.push(c.note);
+    let target: { pid: number; name: string };
+    try { target = await resolvePid(c.pid ?? named); } catch (e: any) { return fail(e.message); }
+    const unseen = (why: string) => fail(`NOT OPENED, nothing was sent: ${why}. The hand does not go where the eye cannot.`);
+    const w = await windowRect(target.pid, p.window, p.front === true);
+    if (!w.ok) return unseen(w.error);
+    const idleS = p.idle_s ?? 30;
+    const job = startJob({ rect: w.rect, display: w.display, label: p.label ?? "drive", ax: false, tree: "none", max_seconds: 600, only_pid: target.pid, events_pid: target.pid });
+    for (let i = 0; i < 300 && job.state === "starting"; i++) await sleep(50);
+    for (let i = 0; i < 20 && job.state === "running" && blind(readLive(job.capture)); i++) await sleep(50);
+    const dark = job.state === "running" ? blind(readLive(job.capture)) : `the capture did not start (${String(job.final ?? "no answer from ScreenCaptureKit in 15s").slice(0, 300)})`;
+    if (dark) { job.stopped ??= "not seeing"; job.stopNow(); return unseen(`could not watch ${target.name}'s window — ${dark}`); }
+    let lock: Lock | undefined;
+    if (p.lock !== false && !(await coveringLock((idleS + 30) * 1000))) {
+      lock = startLock(idleS + 30, "tagged", p.lock_style ?? "full");
+      if (!(await lock.ready)) { job.stopped ??= "lock refused"; job.stopNow(); return fail(await lockFailure(lock)); }
+    }
+    drive = { job, target, window: p.window, lock, idleS, wings: 0, evAt: 0, what: `${target.name} ${w.what}, its own windows only` };
+    if (p.front) {
+      const up = await raiseWindow(target.pid, p.window);
+      if (!up.ok) return fail(`${await endDrive("could not bring the window forward")}\nfront: ${up.error}`);
+      drive.raised = up;
+      await sleep(150);
+    }
+    pre.push(`drive open on ${drive.what}${lock ? ` · the user's input is held (${lock.id})` : " · the user's input is NOT held"} · recording ${job.id}`);
+    p.look ??= true;
+  }
+  const d = drive!;
+  if (p.idle_s) d.idleS = p.idle_s;
+  const cap = d.job.capture;
+  // The eye first, as ever: a wing is only flown while the recording really sees.
+  let dark = blind(readLive(cap));
+  for (const since = Date.now(); dark && Date.now() - since < 1500; dark = blind(readLive(cap))) await sleep(50);
+  if (dark) return fail([...pre, `NOT FLOWN, nothing was sent: the eye is shut — ${dark}.`, await endDrive("the eye went blind")].join("\n\n"));
+  const room = await driveRoom(d);
+  if ("error" in room) return fail([...pre, `NOT FLOWN, nothing was sent: ${room.error}.`, await endDrive("the window is not there to be seen")].join("\n\n"));
+  const out: string[] = [...pre];
+  if (p.wing !== undefined && p.wing.trim()) {
+    const w = parseWing(p.wing);
+    if ("error" in w) { d.idle = setTimeout(idleOut, d.idleS * 1000); return fail([...pre, w.error].join("\n\n")); }
+    if (d.lock) extendLock(d.lock, d.idleS + 60);
+    const seenFrom = readLive(cap)?.t ?? 0;
+    const r = await actorSend({ op: "wing", moves: w.moves, pid: d.target.pid, require_pid: d.target.pid, bounds: room.bounds,
+      live: liveFile(cap), speed: p.speed, coast_ms: p.coast_ms, max_ms: 30_000 }, 35_000);
+    if (!r.ok) { d.idle = setTimeout(idleOut, d.idleS * 1000); return fail([...pre, `the hand did not answer: ${r.error}`].join("\n\n")); }
+    d.wings++;
+    for (const m of r.marks ?? []) {
+      if (m.k === "note") continue;
+      const op = /^tap|right-tap/.test(m.k) ? "click" : m.k;
+      try { appendFileSync(join(cap.dir, "actions.jsonl"), JSON.stringify({ wall0: m.wall0, wall1: m.wall1, op, note: `${w.words[m.i] ?? m.k} · ${m.what}`, x: m.x, y: m.y, ok: true }) + "\n"); } catch { /* run dir gone */ }
+    }
+    out.push(...wingText(w.words, r));
+    if (r.blind) out.push(`⚠ NOT SEEING: ${r.blind}. The hand braked where it was; what the last moves did was not watched.`);
+    // Whatever the wing set going plays out a moment before the screen is read (a hand left flying is not waited for).
+    if (!r.flying) for (let still = 0, end = Date.now() + 600; still < 3 && Date.now() < end; await sleep(50)) still = readLive(cap)?.moving ? 0 : still + 1;
+    const live = readLive(cap);
+    out.push(`screen: ${short(live)}`);
+    try {
+      const { rows, meta } = loadRun(cap.csv);
+      snapshotStalls(cap.dir);
+      const o = { ...d.job.opts, from_s: seenFrom };
+      out.push(`during this wing: ${formatSeen(notice(rows, meta, analyze(rows, meta, o), { ...o, dir: cap.dir, still_recording: true }), 4)}`);
+    } catch { /* not flushed yet */ }
+    const ev = driveEvents(d);
+    if (ev) out.push(ev);
+  }
+  if (p.look) {
+    const [bx, by, bw, bh] = room.bounds;
+    const t = await axTree({ rect: d.job.rect, display: d.job.display, process: String(d.target.pid), mode: "basic" });
+    out.push(`in sight now (the room the hand moves in: [${bx.toFixed(0)},${by.toFixed(0)} ${bw.toFixed(0)}×${bh.toFixed(0)}], global points):\n${capLines(t.text, 90, "eye_inspect {process} shows all of it")}`);
+  }
+  if (p.end) out.push(await endDrive("you ended it"));
+  else {
+    d.idle = setTimeout(idleOut, d.idleS * 1000);
+    out.push(`drive open · next: another wing, or end:true (it ends by itself after ${d.idleS}s without one)`);
+  }
+  return text(out.join("\n"));
+}));
+function idleOut() {
+  const s = drive?.idleS;
+  endDrive(`no wing came for ${s}s`).then((t) => { driveEnded = `(the previous drive was not ended by you)\n${t}`; }).catch(() => {});
 }
 
 // ---- eye_glance: "Just a sec…" — bring a window forward, look, put it back
