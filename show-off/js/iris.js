@@ -3,6 +3,7 @@
 // stands out in orange, and the stretch where nothing was drawn is left empty with an orange arc across it.
 import { frames, freezes, onFrame, period } from "./meter.js";
 import { Spring, QUICK, PLAYFUL, reduceMotion } from "./spring.js";
+import { lid, lookFrom, events } from "./witness.js";
 
 const KEEP = frames.t.length, TURN = 4000, TAU = Math.PI * 2;
 const GREY = [128, 128, 128], ORANGE = [255, 140, 26];
@@ -21,15 +22,11 @@ export function iris(canvas) {
   new IntersectionObserver(([en]) => { visible = en.isIntersecting; }).observe(canvas);
   size();
 
-  // The pupil looks at the pointer, sinks and rises with the scroll, and tightens when the page is caught.
+  // The pupil looks at whatever is moving, else at the pointer, else straight at the visitor. It sinks and rises with
+  // the scroll, tightens when the page is caught, and is wide for a moment each time the eye opens.
   const px = new Spring(QUICK, 0), py = new Spring(QUICK, 0), open = new Spring(PLAYFUL, 1);
-  let lookX = 0, lookY = 0, scrollPush = 0, lastScroll = window.scrollY, caughtAt = -1e9, seen = 0;
-  window.addEventListener("pointermove", (e) => {
-    if (reduceMotion.matches) return;
-    const r = canvas.getBoundingClientRect(), dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
-    const d = Math.hypot(dx, dy) || 1, pull = Math.min(1, d / 420);
-    lookX = (dx / d) * pull; lookY = (dy / d) * pull;
-  }, { passive: true });
+  let scrollPush = 0, lastScroll = window.scrollY, caughtAt = -1e9, seen = 0;
+  events.addEventListener("open", () => { open.x = 1.3; open.aim(1); });
 
   const angle = (t) => ((t % TURN) / TURN) * TAU - Math.PI / 2;
 
@@ -43,6 +40,11 @@ export function iris(canvas) {
       const sy = window.scrollY, speed = ((sy - lastScroll) / Math.max(dt, 1)) * 1000;
       lastScroll = sy;
       scrollPush += (Math.max(-0.7, Math.min(0.7, speed / 2600)) - scrollPush) * Math.min(1, dt / 120);
+      let lookX = 0, lookY = 0;
+      if (visible) {
+        const r = canvas.getBoundingClientRect();
+        [lookX, lookY] = lookFrom(r.left + r.width / 2, r.top + r.height / 2, now);
+      }
       px.aim(lookX); py.aim(Math.max(-1, Math.min(1, lookY + scrollPush)));
     }
     if (!visible || w === 0) return;
@@ -52,10 +54,23 @@ export function iris(canvas) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
+    // The lids. Shut, the eye is one line; open, the line is under the iris. They are shut until the first judged
+    // frame and while the tab is hidden: the two stretches in which this page sees nothing.
+    const lidOpen = Math.max(0, Math.min(1, lid.x));
+    const lids = () => { ctx.beginPath(); ctx.ellipse(cx, cy, R, R * lidOpen, 0, 0, TAU); ctx.clip(); };
+    if (lidOpen < 1) {
+      ctx.strokeStyle = "#808080"; ctx.lineWidth = Math.max(2, R * 0.022); ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy); ctx.stroke();
+    }
+
     // The iris: the grey the-eye records on, washed orange for a moment when a freeze is caught.
     const wash = Math.exp(-(now - caughtAt) / 520);
-    ctx.fillStyle = `rgb(${Math.round(GREY[0] + (ORANGE[0] - GREY[0]) * wash)},${Math.round(GREY[1] + (ORANGE[1] - GREY[1]) * wash)},${Math.round(GREY[2] + (ORANGE[2] - GREY[2]) * wash)})`;
-    ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.fill();
+    if (lidOpen > 0.004) {
+      ctx.save(); lids();
+      ctx.fillStyle = `rgb(${Math.round(GREY[0] + (ORANGE[0] - GREY[0]) * wash)},${Math.round(GREY[1] + (ORANGE[1] - GREY[1]) * wash)},${Math.round(GREY[2] + (ORANGE[2] - GREY[2]) * wash)})`;
+      ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
 
     // The ticks, newest brightest. On-time frames are drawn in a few batches by age; late ones one by one.
     const count = Math.min(frames.n, KEEP);
@@ -89,11 +104,14 @@ export function iris(canvas) {
     ctx.globalAlpha = 1;
 
     // The pupil. It breathes two percent over five seconds: the one thing on the page that moves unasked.
+    if (lidOpen <= 0.004) return;
     const breath = reduceMotion.matches ? 1 : 1 + 0.02 * Math.sin((now / 5000) * TAU);
     const pr = R * 0.4 * breath * open.x, ox = px.x * R * 0.3, oy = py.x * R * 0.3;
+    ctx.save(); lids();
     ctx.fillStyle = "#0B0B0C";
     ctx.beginPath(); ctx.arc(cx + ox, cy + oy, pr, 0, TAU); ctx.fill();
     ctx.fillStyle = "#F4F4F2";
     ctx.beginPath(); ctx.arc(cx + ox - pr * 0.34, cy + oy - pr * 0.34, pr * 0.13, 0, TAU); ctx.fill();
+    ctx.restore();
   });
 }

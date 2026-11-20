@@ -1,12 +1,13 @@
 // The hero: the button that freezes the page, the verdict in the-eye's own voice, the readout in the bar and the
 // running total in the footer. All of it is read from the meter; nothing here is a canned number.
 import { onFrame, recent, refreshHz, freezes, totals, declareBlock } from "./meter.js";
+import { seen, span } from "./witness.js";
 
 const $ = (id) => document.getElementById(id);
 const born = performance.now();
 
 /** Hold the main thread for `ms`. This is the real thing: no frame can be drawn until it returns. */
-function freeze(ms) {
+export function freeze(ms) {
   const from = performance.now();
   declareBlock(from, from + ms, "freeze()");
   while (performance.now() - from < ms) { /* busy on purpose */ }
@@ -44,8 +45,14 @@ export function hero() {
     meter.replaceChildren(`${one.fps.toFixed(1)} fps of ${hz}`, wait);
     bar.classList.toggle("late", one.late > 0);
 
-    const f = freezes[freezes.length - 1];
-    if (f && now - f.at < 8000) {
+    const f = freezes[freezes.length - 1], shut = seen.lastShut;
+    if (shut && now - shut.at < 8000 && !(f && f.at > shut.at)) {
+      say(verdict, [
+        [`THE EYE WAS SHUT for ${span(shut.ms)}`, "head caught"],
+        [`    why: this tab was hidden, and a hidden tab draws nothing`],
+        [`    none of it was judged, and it does not count as a freeze`, "dim"],
+      ]);
+    } else if (f && now - f.at < 8000) {
       const at = ((f.at - f.ms - born) / 1000).toFixed(2);
       say(verdict, [
         [`FROZE: this page drew nothing for ${Math.round(f.ms)}ms at ${at}s`, "head caught"],
@@ -66,6 +73,9 @@ export function hero() {
 
     const n = freezes.length, worst = totals.worst;
     summary.textContent = `${totals.frames.toLocaleString("en-US")} frames drawn. The longest wait between two was ${worst < 100 ? worst.toFixed(1) : Math.round(worst)}ms. `
-      + (n === 0 ? "It never froze." : `It froze ${n === 1 ? "once" : `${n} times`}, and was caught ${n === 1 ? "" : "every time"}.`.replace(" .", "."));
+      + (n === 0 ? "It never froze." : `It froze ${n === 1 ? "once" : `${n} times`}, and was caught ${n === 1 ? "" : "every time"}.`.replace(" .", "."))
+      + ` You watched for ${span(now - seen.since - seen.shutMs)}`
+      + (seen.scrolled >= 1 ? ` and scrolled ${Math.round(seen.scrolled).toLocaleString("en-US")}pt.` : ".")
+      + (seen.shut ? ` The eye was shut ${seen.shut === 1 ? "once" : `${seen.shut} times`}, ${span(seen.shutMs)} in all, and judged none of it.` : "");
   });
 }

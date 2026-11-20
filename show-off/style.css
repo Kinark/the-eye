@@ -30,7 +30,7 @@
 }
 
 *, *::before, *::after { box-sizing: border-box; }
-html { background: var(--black); color: var(--white); font: var(--t-body)/1.55 var(--sans); -webkit-text-size-adjust: 100%; scroll-padding-top: 72px; }
+html { scrollbar-color: #3A3A3F var(--black); accent-color: var(--orange); background: var(--black); color: var(--white); font: var(--t-body)/1.55 var(--sans); -webkit-text-size-adjust: 100%; scroll-padding-top: 72px; }
 body { margin: 0; overflow-x: clip; }
 h1, h2, h3, p, ul, dl, dd, pre, fieldset, legend { margin: 0; padding: 0; border: 0; }
 ul { list-style: none; }
@@ -54,6 +54,14 @@ p { max-width: 68ch; }
 .bar-meter { display: flex; align-items: baseline; gap: var(--s3); max-width: none; font-size: var(--t-small); white-space: nowrap; }
 .bar-meter .num { color: var(--white); min-width: 26ch; text-align: right; }
 .bar-meter.late .num { color: var(--orange); }
+/* The mark is the eye, small. Its iris takes the orange at once when a freeze is caught and gives it back slowly. */
+.mark svg { overflow: visible; }
+.mark-iris { fill: var(--stage); transition: fill 600ms ease-out; }
+.mark-iris.caught { fill: var(--orange); transition-duration: 0ms; }
+/* The label is a slot one line high: what the page noticed rolls in from below (js/witness.js) and rolls out again. */
+.ticker { display: inline-grid; overflow: clip; min-width: 0; text-align: right; }
+.ticker > span { grid-area: 1 / 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ticker .caught { color: var(--orange); }
 
 /* ---- hero ----------------------------------------------------------------------------------------------------- */
 main { padding: 0 var(--gutter); }
@@ -63,8 +71,9 @@ main { padding: 0 var(--gutter); }
 .hero-copy h1 { margin-bottom: var(--s4); }
 .freeze { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s5); margin-top: var(--s4); }
 .hint { font-size: var(--t-small); color: var(--dim); }
-kbd { display: inline-block; min-width: 26px; padding: 2px 7px; border: 1px solid var(--dim); border-radius: 7px; font-size: 14px; line-height: 1.4; text-align: center; color: var(--white); }
-.verdict { min-height: 4.8em; }
+kbd { display: inline-block; min-width: 26px; padding: 2px 7px; border: 1px solid var(--dim); border-radius: 7px; font-size: 14px; line-height: 1.4; text-align: center; color: var(--white); transition: background-color 80ms ease-out, color 80ms ease-out, border-color 80ms ease-out; }
+kbd.down { background: var(--white); border-color: var(--white); color: var(--ink); }
+.verdict { min-height: calc(4.8em + 2 * var(--s1)); }
 
 /* ---- reports: the-eye's own words, in the face they arrive in -------------------------------------------------- */
 .report { font-family: var(--mono); font-size: var(--t-small); line-height: 1.6; font-variant-numeric: tabular-nums; color: var(--white); max-width: 96ch; }
@@ -164,11 +173,23 @@ section { padding: var(--s9) 0; }
 .corner-copy .report.big { min-height: 4.05em; }
 
 /* ---- tools ----------------------------------------------------------------------------------------------------- */
-.tools h2 { margin-bottom: var(--s7); }
-.tool-list { columns: 2; column-gap: var(--s8); }
-.tool-list > div { break-inside: avoid; display: grid; grid-template-columns: 13ch 1fr; column-gap: var(--s4); padding: var(--s3) 0; }
-.tool-list dt code { font-size: var(--t-small); color: var(--white); }
-.tool-list dd { color: var(--dim); font-size: 17px; line-height: 1.45; }
+.tools .intro { grid-template-columns: minmax(0, 6fr) minmax(0, 6fr); align-items: end; column-gap: var(--s8); }
+.say { font-size: var(--t-big); font-weight: 700; line-height: 1.2; letter-spacing: -0.02em; color: var(--white); text-wrap: balance; }
+.drive { display: grid; grid-template-columns: minmax(0, 6fr) minmax(0, 6fr); gap: var(--s7) var(--s8); padding: var(--s7); background: var(--panel); border-radius: var(--r-plate); }
+.drive-copy { display: grid; gap: var(--s4); align-content: start; }
+.drive-copy h3 { font-size: var(--t-body); font-weight: 500; line-height: 1.3; }
+.drive-copy .say { font-size: clamp(28px, 3.1vw, 44px); line-height: 1.05; letter-spacing: -0.03em; margin-bottom: var(--s3); }
+.drive-copy p:not(.say) { color: var(--dim); max-width: 46ch; }
+.call { height: 100%; padding: var(--s6); background: var(--black); border-radius: var(--r-inset); font-size: var(--t-small); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.call code { font-size: inherit; }
+.unasked { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--s6); padding-top: var(--s6); border-top: 1px solid var(--line); }
+.unasked li { font-size: var(--t-small); line-height: 1.5; color: var(--dim); }
+.unasked strong { display: block; color: var(--white); font-weight: 600; margin-bottom: var(--s1); }
+.tool-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--s8); margin-top: var(--s7); }
+.tool-list > div { display: grid; gap: var(--s3); align-content: start; padding: var(--s6) 0 var(--s7); border-top: 1px solid var(--line); }
+.tool-list dt { display: grid; gap: var(--s2); }
+.tool-list dt code { font-size: var(--t-small); color: var(--dim); }
+.tool-list dd { color: var(--dim); font-size: 17px; line-height: 1.5; max-width: 52ch; }
 
 /* ---- install --------------------------------------------------------------------------------------------------- */
 .install h2 { margin-bottom: var(--s7); }
@@ -184,7 +205,10 @@ section { padding: var(--s9) 0; }
   .hero { align-items: flex-start; padding-top: calc(56px + 58vw); }
   .iris { top: 64px; right: 50%; transform: translateX(50%); width: 60vw; height: 60vw; }
   .fit-panel, .corner, .replay .intro { grid-template-columns: 1fr; }
-  .tool-list { columns: 1; }
+  .tools .intro, .drive, .tool-list { grid-template-columns: 1fr; }
+  .drive { padding: var(--s5); }
+  .call { padding: var(--s5); }
+  .unasked { grid-template-columns: 1fr 1fr; }
   .timeline { grid-template-columns: 1fr; }
   .rows li { display: block; height: auto; padding: var(--s2) 0; line-height: 1.35; }
   .rows .num { display: inline-block; min-width: 0; margin-right: 0.3em; }
@@ -192,8 +216,12 @@ section { padding: var(--s9) 0; }
   .rows li { height: auto; min-height: 40px; }
   .replay-stage { aspect-ratio: 1000 / 460; }
   .cmd { flex-direction: column; align-items: flex-start; }
+  .bar-meter { min-width: 0; }
   .bar-meter .label { display: none; }
   .bar-meter .num { min-width: 0; }
+  /* No room for both: while the page has something to say, it says that instead of the number. */
+  .bar-meter.noticing .label { display: inline-grid; }
+  .bar-meter.noticing .num { display: none; }
   section { padding: var(--s8) 0; }
 }
 
@@ -209,4 +237,5 @@ section { padding: var(--s9) 0; }
 @media (max-width: 560px) {
   .bar-meter .wide, .bar-meter .label { display: none; }
   .bar-meter .num { min-width: 0; }
+  .bar-meter.noticing .label { display: inline-grid; }
 }

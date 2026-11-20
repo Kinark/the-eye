@@ -2,6 +2,7 @@
 // the report the-eye returned for it. Nothing here is authored: the page only moves a playhead over measurements.
 import { onFrame } from "./meter.js";
 import { MOTION, drawStage, drawTimeline } from "./replay-draw.js";
+import { gaze } from "./witness.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -50,7 +51,10 @@ export async function replay() {
 
   play.addEventListener("click", () => { if (!playing && t >= data.to) t = data.from; playing = !playing; dirty = true; });
   slow.addEventListener("click", () => slow.setAttribute("aria-pressed", String(slow.getAttribute("aria-pressed") !== "true")));
+  // While it plays, the playhead is what the eyes watch.
+  const playhead = () => { const r = line.getBoundingClientRect(); return [r.left + ((t - data.from) / (data.to - data.from)) * r.width, r.top + r.height / 2]; };
   onFrame((_, dt) => {
+    if (playing) gaze.at = playhead; else if (gaze.at === playhead) gaze.at = null;
     if (playing) {
       go(t + (Math.min(dt, 100) / 1000) * (slow.getAttribute("aria-pressed") === "true" ? 0.25 : 1));
       if (t >= data.to) playing = false;

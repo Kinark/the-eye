@@ -3,6 +3,8 @@
 // fitter uses to recognise it, and the fit itself runs in a worker so it cannot cost this page a frame.
 import { onFrame, period } from "./meter.js";
 import { springValue, bezierValue } from "/lib/physics.js";
+import { Spring, QUICK, reduceMotion } from "./spring.js";
+import { gaze } from "./witness.js";
 
 const $ = (id) => document.getElementById(id);
 const PAD = 36, SIZE = 88, REST_FRAMES = 10;
@@ -18,7 +20,20 @@ export function puck() {
   let flight = null; // { from, to, t0, v0, eng, samples, rest, cur, ticks }
   let asked = 0;
 
-  const place = () => { el.style.transform = `translate3d(${x.toFixed(2)}px,0,0)`; };
+  // The puck has some give: it rises 6% into the hand and stretches along its travel with its speed, about its own
+  // centre, so the place the ticks and the fitter read is not moved by it.
+  let sx = 1, sy = 1, wasX = PAD;
+  const place = () => { el.style.transform = `translate3d(${x.toFixed(2)}px,0,0) scale(${sx.toFixed(4)},${sy.toFixed(4)})`; };
+  const shape = () => { sx = lift.x * (1 + stretch.x); sy = lift.x * (1 - stretch.x * 0.5); place(); };
+  const lift = new Spring(QUICK, 1, shape), stretch = new Spring(QUICK, 0, shape);
+  onFrame((_, dt) => {
+    const want = reduceMotion.matches ? 0 : Math.min(0.14, (Math.abs(x - wasX) / Math.max(dt, 1)) * 1000 / 16000);
+    wasX = x;
+    if (Math.abs(want - stretch.to) > 0.002 || (want === 0 && stretch.to !== 0)) stretch.aim(want);
+  });
+  // While the puck is in the hand or in flight, it is what the eyes watch.
+  const eyeOn = () => { const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; };
+  const watched = (on) => { if (on) gaze.at = eyeOn; else if (gaze.at === eyeOn) gaze.at = null; };
   const wipe = () => ctx.clearRect(0, 0, w, h);
   const size = () => {
     const atHi = Math.abs(x - hi) < 1;
@@ -63,7 +78,8 @@ export function puck() {
 
   // ---- flying ----------------------------------------------------------------------------------------------------
   function launch(to, v0) {
-    if (Math.abs(to - x) < 12) { note.textContent = "Too short a trip to read. Fling it across."; flight = null; return; }
+    if (Math.abs(to - x) < 12) { note.textContent = "Too short a trip to read. Fling it across."; flight = null; watched(false); return; }
+    watched(true);
     const eng = engine(), now = performance.now();
     flight = { from: x, to, t0: now, v0, eng, samples: [{ t: now / 1000, x }], rest: 0, cur: x, done: false };
     declared.textContent = describe(eng, eng.kind === "spring" ? v0 : 0);
@@ -74,8 +90,9 @@ export function puck() {
   function land() {
     const f = flight;
     flight = null;
+    watched(false);
     x = f.to; place();
-    note.textContent = `${f.samples.length - 1} frames. Each tick is where the puck was on one of them.`;
+    note.textContent = `${f.samples.length - 1} frames. Each tick is where the puck was on one of them${f.late ? `; the ${f.late === 1 ? "orange one came" : `${f.late} orange ones came`} late` : ""}.`;
     fitted.replaceChildren(Object.assign(document.createElement("p"), { className: "dim", textContent: "reading the frames" }));
     worker.postMessage({ id: ++asked, samples: f.samples, period: period() / 1000 });
   }
@@ -91,7 +108,7 @@ export function puck() {
   };
   worker.onerror = () => { fitted.textContent = "The fitter did not load. Is the page served by npm run show-off?"; };
 
-  onFrame((now) => {
+  onFrame((now, dt) => {
     const f = flight;
     if (!f) return;
     const t = (now - f.t0) / 1000, travel = f.to - f.from, e = f.eng;
@@ -112,8 +129,11 @@ export function puck() {
       }
       if (f.done) f.cur = f.to;
       // One tick per frame, under the puck's centre: their spacing is its speed.
-      ctx.fillStyle = "rgba(11, 11, 12, 0.6)";
-      ctx.fillRect(Math.round(f.cur + SIZE / 2) - 1, h / 2 + SIZE / 2 + 14, 2, 14);
+      // A frame that came late is caught here too: its tick is orange and taller, after the gap it left.
+      const late = dt >= 1.5 * period();
+      if (late) f.late = (f.late ?? 0) + 1;
+      ctx.fillStyle = late ? "#FF8C1A" : "rgba(11, 11, 12, 0.6)";
+      ctx.fillRect(Math.round(f.cur + SIZE / 2) - 1, h / 2 + SIZE / 2 + 14, late ? 3 : 2, late ? 24 : 14);
     } else if (++f.rest >= REST_FRAMES) {
       f.samples.push({ t: now / 1000, x: f.cur });
       land();
@@ -131,6 +151,8 @@ export function puck() {
     flight = null; // grabbed mid-flight: it stops being the engine's and becomes the hand's, from where it is
     held = { dx: e.clientX - el.getBoundingClientRect().left, pts: [[e.timeStamp, x]] };
     el.classList.add("held");
+    watched(true);
+    if (!reduceMotion.matches) lift.aim(1.06);
     wipe();
     note.textContent = "";
     e.preventDefault();
@@ -150,6 +172,7 @@ export function puck() {
     const v = span > 0.008 && !still ? (pts[pts.length - 1][1] - first[1]) / span : 0;
     held = null;
     el.classList.remove("held");
+    lift.aim(1);
     const mid = (lo + hi) / 2, to = v > 300 ? hi : v < -300 ? lo : x > mid ? hi : lo;
     x = Math.min(Math.max(x, lo - 200), hi + 200);
     launch(to, v);

@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "flat-type-hierarchy",
+        "value": "*",
+        "files": [
+          "show-off/index.html"
+        ],
+        "createdAt": "2026-11-14T04:53:47.963Z",
+        "reason": "agent triage, not user confirmed: style.css scale is display clamp(64-168px) / h2 clamp(40-80px) / big clamp(22-30px) / body 18px, so h2:body is at least 2.2x and display:h2 at least 1.6x; detector appears not to resolve the clamp() custom properties"
+      }
+    ]
+  }
+}
