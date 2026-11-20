@@ -6,7 +6,7 @@ import { onFrame, recent, frames, freezes } from "./meter.js";
 import { Spring, QUICK, PLAYFUL, reduceMotion } from "./spring.js";
 
 /** What the page has seen of this visit. The footer reads it. */
-export const seen = { since: performance.now(), scrolled: 0, shut: 0, shutMs: 0, lastShut: null };
+export const seen = { since: performance.now(), scrolled: 0, shut: 0, shutMs: 0, lastShut: null, outside: 0 }; // outside: ms the-eye itself watched (js/outside.js)
 /** How open the eyes are: 0 shut, 1 open. Shut until the first judged frame, and while the tab is hidden. */
 export const lid = new Spring(PLAYFUL, reduceMotion.matches ? 1 : 0);
 /** The thing in motion, when there is one: a function returning its [clientX, clientY]. The eyes follow it. */

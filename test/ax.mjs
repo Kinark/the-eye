@@ -4,7 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const client = new Client({ name: "ax", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname] }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [new URL("../src/index.ts", import.meta.url).pathname] }));
 let errors = 0;
 const call = async (name, args = {}, show = 2500) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 120_000 });

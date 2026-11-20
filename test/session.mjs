@@ -1,8 +1,8 @@
 // A the-eye server kept alive between shell commands, so a session (and two fingers left on the trackpad) can be
 // played turn by turn from a terminal or by an agent whose own MCP connection runs older code.
-//   node test/session.mjs serve [dir]            start the server and wait for calls (run it in the background)
-//   node test/session.mjs call <tool> '<json>'   one call: prints the text, saves each image and prints its path
-//   node test/session.mjs stop                   end the open session and the server
+//   bun test/session.mjs serve [dir]            start the server and wait for calls (run it in the background)
+//   bun test/session.mjs call <tool> '<json>'   one call: prints the text, saves each image and prints its path
+//   bun test/session.mjs stop                   end the open session and the server
 // A session with a hand TAKES THE REAL INPUT LOCK (Esc ×6 releases).
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -18,7 +18,7 @@ mkdirSync(dir, { recursive: true });
 if (mode === "serve") {
   for (const f of readdirSync(dir)) rmSync(join(dir, f), { force: true });
   const client = new Client({ name: "session", version: "1" });
-  await client.connect(new StdioClientTransport({ command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname], env: process.env }));
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [new URL("../src/index.ts", import.meta.url).pathname], env: process.env }));
   writeFileSync(join(dir, "ready"), String(process.pid));
   let idle = Date.now();
   for (;;) {
@@ -55,7 +55,7 @@ if (mode === "serve") {
   process.exit(0);
 }
 
-if (!existsSync(join(dir, "ready"))) { console.log(`no server: node test/session.mjs serve & (looked in ${dir})`); process.exit(1); }
+if (!existsSync(join(dir, "ready"))) { console.log(`no server: bun test/session.mjs serve & (looked in ${dir})`); process.exit(1); }
 const id = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 writeFileSync(join(dir, `${id}.tmp`), JSON.stringify(mode === "stop" ? { tool: "__stop" } : { tool: a, args: JSON.parse(b ?? "{}") }));
 renameSync(join(dir, `${id}.tmp`), join(dir, `${id}.req.json`));

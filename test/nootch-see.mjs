@@ -1,4 +1,4 @@
-// node test/nootch-see.mjs ['<process>'] — the whole reflex layer against the real thing, in one session on NOOTCH!:
+// bun test/nootch-see.mjs ['<process>'] — the whole reflex layer against the real thing, in one session on NOOTCH!:
 // the probe goes in by itself, the hand hovers the notch, opens the Nook, the Nook is looked at standing still, and it
 // closes. Prints everything the-eye says unasked: what the screen showed (moved by, what a viewer would notice), what
 // the open Nook reads like at rest (text sizes, contrast, alignment, corner shape), and from inside the app what each
@@ -9,7 +9,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const [proc = "NOOTCH!-Dev"] = process.argv.slice(2);
 const client = new Client({ name: "nootch-see", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname], env: process.env }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [new URL("../src/index.ts", import.meta.url).pathname], env: process.env }));
 const call = async (name, args = {}) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 300_000 });
   const imgs = r.content.filter((c) => c.type === "image").length;

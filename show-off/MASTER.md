@@ -1,6 +1,6 @@
 # show-off: design system
 
-The page that shows what the-eye does, by doing it to itself. `npm run show-off` serves it; nothing is built.
+The page that shows what the-eye does, by doing it to itself. `bun run show-off` serves it; nothing is built.
 
 ## Theses
 
@@ -50,6 +50,33 @@ Read, not played: nothing in it moves or answers the pointer. `eye_drive` gets t
 with its calls on a `--black` inset (radius 28); the four that only look sit under hairlines. `.say` (`--t-big`, 700)
 is the one-line claim of each tool; inside the plate it grows to clamp(28px, 3.1vw, 44px). No orange here: nothing was
 caught. Every claim in the copy is a behaviour README "Tools" states.
+
+The last row is the manual (`.manual`), under the same hairlines: the claim on the left, the seven chapters on the
+right with what each costs to read. The counts are read off `skills/the-eye/*.md` by `serve.mjs` (`/config.json`)
+when the page loads, so they are never typed in.
+
+## Websites too (`js/outside.js`)
+
+The section where the page says who is watching it. One plate (`--panel`, radius 40): the call on a `--black` inset
+with the address the page is really served from (`location.host`), and beside it two readings in the fit section's
+form. "From inside" is the page's own meter. "From outside" is true or it says nothing is there: a website session
+puts `src/eye-page.js` into the page before the page's scripts, and that probe leaves `window.__eye`. The page reads
+the probe's own books (`els.size` named, `track.size` followed, `off`) four times a second.
+
+- **Three states, one voice.** `NOT WATCHED` (no probe), `WATCHED FROM OUTSIDE` (probe on: how many things it has
+  named, how many it follows, for how long), `THE EYE HAS LET GO` (probe present, switched off).
+- **Orange.** The head of `WATCHED FROM OUTSIDE` and its line in the bar are orange: the page caught its watcher, and
+  the lock's orange is on the screen at that moment.
+- **The eyes.** Both pupils go wide for a moment when the probe turns on, as when the lids open.
+- **The footer** adds how long the-eye itself watched.
+- A screen reader hears the head once per state (`#outside-said`); the figures under it are not announced.
+
+Nothing here imitates the-eye. No drawn pointer, no canned reply: with no probe in the page, the line says so.
+
+## Install
+
+Two ways, on the house segmented control: the MCP line with this checkout's real path, or the two plugin commands.
+The plate keeps the taller height, so nothing under it moves on the switch. The text swaps; nothing crossfades.
 
 ## The witness (`js/witness.js`)
 
@@ -106,4 +133,4 @@ puck on stage 3.8:1 (a graphic, not text).
 
 `serve.mjs` server · `index.html` · `style.css` · `js/meter.js` frame log · `js/spring.js` · `js/squircle.js` ·
 `js/iris.js` hero eye · `js/witness.js` what the page notices about the visitor · `js/hero.js` freeze and verdict · `js/puck.js` + `js/fit-worker.js` fling and fit ·
-`js/replay.js` + `js/replay-draw.js` recording · `js/corner.js` corner reader · `data/` the recording.
+`js/replay.js` + `js/replay-draw.js` recording · `js/corner.js` corner reader · `js/outside.js` who is watching the page · `data/` the recording.

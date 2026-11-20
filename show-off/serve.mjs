@@ -1,16 +1,17 @@
-#!/usr/bin/env node
-// `npm run show-off`: serves the show-off page. No dependencies, no build step.
+#!/usr/bin/env bun
+// `bun run show-off`: serves the show-off page. No dependencies, no build step.
 // The page runs the-eye's own fitter and corner reader: /lib/*.js is src/*.ts with the types stripped, on request.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { stripTypeScriptTypes } from "node:module";
 import { spawn } from "node:child_process";
 import { dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "..");
+const strip = new Bun.Transpiler({ loader: "ts" });
 const LIB = new Set(["physics", "still"]); // pure maths, no imports: safe to hand to a browser as is
+const CHAPTERS = ["wing", "fingers", "steps", "web", "reply", "session", "measure"]; // the same names as CHAPTERS in src/guide.ts
 const TYPES = {
   ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
   ".mjs": "text/javascript; charset=utf-8", ".json": "application/json; charset=utf-8", ".txt": "text/plain; charset=utf-8",
@@ -19,11 +20,16 @@ const TYPES = {
 
 async function respond(url) {
   const path = decodeURIComponent(new URL(url, "http://x").pathname);
-  if (path === "/config.json") return [200, TYPES[".json"], JSON.stringify({ repo, node: process.version })];
+  if (path === "/config.json") {
+    // The manual's chapters as they are on disk right now: the page prints what each one costs an agent to read.
+    const manual = {};
+    for (const name of CHAPTERS) manual[name] = (await readFile(join(repo, "skills", "the-eye", `${name}.md`), "utf8").catch(() => "")).length;
+    return [200, TYPES[".json"], JSON.stringify({ repo, bun: Bun.version, manual })];
+  }
   const lib = path.match(/^\/lib\/(\w+)\.js$/);
   if (lib && LIB.has(lib[1])) {
     const ts = await readFile(join(repo, "src", `${lib[1]}.ts`), "utf8");
-    return [200, TYPES[".js"], stripTypeScriptTypes(ts)];
+    return [200, TYPES[".js"], strip.transformSync(ts)];
   }
   const file = normalize(join(here, path === "/" ? "index.html" : path));
   if (file !== here && !file.startsWith(here + sep)) return [403, TYPES[".txt"], "outside the site"];

@@ -1,5 +1,5 @@
 // Turns one real the-eye run folder into the small JSON the show-off page replays.
-//   node show-off/data/extract.mjs <run folder> <from_s> <to_s> > show-off/data/open.json
+//   bun show-off/data/extract.mjs <run folder> <from_s> <to_s> > show-off/data/open.json
 // Nothing here is made up: every time comes from the run's own files, read with the server's own loader.
 import { readFileSync } from "node:fs";
 import { join, basename } from "node:path";

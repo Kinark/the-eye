@@ -1,4 +1,4 @@
-// node test/took-back.mjs — Esc ×6 with real key presses (posted by an untagged process, as the user's are), through
+// bun test/took-back.mjs — Esc ×6 with real key presses (posted by an untagged process, as the user's are), through
 // the server: (1) while the hand plays by itself between calls: the fingers lift, nothing more reaches the app and the
 // session is ended; (2) in the middle of a long step (a glide, a pinch, a press): it stops, what it had open is
 // closed, and the reply says who stopped it; (3) the next session works again. Also: a reply that comes while play
@@ -35,7 +35,7 @@ const win = await new Promise((res) => createInterface({ input: target.stdout })
 const cx = Math.round(win.x + win.w / 2), cy = Math.round(win.y + win.h / 2);
 
 const client = new Client({ name: "took-back", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [`${root}src/index.ts`], env: process.env }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [`${root}src/index.ts`], env: process.env }));
 const call = async (name, args = {}) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 120_000 });
   return r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");

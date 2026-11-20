@@ -1,4 +1,4 @@
-// node test/physics.mjs — the motion fitter against the platform's own curves.
+// bun test/physics.mjs — the motion fitter against the platform's own curves.
 // Builds test/fixtures/truth.swift (SwiftUI's Spring and UnitCurve, sampled at 120Hz) and checks that fitMotion names
 // what moved each one and recovers its numbers, from frames degraded the way a screen capture degrades them:
 // whole-point positions, an unknown start phase, dropped frames, and a 60Hz display.

@@ -1,4 +1,4 @@
-// node test/lock.mjs — the lock: countdown, cursor pin, preflight, quick style. Takes the real lock twice
+// bun test/lock.mjs — the lock: countdown, cursor pin, preflight, quick style. Takes the real lock twice
 // (3·2·1 then ~3s orange; then a ~0.5s "Just a sec…" pill). Esc ×6 releases either.
 // 1. The tap must stay off during the countdown: an untagged event posted mid-countdown is never seen by it, one
 //    posted after engaging is (and is blocked). Before the fix, disabling the fresh tap re-armed it mid-countdown.

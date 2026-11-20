@@ -1,4 +1,4 @@
-// node test/watch-events.mjs — `the-eye watch` end to end.
+// bun test/watch-events.mjs — `the-eye watch` end to end.
 // 1. A fixture app (test/fixtures/ticker.swift) that changes by itself: value-changed, title-changed, sheet
 //    open/close with its text + buttons, --until on a value, --until on a window already showing, --seconds → 124.
 //    No input is sent, so no lock is needed.
@@ -20,7 +20,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Run `the-eye watch …`; resolves with its stdout lines and exit code. */
 function watch(args) {
-  const p = spawn("node", [CLI, "watch", ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  const p = spawn(process.execPath, [CLI, "watch", ...args], { stdio: ["ignore", "pipe", "pipe"] });
   const lines = []; let buf = "", err = "";
   p.stdout.on("data", (d) => { buf += d; const parts = buf.split("\n"); buf = parts.pop(); lines.push(...parts); });
   p.stderr.on("data", (d) => (err += d));
@@ -66,7 +66,7 @@ spawnSync("swiftc", ["-O", join(ROOT, "test", "fixtures", "ticker.swift"), "-o",
 // ---- 2. TextEdit, under the lock
 spawnSync("pkill", ["-x", "TextEdit"]); await sleep(800);
 const client = new Client({ name: "watch-events", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [CLI], stderr: "ignore" }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [CLI], stderr: "ignore" }));
 const call = async (name, args) => (await client.callTool({ name, arguments: args }, undefined, { timeout: 120000 })).content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
 const w = watch(["--app", "TextEdit", "--seconds", "30"]);
 await w.ready;

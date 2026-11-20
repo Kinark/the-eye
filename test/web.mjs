@@ -1,4 +1,4 @@
-// node test/web.mjs — the website path end to end in a headless browser of its own (no screen, no input, no lock):
+// bun test/web.mjs — the website path end to end in a headless browser of its own (no screen, no input, no lock):
 // open a fixture page, record with the page probe, press things through the DevTools protocol, and check that the
 // report names the script that blocked, the CSS transition as declared, what the console said and the layout shift.
 import { mkdtempSync, readFileSync } from "node:fs";

@@ -6,7 +6,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const root = new URL("..", import.meta.url).pathname;
 const client = new Client({ name: "guide", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [`${root}src/index.ts`], stderr: "ignore" }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [`${root}src/index.ts`], stderr: "ignore" }));
 let bad = 0;
 const ok = (what, cond, detail = "") => { if (!cond) bad++; console.log(`${cond ? "ok  " : "FAIL"} ${what}${detail ? `: ${detail}` : ""}`); };
 const call = async (args) => {
@@ -24,7 +24,7 @@ ok("five tools", tools.length === 5, tools.map((t) => t.name).join(", "));
 // What is left is mostly the shape of the schemas (sixty arguments, eighteen step fields), not prose.
 ok("the connect payload is an outline (< 26,000 chars)", total < 26_000, String(total));
 ok("the instructions carry the trigger, the lock and the way out", /USE IT BY DEFAULT/.test(ins) && /THE LOCK/.test(ins) && /Esc 6×/.test(ins) && /hands:false/.test(ins));
-ok("the instructions name real commands, not the skill's placeholder", !ins.includes("CLAUDE_SKILL_DIR") && ins.includes(`node ${root}src/index.ts watch`));
+ok("the instructions name real commands, not the skill's placeholder", !ins.includes("CLAUDE_SKILL_DIR") && ins.includes(`bun ${root}src/index.ts watch`));
 ok("no front matter in the instructions", !ins.startsWith("---"));
 
 // Every chapter the tool offers is served, and the outline lists it.
@@ -56,7 +56,7 @@ ok("a fingers mistake names the fingers chapter", e2.isError && e2.text.includes
 
 // A server that has not handed the chapter over yet brings it with the error.
 const fresh = new Client({ name: "guide2", version: "1" });
-await fresh.connect(new StdioClientTransport({ command: "node", args: [`${root}src/index.ts`], stderr: "ignore" }));
+await fresh.connect(new StdioClientTransport({ command: process.execPath, args: [`${root}src/index.ts`], stderr: "ignore" }));
 const r = await fresh.callTool({ name: "eye_drive", arguments: { wing: "E wiggle" } });
 const t = r.content.map((c) => c.text ?? "").join("\n");
 ok("a fresh server sends the wing chapter with the error", r.isError && t.includes("# wing: a line of words") && t.includes("## The words"), `${t.length} chars`);

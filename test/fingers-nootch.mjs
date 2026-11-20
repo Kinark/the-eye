@@ -1,4 +1,4 @@
-// node test/fingers-nootch.mjs ['<process>'] — two fingers on NOOTCH!'s notch: one touch held across two calls that pulls the
+// bun test/fingers-nootch.mjs ['<process>'] — two fingers on NOOTCH!'s notch: one touch held across two calls that pulls the
 // notch open on a curve, stirs it in circles, wanders and lifts, then a diagonal flick, then the hand playing by itself
 // (fingers play), sent somewhere by a stroke, calmed and lifted. Prints what the-eye says;
 // asserts nothing. TAKES THE REAL INPUT LOCK (Esc ×6 releases).
@@ -7,7 +7,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const [proc = "NOOTCH!-Dev"] = process.argv.slice(2);
 const client = new Client({ name: "fingers-nootch", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname], env: process.env }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [new URL("../src/index.ts", import.meta.url).pathname], env: process.env }));
 const call = async (name, args = {}) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 300_000 });
   return (r.isError ? "ERROR: " : "") + r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");

@@ -1,4 +1,4 @@
-// node test/probe-cost.mjs ['<process>'] — what the probe costs the app under test: the same open / close of the Nook
+// bun test/probe-cost.mjs ['<process>'] — what the probe costs the app under test: the same open / close of the Nook
 // in four sessions (no probe · the probe watching a few layers · the probe walking every layer · no probe again),
 // first lines of each report side by side. Compare the fps and the frame gaps between the modes.
 // TAKES THE REAL INPUT LOCK for each session (Esc ×6 releases).
@@ -7,7 +7,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const [proc = "NOOTCH!-Dev"] = process.argv.slice(2);
 const client = new Client({ name: "probe-cost", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname] }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [new URL("../src/index.ts", import.meta.url).pathname] }));
 const call = async (name, args = {}) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 300_000 });
   return (r.isError ? "ERROR: " : "") + r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");

@@ -1,4 +1,4 @@
-// The words of a wing → the moves the hand flies. node test/wing.mjs
+// The words of a wing → the moves the hand flies. bun test/wing.mjs
 import { parseWing, wingMs } from "../src/wing.ts";
 let bad = 0;
 const eq = (name, got, want) => {

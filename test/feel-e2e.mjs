@@ -1,4 +1,4 @@
-// node test/feel-e2e.mjs — what moved it, read off a real screen.
+// bun test/feel-e2e.mjs — what moved it, read off a real screen.
 // Builds test/fixtures/springy.swift (a bar driven by a known CASpringAnimation, a critically damped one, an
 // easeInEaseOut and a hand-rolled per-frame lerp; a puck that slides without changing size, on a spring and on an
 // easeOut; a tile that grows and shrinks in both dimensions at once), presses each button by name with eye_drive and checks that
@@ -24,7 +24,7 @@ sh("codesign", ["-f", "-s", "-", appDir]);
 
 const app = spawn(exe, [], { stdio: "ignore" });
 const client = new Client({ name: "feel-e2e", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [join(ROOT, "src", "index.ts")] }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(ROOT, "src", "index.ts")] }));
 const call = async (name, args) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 120_000 });
   const t = r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");

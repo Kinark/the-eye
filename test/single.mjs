@@ -9,7 +9,7 @@ import { join } from "node:path";
 
 const server = async (name, env = {}) => {
   const c = new Client({ name, version: "1" });
-  await c.connect(new StdioClientTransport({ command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname], env: { ...process.env, THE_EYE_ASK: "yep", ...env } }));
+  await c.connect(new StdioClientTransport({ command: process.execPath, args: [new URL("../src/index.ts", import.meta.url).pathname], env: { ...process.env, THE_EYE_ASK: "yep", ...env } }));
   return c;
 };
 const call = async (c, name, args) => {

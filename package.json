@@ -7,13 +7,13 @@
     "the-eye": "src/index.ts"
   },
   "scripts": {
-    "start": "node src/index.ts",
-    "show-off": "node show-off/serve.mjs",
+    "start": "bun src/index.ts",
+    "show-off": "bun show-off/serve.mjs",
     "typecheck": "tsc -p .",
     "build:native": "mkdir -p bin && swiftc -O -swift-version 5 swift/EyeCapture.swift -o bin/eye-capture"
   },
   "engines": {
-    "node": ">=23.6"
+    "bun": ">=1.2"
   },
   "os": [
     "darwin"
@@ -23,7 +23,7 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@types/node": "^24.19.2",
+    "@types/bun": "^1.4.5",
     "typescript": "^5.9.3"
   }
 }

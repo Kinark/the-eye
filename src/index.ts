@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // the-eye — an MCP server that lets an agent SEE and MEASURE what is on a macOS screen over time: per-frame
 // timing and motion (pixels → numbers), what UI element is under the pointer and the element tree of the
 // observed windows (Accessibility), and, optionally, layer geometry from inside an app (probe.ts).

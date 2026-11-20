@@ -1,4 +1,4 @@
-// node test/track.mjs — following the thing itself from the box of what changed between frames (src/track.ts).
+// bun test/track.mjs — following the thing itself from the box of what changed between frames (src/track.ts).
 // Synthetic rows, no screen: a 50pt puck sliding on a spring, a tile growing and shrinking in both dimensions, the
 // sliver left by one moving edge, each with the lies a real press adds (a highlighted button somewhere else, a first
 // box that swallows both, a slow tail that loses rows to the threshold).

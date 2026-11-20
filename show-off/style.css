@@ -191,10 +191,35 @@ section { padding: var(--s9) 0; }
 .tool-list dt code { font-size: var(--t-small); color: var(--dim); }
 .tool-list dd { color: var(--dim); font-size: 17px; line-height: 1.5; max-width: 52ch; }
 
+/* ---- websites: the page, watched from outside ------------------------------------------------------------------- */
+.self { display: grid; grid-template-columns: minmax(0, 6fr) minmax(0, 6fr); gap: var(--s7) var(--s8); padding: var(--s7); background: var(--panel); border-radius: var(--r-plate); }
+.self-call { display: grid; gap: var(--s5); justify-items: start; align-content: start; }
+.self-call .call { width: 100%; height: auto; font-size: clamp(15px, 1.35vw, 19px); }
+.self .readout { align-content: center; }
+.self .unasked code { color: var(--white); }
+.web > .fine { margin-top: var(--s5); }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+/* ---- the manual: the last row of the tools, under the same hairline ------------------------------------------- */
+.manual { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s6) var(--s8); }
+.manual > div { display: grid; gap: var(--s3); align-content: start; padding: var(--s6) 0 0; border-top: 1px solid var(--line); }
+.manual h3 { display: grid; gap: var(--s2); font-weight: 400; }
+.manual h3 code { font-size: var(--t-small); color: var(--dim); }
+.manual p { color: var(--dim); font-size: 17px; line-height: 1.5; max-width: 52ch; }
+.manual p code { color: var(--white); }
+.manual h4 { margin: 0 0 var(--s1); }
+.chapters li { display: grid; grid-template-columns: 9ch minmax(0, 1fr) 6ch; align-items: baseline; column-gap: var(--s4); padding: var(--s2) 0; font-size: var(--t-small); line-height: 1.4; color: var(--dim); }
+.chapters code { color: var(--white); font-size: var(--t-small); }
+.chapters .num { color: var(--white); text-align: right; }
+
 /* ---- install --------------------------------------------------------------------------------------------------- */
 .install h2 { margin-bottom: var(--s7); }
 .cmd { display: flex; align-items: center; justify-content: space-between; gap: var(--s5); padding: var(--s5) var(--s5) var(--s5) var(--s6); background: var(--panel); border-radius: var(--r-inset); margin-bottom: var(--s5); }
-.cmd code { font-size: clamp(16px, 1.5vw, 21px); line-height: 1.5; overflow-wrap: anywhere; user-select: all; }
+.cmd code { font-size: clamp(16px, 1.5vw, 21px); line-height: 1.5; overflow-wrap: anywhere; user-select: all; white-space: pre-line; }
+/* Two lines as a plugin, one as a server: the plate keeps the taller height so nothing under it moves on the switch. */
+.cmd { min-height: calc(2 * var(--s5) + 2 * 1.5 * clamp(16px, 1.5vw, 21px)); }
+.how { margin-bottom: var(--s5); }
+.install .fine + .fine { margin-top: var(--s3); }
 
 /* ---- footer ---------------------------------------------------------------------------------------------------- */
 .foot { padding: var(--s9) var(--gutter) var(--s8); display: grid; gap: var(--s4); border-top: 1px solid var(--line); }
@@ -205,8 +230,8 @@ section { padding: var(--s9) 0; }
   .hero { align-items: flex-start; padding-top: calc(56px + 58vw); }
   .iris { top: 64px; right: 50%; transform: translateX(50%); width: 60vw; height: 60vw; }
   .fit-panel, .corner, .replay .intro { grid-template-columns: 1fr; }
-  .tools .intro, .drive, .tool-list { grid-template-columns: 1fr; }
-  .drive { padding: var(--s5); }
+  .tools .intro, .drive, .tool-list, .self, .manual { grid-template-columns: 1fr; }
+  .drive, .self { padding: var(--s5); }
   .call { padding: var(--s5); }
   .unasked { grid-template-columns: 1fr 1fr; }
   .timeline { grid-template-columns: 1fr; }

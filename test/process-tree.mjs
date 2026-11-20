@@ -6,7 +6,7 @@ import { execSync, spawnSync } from "node:child_process";
 
 const want = process.argv[2] ?? "NOOTCH";
 const client = new Client({ name: "process-tree", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname] }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [new URL("../src/index.ts", import.meta.url).pathname] }));
 let errors = 0;
 const call = async (name, args = {}) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 30_000 });

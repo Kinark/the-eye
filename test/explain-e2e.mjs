@@ -1,5 +1,5 @@
 // End-to-end: one session with Instruments beside it, labeled steps (open, hover, scroll, scrub, close) → the explain view.
-// usage: node test/explain-e2e.mjs <process-name> [label]
+// usage: bun test/explain-e2e.mjs <process-name> [label]
 // TAKES THE REAL INPUT LOCK for the whole run, about half a minute (Esc ×6 releases).
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -7,7 +7,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const proc = process.argv[2] ?? "NOOTCH!-Dev";
 const label = process.argv[3] ?? "explain-e2e";
 const client = new Client({ name: "e2e", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname] }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [new URL("../src/index.ts", import.meta.url).pathname] }));
 const call = async (name, a = {}) => (await client.callTool({ name, arguments: a }, undefined, { timeout: 300_000 })).content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
 const cx = 756, zone = [{ x: cx - 140, y: 0, w: 280, h: 70 }];
 const act = async (lbl, steps) => {

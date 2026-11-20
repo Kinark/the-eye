@@ -1,4 +1,4 @@
-// node test/said-e2e.mjs — what the app SAID, on the clock of what it showed.
+// bun test/said-e2e.mjs — what the app SAID, on the clock of what it showed.
 // Builds test/fixtures/springy.swift, whose every button also tells accessibility two things without drawing them:
 // its status text becomes "<name> started" inside the button's action, and "<name> at 200" is announced 200ms later.
 // Presses Ease (a 350ms animation) by name with eye_drive and checks that the reply carries both, timed against the click and
@@ -24,7 +24,7 @@ sh("codesign", ["-f", "-s", "-", appDir]);
 
 const app = spawn(exe, [], { stdio: "ignore" });
 const client = new Client({ name: "said-e2e", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [join(ROOT, "src", "index.ts")] }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(ROOT, "src", "index.ts")] }));
 const call = async (name, args) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 120_000 });
   const t = r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");

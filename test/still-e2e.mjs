@@ -1,4 +1,4 @@
-// node test/still-e2e.mjs — what a window that holds still says, read off a real screen.
+// bun test/still-e2e.mjs — what a window that holds still says, read off a real screen.
 // Builds test/fixtures/still.swift (text of known sizes and colours, boxes with a 2pt misalignment, uneven gaps, an
 // overlap, a label running off the window, and the four corner shapes), looks at it once with eye_snapshot {app} and with
 // eye_snapshot, and checks that the reply carries the measurements nobody asked for.
@@ -23,7 +23,7 @@ sh("codesign", ["-f", "-s", "-", appDir]);
 
 const app = spawn(exe, [], { stdio: "ignore" });
 const client = new Client({ name: "still-e2e", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [join(ROOT, "src", "index.ts")], env: { ...process.env } }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(ROOT, "src", "index.ts")], env: { ...process.env } }));
 const call = async (name, args) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 60_000 });
   const t = r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");

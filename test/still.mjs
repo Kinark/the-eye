@@ -1,4 +1,4 @@
-// node test/still.mjs — the maths on a still frame (src/still.ts), on drawn pixels and made-up frames: no screen needed.
+// bun test/still.mjs — the maths on a still frame (src/still.ts), on drawn pixels and made-up frames: no screen needed.
 import { contrast, elements, readCorner, readLayout, readText, still } from "../src/still.ts";
 
 let failed = 0, n = 0;

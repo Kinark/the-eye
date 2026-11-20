@@ -84,7 +84,7 @@ main thread was free the whole time, which puts the lost frames after the app (r
 means the motion isn't driven from the main thread. A main-thread stall during a motion that no visible gap accounts
 for is listed too. Without the probe the report says the cause was not measured and how to get it.
 
-Test: `node test/notice.mjs` (synthetic recordings, no screen) and `node test/why-e2e.mjs` (a real fixture app that
+Test: `bun test/notice.mjs` (synthetic recordings, no screen) and `bun test/why-e2e.mjs` (a real fixture app that
 blocks its main thread mid-animation; takes the input lock for a few seconds).
 
 ## What moved it
@@ -142,10 +142,10 @@ then the animation, used to be one segment, and the pause was charged to the ani
 Position and size are read on the capture's grid (1–1.5pt), brightness is finer. On the fixture below all of them
 come back within about 4% of the numbers the code asked for.
 
-Test: `node test/physics.mjs` checks the fitter against SwiftUI's own `Spring` and `UnitCurve` (built from
-`test/fixtures/truth.swift`), degraded the way a capture degrades them; `node test/track.mjs` checks the follower
+Test: `bun test/physics.mjs` checks the fitter against SwiftUI's own `Spring` and `UnitCurve` (built from
+`test/fixtures/truth.swift`), degraded the way a capture degrades them; `bun test/track.mjs` checks the follower
 on synthetic boxes (a slide, a grow, a shrink, one moving edge, each with a highlighted button elsewhere and a first
-box that swallows both); `node test/feel-e2e.mjs` presses the buttons of `test/fixtures/springy.swift` (a bar on a
+box that swallows both); `bun test/feel-e2e.mjs` presses the buttons of `test/fixtures/springy.swift` (a bar on a
 known `CASpringAnimation`, a critically damped one, an `easeInEaseOut` and a hand-rolled lerp; a puck that slides on
 a spring and on an `easeOut`; a tile that grows and shrinks in both dimensions) and checks the engine and its numbers
 come back from the screen alone. The last takes the input lock.
@@ -240,7 +240,7 @@ agent-facing text lives once, in [`skills/the-eye/`](skills/the-eye/), and reach
   that carries it with the server (see [Install](#install)). A client with skills reads the chapters as files.
 
 On connect the server sent 43,204 characters before this split and sends about 24,400 after it; what is left is
-mostly the shape of the schemas. `node test/guide.mjs` holds it under 26,000, checks that every chapter is served
+mostly the shape of the schemas. `bun test/guide.mjs` holds it under 26,000, checks that every chapter is served
 and that the chapters name every word `src/wing.ts` parses.
 
 A change to what a tool does goes into the chapter that describes it, and into `SKILL.md` only when the outline
@@ -284,7 +284,7 @@ timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` 
   itself, and a verdict says `✓ it ran as declared` or how it differed (interrupted, retargeted, stacked, slowed by
   dropped frames). A layer the app drives by hand each frame (SwiftUI on macOS, a display link) has nothing declared;
   the fit still speaks. Layers that move rigidly with one already described are folded into it.
-  Test: `node test/probe-feel-e2e.mjs` (the `springy.swift` fixture with the probe loaded; takes the real input lock).
+  Test: `bun test/probe-feel-e2e.mjs` (the `springy.swift` fixture with the probe loaded; takes the real input lock).
 - **When the in-between was never shown.** A layer that covers a large part of its way in one step is not fitted:
   the report says `moved by: cannot be told`, the step, how long it had gone without an update, and the main-thread
   block that swallowed those positions (function included). The screen reading refuses the same way when over 40% of
@@ -297,7 +297,7 @@ timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` 
   screen changed first`, or `yet the app reported a change` when nothing visible answered. A run in which the steps
   changed the screen and the app said nothing is flagged: assistive technology was not told. `events:false` on
   `eye_drive` does not attach the observer; fps on the fixture reads the same with and without it.
-  Test: `node test/said-e2e.mjs` (the fixture changes a value in its action and announces 200ms later; both are
+  Test: `bun test/said-e2e.mjs` (the fixture changes a value in its action and announces 200ms later; both are
   200ms gap between them reads 207–208ms).
 - **Under the pixels.** A recording of an app also reads what no screen recording can, from four places. Two need
   no root and are always on:
@@ -336,7 +336,7 @@ timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` 
 - **Recorded alone.** A session on an app's window captures only the target app's windows,
   over mid grey (`--only-pid` in the helper): what shows through a see-through overlay window, or sits over the app,
   is not measured as its motion. `isolate:false` records the screen as it is (the default for a `rect`).
-  Test against the real thing: `node test/nootch-see.mjs` (hover, open, at rest, close on NOOTCH!-Dev, probe loaded).
+  Test against the real thing: `bun test/nootch-see.mjs` (hover, open, at rest, close on NOOTCH!-Dev, probe loaded).
 - **Main-thread watchdog (the "why").** While a probe recording runs, a run-loop observer on the app's main thread
   marks the start and end of every turn, and a watcher thread polls that mark every 3ms. A turn longer than 1.25
   display frames is a *stall*: while it lasts the watcher samples the main thread's stack (suspend → walk frame
@@ -356,8 +356,8 @@ timestamped on the same mach clock as `frames.csv`. A rect, `match` and `watch` 
   backdrops) can still lag on screen. The session records the screen at the same moment and aligns the probe report to it.
   Probe rows that update every frame alongside a capture that doesn't change point at the window server.
 
-Tests: `node test/probe-feel-e2e.mjs` (the fixture), `node test/nootch-see.mjs ['<process>']` and
-`node test/probe-cost.mjs '<process>'` (a real debuggable app).
+Tests: `bun test/probe-feel-e2e.mjs` (the fixture), `bun test/nootch-see.mjs ['<process>']` and
+`bun test/probe-cost.mjs '<process>'` (a real debuggable app).
 
 Coordinates are **display-local points, top-left origin**. Runs are stored in `~/Library/Caches/the-eye/runs/<time>_<label>/`
 (`frames.csv`, `frames.csv.meta.json`, `cursor.csv`, `hover.jsonl`, `ax_tree_start.*`, `actions.jsonl`, `stalls.json` when a probe ran, `keyframes/`). Override the location with `THE_EYE_DIR`.
@@ -381,7 +381,7 @@ the element under it.
 `eye_status` reads the same file for the open session. For a stream instead of a question there is a CLI:
 
 ```
-$ the-eye live                      # = node src/index.ts live [--run DIR] [--seconds N] [--until moving|still]
+$ the-eye live                      # = bun src/index.ts live [--run DIR] [--seconds N] [--until moving|still]
 3.20s MOVING
 3.95s still · moved 0.75s · 88 new frames (117 fps) · worst gap 9ms
 5.10s HITCH · a gap of 58ms in the last second (3 hitches)
@@ -675,7 +675,7 @@ another SCK screenshot, and occasional for `SCScreenshotManager`. Every helper c
   before it puts the window back
 - the server never uses `spawnSync` for helpers. Stopping escalates SIGTERM → SIGKILL, and a wedged input actor is killed and respawned.
 
-Regression test: `node test/stop-hang.mjs [rounds]`.
+Regression test: `bun test/stop-hang.mjs [rounds]`.
 
 Recordings started back to back sometimes get a spurious TCC refusal ("The user declined TCCs…") that sticks to the
 helper process, so retrying inside it doesn't help. `eye_drive` starts a fresh helper (up to 3 tries, 0.7s/1.4s
@@ -683,23 +683,23 @@ apart) and says so in its result ("capture retried 1×…"); only the third refu
 
 ## Install
 
-Requires macOS 14+, Node ≥ 23.6 (it runs the TypeScript directly) and Xcode command-line tools (`swiftc`).
-The native helper builds automatically on first start, or manually with `npm run build:native`.
+Requires macOS 14+, [Bun](https://bun.sh) ≥ 1.2 (it runs the TypeScript directly) and Xcode command-line tools (`swiftc`).
+The native helper builds automatically on first start, or manually with `bun run build:native`.
 
 ```sh
-cd the-eye && npm install
+cd the-eye && bun install
 ```
 
 OpenCode (`opencode.jsonc`):
 
 ```jsonc
 "mcp": { "servers": {
-  "the-eye": { "type": "local", "command": ["node", "/path/to/the-eye/src/index.ts"],
+  "the-eye": { "type": "local", "command": ["bun", "/path/to/the-eye/src/index.ts"],
                "timeout": { "execution": 660000 } }
 } }
 ```
 
-Claude Code: `claude mcp add the-eye -- node /path/to/the-eye/src/index.ts`
+Claude Code: `claude mcp add the-eye -- bun /path/to/the-eye/src/index.ts`
 
 Or as a plugin, which brings the server and the manual as a skill (`the-eye:the-eye`) together:
 
@@ -708,7 +708,7 @@ Or as a plugin, which brings the server and the manual as a skill (`the-eye:the-
 /plugin install the-eye@the-eye
 ```
 
-The plugin's copy runs `npm install` by itself on its first start. From a checkout: `claude --plugin-dir .`. Use one
+The plugin's copy runs `bun install` by itself on its first start. From a checkout: `claude --plugin-dir .`. Use one
 or the other, not both: two servers would queue behind each other.
 
 **Permissions:** the host app (terminal or agent) needs **Screen Recording** for capture and **Accessibility** for
@@ -717,12 +717,14 @@ the input lock.
 ## The show-off page
 
 ```
-npm run show-off
+bun run show-off
 ```
 
 Serves `show-off/` on http://localhost:4173 and opens it (`SHOW_OFF_OPEN=0` to not open, `PORT` to move it). The page
 logs its own frames and reports on itself, fits a puck you fling with `src/physics.ts`, reads a corner you draw with
-`src/still.ts`, and replays one real recording with the report it produced. No build step, no dependencies; design
+`src/still.ts`, and replays one real recording with the report it produced. It is also a website the eye can be
+pointed at: its "Websites too" section carries the call (`eye_drive {url:"localhost:4173", …}`) and says, from
+`window.__eye`, whether the eye's page probe is inside it right now. No build step, no dependencies; design
 notes are in `show-off/MASTER.md`.
 
 ## Example
@@ -733,4 +735,4 @@ eye_drive  { rect: {x:356,y:0,w:800,h:300}, command: "./drive full", label: "tim
 eye_report { runs: [{csv: ".../frames.csv", label: "baseline"}, {csv: ".../frames.csv", label: "timer-on"}] }
 ```
 
-Tests: `node test/smoke.mjs` (all non-interactive tools), `node test/guide.mjs` (the manual: the size of what is sent on connect, every chapter, a wing that cannot be read), `node test/ax.mjs` (AX hover/tree path; never moves the pointer), `node test/notice.mjs` (what a viewer would notice, on synthetic recordings), `node test/why-e2e.mjs` (drive → see → why on a fixture app; takes the input lock).
+Tests: `bun test/smoke.mjs` (all non-interactive tools), `bun test/guide.mjs` (the manual: the size of what is sent on connect, every chapter, a wing that cannot be read), `bun test/ax.mjs` (AX hover/tree path; never moves the pointer), `bun test/notice.mjs` (what a viewer would notice, on synthetic recordings), `bun test/why-e2e.mjs` (drive → see → why on a fixture app; takes the input lock).

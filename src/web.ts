@@ -1,4 +1,4 @@
-// Websites: a dedicated Chromium-family browser, driven over the DevTools protocol (CDP, Node's own WebSocket), with
+// Websites: a dedicated Chromium-family browser, driven over the DevTools protocol (CDP, the runtime's own WebSocket), with
 // renderer accessibility forced on so the Swift hand, the AX tree and the window capture work on web content as they
 // do on any app. Inside each document of the session's tab runs src/eye-page.js, the web twin of EyeProbe: every
 // animation frame's element geometry, the CSS / Web Animations the page declared, long animation frames with the
@@ -9,6 +9,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileS
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { dlopen } from "bun:ffi";
 import { analyzeProbe, cssBezier } from "./probe.ts";
 import type { Stall, Stalls } from "./notice.ts";
 
@@ -122,7 +123,7 @@ class Cdp {
   static open(url: string, ms = 5000): Promise<Cdp> {
     return new Promise((res, rej) => {
       const c = new Cdp(), WS = (globalThis as any).WebSocket;
-      if (!WS) { rej(new Error("this Node has no global WebSocket (needs Node 22+)")); return; }
+      if (!WS) { rej(new Error("this runtime has no global WebSocket")); return; }
       const ws = new WS(url);
       c.ws = ws;
       const timer = setTimeout(() => { try { ws.close(); } catch { /* */ } rej(new Error(`DevTools connection to ${url} timed out`)); }, ms);
@@ -427,8 +428,11 @@ type Probe = {
   els: Map<number, Rec>; dropped: number; watched: any[]; seenLs: number; seenEv: number; hz: number;
 };
 let probe: Probe | null = null;
-// Wall ms → mach seconds: Node's hrtime is mach_absolute_time on macOS, the clock the capture and EyeProbe use.
-const machOffset = () => Number(process.hrtime.bigint()) / 1e9 - Date.now() / 1000;
+// Wall ms → mach seconds, the clock the capture and EyeProbe use. Bun's process.hrtime counts from the start of the
+// process (Node's was mach_absolute_time), so the system is asked: CLOCK_UPTIME_RAW is mach_absolute_time in ns.
+const CLOCK_UPTIME_RAW = 8;
+const libSystem = dlopen("libSystem.B.dylib", { clock_gettime_nsec_np: { args: ["i32"], returns: "u64" } }).symbols;
+const machOffset = () => Number(libSystem.clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1e9 - Date.now() / 1000;
 const sources = new Map<string, string | null>();
 function fetchSource(url: string) {
   if (!url || sources.has(url)) return;

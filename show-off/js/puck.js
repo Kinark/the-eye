@@ -106,7 +106,7 @@ export function puck() {
     out.push(p(`  fitted off the main thread in ${data.ms < 10 ? data.ms.toFixed(1) : Math.round(data.ms)}ms, from ${data.frames} frames`, "dim"));
     fitted.replaceChildren(...out);
   };
-  worker.onerror = () => { fitted.textContent = "The fitter did not load. Is the page served by npm run show-off?"; };
+  worker.onerror = () => { fitted.textContent = "The fitter did not load. Is the page served by bun run show-off?"; };
 
   onFrame((now, dt) => {
     const f = flight;

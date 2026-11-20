@@ -76,6 +76,7 @@ export function hero() {
       + (n === 0 ? "It never froze." : `It froze ${n === 1 ? "once" : `${n} times`}, and was caught ${n === 1 ? "" : "every time"}.`.replace(" .", "."))
       + ` You watched for ${span(now - seen.since - seen.shutMs)}`
       + (seen.scrolled >= 1 ? ` and scrolled ${Math.round(seen.scrolled).toLocaleString("en-US")}pt.` : ".")
-      + (seen.shut ? ` The eye was shut ${seen.shut === 1 ? "once" : `${seen.shut} times`}, ${span(seen.shutMs)} in all, and judged none of it.` : "");
+      + (seen.shut ? ` The eye was shut ${seen.shut === 1 ? "once" : `${seen.shut} times`}, ${span(seen.shutMs)} in all, and judged none of it.` : "")
+      + (seen.outside >= 1000 ? ` the-eye itself watched ${span(seen.outside)} of it from outside.` : "");
   });
 }

@@ -1,4 +1,4 @@
-// node test/question.mjs — question mode. **Takes the real input lock** for about fifteen seconds in all.
+// bun test/question.mjs — question mode. **Takes the real input lock** for about fifteen seconds in all.
 // 1. ask.ts on its own: what Nope / Yep / Mi casa su casa and a timeout mean for the rest of the session.
 // 2. The helper: the first 175ms are deaf, arrows move the highlight, return takes it, Esc is Nope, time runs out on
 //    the highlighted button, and a question can be put over a lock that is already held.
@@ -50,7 +50,7 @@ for down in [true, false] { CGEvent(keyboardEventSource: nil, virtualKey: code, 
 `);
 const b = spawnSync("swiftc", ["-O", src, "-o", key], { encoding: "utf8" });
 if (b.status !== 0) { console.error(b.stderr); process.exit(1); }
-spawnSync("node", ["-e", "0"]); // warm
+spawnSync(process.execPath, ["-e", "0"]); // warm
 const press = (code) => spawnSync(key, [String(code)]);
 const RET = 36, ESC = 53, LEFT = 123, RIGHT = 124;
 
@@ -119,7 +119,7 @@ const answered = async (o, ms = 1500) => { for (let i = 0; i < ms / 20 && !o.ans
 
 // ---- 3. the server
 const client = new Client({ name: "question-test", version: "0" });
-await client.connect(new StdioClientTransport({ command: "node", args: [join(ROOT, "src", "index.ts")], env: { ...process.env, THE_EYE_ASK: "" } }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(ROOT, "src", "index.ts")], env: { ...process.env, THE_EYE_ASK: "" } }));
 const t0 = Date.now();
 const r = await client.callTool({ name: "eye_drive", arguments: { ask: "the-eye test: leave this one alone, it answers itself" } });
 const t = r.content?.[0]?.text ?? "";

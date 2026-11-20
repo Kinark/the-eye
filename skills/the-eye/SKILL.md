@@ -32,6 +32,6 @@ READING A REPLY. WHAT IT LOOKED LIKE opens with a verdict (SMOOTH · MOSTLY SMOO
 
 ONE AT A TIME. One agent session drives the screen: if another is mid-turn, your call waits in a queue and then runs; don't retry or sleep. If several copies or builds of the app run, eye_drive stops with the list and the choices (duplicates).
 
-WAITING: don't poll. `node ${CLAUDE_SKILL_DIR}/../../src/index.ts watch` prints one line per UI event (windows, sheets, dialogs with their text and [buttons], titles, announcements; --app NAME, --until "TEXT" --seconds N exits on the first match, 124 if none). `node ${CLAUDE_SKILL_DIR}/../../src/index.ts live` prints one line each time the recorded screen starts moving, comes to rest or hitches. Stream either with your Monitor tool, or run it in the background.
+WAITING: don't poll. `bun ${CLAUDE_SKILL_DIR}/../../src/index.ts watch` prints one line per UI event (windows, sheets, dialogs with their text and [buttons], titles, announcements; --app NAME, --until "TEXT" --seconds N exits on the first match, 124 if none). `bun ${CLAUDE_SKILL_DIR}/../../src/index.ts live` prints one line each time the recorded screen starts moving, comes to rest or hitches. Stream either with your Monitor tool, or run it in the background.
 
 Coordinates are POINTS, top-left origin. The host app needs Screen Recording and Accessibility permission.

@@ -1,4 +1,4 @@
-// node test/web-e2e.mjs — a website through the real session: eye_drive {url} opens test/fixtures/page.html (served over
+// bun test/web-e2e.mjs — a website through the real session: eye_drive {url} opens test/fixtures/page.html (served over
 // http like a dev server) in the eye's own browser, the real hand presses things found IN THE PAGE (el:"…" tap), types
 // into a field, and the reply must carry what the page did and said: the CSS transition as declared and as it ran, the
 // script that blocked the main thread by name, the console error and the exception, the typed value.
@@ -18,7 +18,7 @@ await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const url = `http://127.0.0.1:${server.address().port}/`;
 
 const client = new Client({ name: "web-e2e", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [join(ROOT, "src", "index.ts")] }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(ROOT, "src", "index.ts")] }));
 const call = async (name, args) => {
   const t0 = Date.now();
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 180_000 });

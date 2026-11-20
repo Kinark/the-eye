@@ -1,4 +1,4 @@
-// node test/why-e2e.mjs [jank_ms] — the whole loop on a real screen: act, see, and be told why.
+// bun test/why-e2e.mjs [jank_ms] — the whole loop on a real screen: act, see, and be told why.
 // Builds test/fixtures/janky.swift as a debuggable app (ad-hoc signed, get-task-allow) and presses its button by
 // name in ONE eye_drive call (the probe goes in by itself, the window is recorded, the session ends) and checks
 // that the reply names the freeze AND the function that blocked the main thread.
@@ -27,7 +27,7 @@ sh("codesign", ["-f", "-s", "-", "--entitlements", ent, appDir]);
 
 const app = spawn(exe, [], { stdio: "ignore", env: { ...process.env, JANK_MS: jank } });
 const client = new Client({ name: "why-e2e", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [join(ROOT, "src", "index.ts")], env: process.env }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(ROOT, "src", "index.ts")], env: process.env }));
 const call = async (name, args) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 120_000 });
   const t = r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");

@@ -1,4 +1,4 @@
-// node test/gestures.mjs — the input actor's trackpad ops (pinch, rotate, smart_zoom, swipe, scroll momentum, press,
+// bun test/gestures.mjs — the input actor's trackpad ops (pinch, rotate, smart_zoom, swipe, scroll momentum, press,
 // force_click) checked against what AppKit actually hands a view, through the real event path. Holds the eye's input lock
 // for the whole run (3·2·1 countdown first; Esc ×6 releases it), so your own trackpad/keyboard can't interfere.
 import { spawn, spawnSync } from "node:child_process";

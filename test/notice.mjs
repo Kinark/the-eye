@@ -1,4 +1,4 @@
-// node test/notice.mjs — the perception layer on synthetic recordings (no screen, no input). Each case writes a
+// bun test/notice.mjs — the perception layer on synthetic recordings (no screen, no input). Each case writes a
 // frames.csv the way eye-capture would and checks what a viewer is told they would have noticed.
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

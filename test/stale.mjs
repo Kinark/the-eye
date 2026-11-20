@@ -1,4 +1,4 @@
-// node test/stale.mjs: stale copies of a build are quit by the server itself, never left running unnoticed.
+// bun test/stale.mjs: stale copies of a build are quit by the server itself, never left running unnoticed.
 // Uses window-less dummy .app bundles (a sleeping binary) under a fake DerivedData folder, so it touches no screen or input.
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";

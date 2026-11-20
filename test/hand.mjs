@@ -1,4 +1,4 @@
-// node test/hand.mjs — the hand that plays by itself (`fingers play`) and what must stop it, checked at the helper:
+// bun test/hand.mjs — the hand that plays by itself (`fingers play`) and what must stop it, checked at the helper:
 // `eye-capture input` driven directly over a panel that logs the scroll events AppKit hands it, with a made-up live
 // file in place of a recording (so the test decides what the hand "sees"). Checks: play lands and keeps moving; a pop
 // (the screen jumping when the fingers did nothing new) is noticed and crossed again; the fingers lift when the eye

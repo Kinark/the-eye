@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>the-eye: it watches every refresh</title>
 <link id="icon" rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='15' fill='%23808080'/%3E%3Ccircle cx='16' cy='16' r='6.5' fill='%230B0B0C'/%3E%3C/svg%3E">
-<meta name="description" content="the-eye is a macOS MCP server that lets an agent measure what a screen actually showed. This page measures itself the same way.">
+<meta name="description" content="the-eye is a macOS MCP server that lets an agent measure what a screen actually showed, in an app or on a web page. This page measures itself the same way, and knows when the eye is watching it.">
 <meta name="color-scheme" content="dark">
 <link rel="stylesheet" href="/style.css">
 <script type="module" src="/js/main.js"></script>
@@ -134,6 +134,38 @@
   </div>
 </section>
 
+<section class="web" aria-labelledby="h-web">
+  <div class="intro">
+    <h2 id="h-web">Websites too.<br>Start with this one.</h2>
+    <p>Everything above is this page timing itself, from inside. the-eye does the real thing to a web page now. It opens the address in a browser of its own, records that window at every refresh, presses things by the name the page gives them, and puts a probe inside. This page is already being served, so one call is all it takes.</p>
+  </div>
+
+  <article class="self" data-squircle="40" aria-labelledby="t-outside">
+    <div class="self-call">
+      <pre class="call" data-squircle="28"><code id="self-call">eye_drive {
+  url: "localhost:4173",
+  wing: 'el:"Send it across" tap settle',
+  end: true
+}</code></pre>
+      <button id="self-copy" class="btn quiet" data-squircle="14" data-tilt>Copy the call</button>
+    </div>
+    <div class="readout">
+      <h3 class="label">from inside, by this page</h3>
+      <p id="inside" class="report">measuring</p>
+      <h3 id="t-outside" class="label">from outside, by the-eye</h3>
+      <div id="outside" class="report"></div>
+      <p id="outside-said" class="sr" role="status" aria-live="polite"></p>
+    </div>
+    <ul class="unasked" aria-label="What a website session adds">
+      <li><strong>A browser of its own.</strong> Chrome for Testing, Chromium, Chrome, Brave or Edge, on a profile it keeps between sessions. Never your everyday one.</li>
+      <li><strong>Things by their name.</strong> <code>el:"Send it across"</code> is that button's text. A CSS selector works too. The hand waits until the thing is visible, enabled, uncovered and at rest.</li>
+      <li><strong>A freeze names its script.</strong> The function that held the main thread, with its file and line, from the browser's own long-frame timing.</li>
+      <li><strong>Declared against drawn.</strong> Each CSS transition, CSS animation and Web Animation is quoted as the page declared it, fitted on the frames it really got, and checked.</li>
+    </ul>
+  </article>
+  <p class="fine">Only Chromium-family browsers can be driven: Safari and Firefox have no DevTools protocol the eye can use. While the hand moves, your trackpad and keyboard are held. <kbd data-key="Escape">Esc</kbd> six times in a row gives them back.</p>
+</section>
+
 <section class="tools" aria-labelledby="h-tools">
   <div class="intro">
     <h2 id="h-tools">Five tools.<br>One of them acts.</h2>
@@ -144,8 +176,8 @@
     <div class="drive-copy">
       <h3 id="t-drive"><code>eye_drive</code></h3>
       <p class="say">A hand, an eye and a witness inside the app, in one call.</p>
-      <p>It opens one session on your app. The window is recorded at every display refresh. Your trackpad and keyboard are held, so nothing collides with the hand. In a Debug build a probe goes inside and logs every layer on the same clock as the frames.</p>
-      <p>Then you say where to go. A line of words is one unbroken motion at 120Hz, and things are called by their names. The hand presses a thing only if that thing is what is under the pointer.</p>
+      <p>It opens one session on your app, or on a web page. The window is recorded at every display refresh. Your trackpad and keyboard are held, so nothing collides with the hand. In a Debug build a probe goes inside and logs every layer on the same clock as the frames.</p>
+      <p>Then you say where to go. A line of words is one unbroken motion at 120Hz, and things are called by their names. The hand presses a thing only if that thing is what is under the pointer. Two fingers can stay down on the trackpad between calls: a stroke, a flick, or the hand playing by itself.</p>
       <p>End it, and it answers with what a viewer would have noticed, worst first: the freeze, how long it lasted, and the function that was blocking the main thread.</p>
     </div>
     <div class="drive-calls">
@@ -160,6 +192,12 @@ eye_drive { steps: [
   { op: "scroll", dy: -400, momentum: true },
   { op: "wait_until", expr: "!moving" }
 ] }
+
+<span class="dim">// a website instead of an app</span>
+eye_drive {
+  url: "localhost:3000",
+  wing: 'el:"Sign in" tap  settle'
+}
 
 <span class="dim">// only watch: no hand, input stays yours</span>
 eye_drive { app: "YourApp", hands: false }
@@ -193,15 +231,43 @@ eye_drive { end: true }</code></pre>
       <dd>Displays and their refresh rates, who holds the screen, and the open session live: moving or still, how far, and what a viewer noticed in the last few seconds.</dd>
     </div>
   </dl>
+
+  <div class="manual">
+    <div class="manual-copy">
+      <h3><code>eye_drive { guide: "wing" }</code><span class="say">The manual comes a chapter at a time.</span></h3>
+      <p>Every agent that has the server connected pays for a tool's description, used or not. So the descriptions are an outline, and the text that explains a part arrives when that part is used. A call with <code>guide</code> returns one chapter and does nothing else: no session, no lock, no queue.</p>
+      <p>On connect the server used to send 43,204 characters. It sends about 24,400 now.</p>
+    </div>
+    <div class="manual-list">
+      <h4 class="label">the chapters, and what each costs to read, in characters</h4>
+      <ul id="chapters" class="chapters">
+        <li><code>wing</code><span>every word of a wing, and what the hand refuses to do</span><span class="num" data-chapter="wing"></span></li>
+        <li><code>fingers</code><span>two fingers on the trackpad</span><span class="num" data-chapter="fingers"></span></li>
+        <li><code>steps</code><span>exact steps, gestures, Force Touch</span><span class="num" data-chapter="steps"></span></li>
+        <li><code>web</code><span>websites, and the probe inside the page</span><span class="num" data-chapter="web"></span></li>
+        <li><code>reply</code><span>how to read a reply, line by line</span><span class="num" data-chapter="reply"></span></li>
+        <li><code>session</code><span>the lock, who drives, the queue</span><span class="num" data-chapter="session"></span></li>
+        <li><code>measure</code><span>the probe, A/B, Instruments</span><span class="num" data-chapter="measure"></span></li>
+      </ul>
+    </div>
+  </div>
 </section>
 
 <section class="install" aria-labelledby="h-install">
   <h2 id="h-install">Put it under your agent.</h2>
+  <form id="how" class="how" aria-label="How to install it">
+    <fieldset class="segmented">
+      <legend class="label">install it as</legend>
+      <label><input type="radio" name="how" value="server" checked><span data-squircle="12">an MCP server</span></label>
+      <label><input type="radio" name="how" value="plugin"><span data-squircle="12">a Claude Code plugin</span></label>
+    </fieldset>
+  </form>
   <div class="cmd" data-squircle="28">
-    <code id="cmd-text">claude mcp add the-eye -- node src/index.ts</code>
+    <code id="cmd-text">claude mcp add the-eye -- bun src/index.ts</code>
     <button id="copy" class="btn" data-squircle="14" data-tilt>Copy</button>
   </div>
-  <p class="fine">Needs macOS 14 or later, Node 23.6 or later, and the Xcode command-line tools. The terminal or agent that runs it needs Screen Recording and Accessibility permission. The native helper builds itself on first start.</p>
+  <p id="cmd-note" class="fine" role="status" aria-live="polite">Runs this checkout. The manual's outline reaches the agent as the server's instructions.</p>
+  <p class="fine">Needs macOS 14 or later, Bun 1.2 or later, and the Xcode command-line tools. The terminal or agent that runs it needs Screen Recording and Accessibility permission. The native helper builds itself on first start.</p>
 </section>
 
 </main>

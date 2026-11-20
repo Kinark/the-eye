@@ -1,4 +1,4 @@
-// node test/queue.mjs — two/three the-eye servers sharing a private lease dir: queued calls wait their turn and
+// bun test/queue.mjs — two/three the-eye servers sharing a private lease dir: queued calls wait their turn and
 // return their real result; an idle holder hands over at once; FIFO order; capped waits keep their place.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -10,7 +10,7 @@ const dir = mkdtempSync(join(tmpdir(), "eye-queue-"));
 const server = async (name, env = {}) => {
   const c = new Client({ name, version: "1" });
   await c.connect(new StdioClientTransport({
-    command: "node", args: [new URL("../src/index.ts", import.meta.url).pathname],
+    command: process.execPath, args: [new URL("../src/index.ts", import.meta.url).pathname],
     env: { ...process.env, THE_EYE_LEASE_DIR: dir, ...env },
   }));
   return c;

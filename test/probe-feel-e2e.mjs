@@ -1,4 +1,4 @@
-// node test/probe-feel-e2e.mjs — what moved it, read from INSIDE the app.
+// bun test/probe-feel-e2e.mjs — what moved it, read from INSIDE the app.
 // Builds test/fixtures/springy.swift as a debuggable app, presses each button by name with eye_drive (the probe goes in by
 // itself) and checks that the probe's part of the reply names, per layer: the animation the code DECLARED (CASpringAnimation mass /
 // stiffness / damping, CABasicAnimation duration + timing function), the engine fitted to the exact presentation
@@ -26,7 +26,7 @@ sh("codesign", ["-f", "-s", "-", "--entitlements", ent, appDir]);
 
 const app = spawn(exe, [], { stdio: "ignore" });
 const client = new Client({ name: "probe-feel-e2e", version: "1" });
-await client.connect(new StdioClientTransport({ command: "node", args: [join(ROOT, "src", "index.ts")] }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(ROOT, "src", "index.ts")] }));
 const call = async (name, args) => {
   const r = await client.callTool({ name, arguments: args }, undefined, { timeout: 300_000 });
   const t = r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
