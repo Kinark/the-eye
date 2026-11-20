@@ -360,11 +360,11 @@ export function describeModel(m: Model, travel?: number): string {
   if (m.kind === "spring") {
     const name = SPRING_NAMES.find(([, b]) => Math.abs(b - m.bounce) <= 0.04);
     const swiftui = name ? `.${name[0]}(duration: ${n2(m.duration)})` : `.spring(duration: ${n2(m.duration)}, bounce: ${n2(m.bounce)})`;
-    return `a SPRING, damping ratio ${n2(m.zeta)}, response ${n2(m.duration)}s — in code: ${swiftui}, or stiffness ${Math.round(m.stiffness)} damping ${n2(m.damping)} at mass 1${Math.abs(m.v0) > 0.5 ? `, launched already moving (${n2(m.v0)}× its travel per second)` : ""}; ${feel(m.zeta)}`;
+    return `a SPRING, damping ratio ${n2(m.zeta)}, response ${n2(m.duration)}s — ${swiftui} · stiffness ${Math.round(m.stiffness)} damping ${n2(m.damping)}${Math.abs(m.v0) > 0.5 ? `, launched already moving (${n2(m.v0)}× its travel per second)` : ""}; ${feel(m.zeta).split(":")[0]}`;
   }
   if (m.kind === "curve") {
     const bez = `cubic-bezier(${m.p.map(n2).join(", ")})`;
-    return `a TIMING CURVE over ${msr(m.duration)}: ${m.preset ? `${m.preset}${m.preset === "linear" ? "" : ` = ${bez}`}` : bez}${m.preset === "linear" ? "; constant speed, no easing at all: mechanical" : "; a fixed duration, so it stops on a schedule rather than settling"}`;
+    return `a TIMING CURVE over ${msr(m.duration)}: ${m.preset ? `${m.preset}${m.preset === "linear" ? "" : ` = ${bez}`}` : bez}${m.preset === "linear" ? "; constant speed, no easing" : ""}`;
   }
   // Friction on a thing let go at speed (scroll momentum, a flick that coasts) draws exactly this curve: the
   // distance left shrinks by a fixed factor per unit of time.
@@ -375,10 +375,10 @@ export function describeModel(m: Model, travel?: number): string {
 /** One or two lines for a report: what moved it, how well that explains the frames, and what it did. */
 export function formatFit(f: MotionFit, o: { unit?: string; what?: string; from?: string } = {}): string[] {
   const unit = o.unit ?? "pt", abs = unit === "pt"; // only points mean something as an absolute size
-  const did = `settled ${Math.round(f.settle_ms)}ms after it began${f.overshoot_pct >= 1 ? `, overshot ${abs ? `${f.overshoot.toFixed(1)}pt (${f.overshoot_pct.toFixed(0)}%)` : `${f.overshoot_pct.toFixed(0)}% past its target`}` : ", no overshoot"}, fastest ${abs ? `${Math.round(f.peak_speed)}pt/s ` : ""}at ${Math.round(f.peak_at_pct)}% of the way through`;
-  if (!f.model) return [`moved by: nothing simple (best model misses by ${(100 * f.rms).toFixed(1)}% of the travel) — ${f.caveat}`, `  it ${did}${o.from ? ` · read from ${o.from}` : ""}`];
+  const did = `settled in ${Math.round(f.settle_ms)}ms${f.overshoot_pct >= 1 ? `, overshot ${abs ? `${f.overshoot.toFixed(1)}pt (${f.overshoot_pct.toFixed(0)}%)` : `${f.overshoot_pct.toFixed(0)}% past its target`}` : ", no overshoot"}, fastest ${abs ? `${Math.round(f.peak_speed)}pt/s ` : ""}at ${Math.round(f.peak_at_pct)}%`;
+  if (!f.model) return [`moved by: nothing simple (best model off by ${(100 * f.rms).toFixed(1)}%) — ${f.caveat}`, `  ${did}${o.from ? ` · from ${o.from}` : ""}`];
   const L = [`moved by: ${describeModel(f.model, abs ? f.travel : undefined)}`];
-  if (f.also) L.push(`  or equally: ${describeModel(f.also, abs ? f.travel : undefined)} (these frames cannot tell the two apart)`);
-  L.push(`  it ${did} · fit off by ${(100 * f.rms).toFixed(1)}% of the travel over ${f.frames} frames${o.from ? ` · read from ${o.from}` : ""}${f.caveat ? ` · ${f.caveat}` : ""}`);
+  if (f.also) L.push(`  or equally: ${describeModel(f.also, abs ? f.travel : undefined)}`);
+  L.push(`  ${did} · fit off by ${(100 * f.rms).toFixed(1)}% over ${f.frames} frames${o.from ? ` · from ${o.from}` : ""}${f.caveat ? ` · ${f.caveat}` : ""}`);
   return L;
 }

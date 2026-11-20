@@ -485,4 +485,4 @@ export async function quitPids(pids: number[]) { return quit(pids); }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const fmtAge = (s: number) => (s >= 3600 ? `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m` : s >= 60 ? `${Math.floor(s / 60)}m${s % 60}s` : `${s}s`);
 export const duplicatesSchemaDescription =
-  "What to do when the target app runs more than once, counting other builds of it (Dev/Release…). ask (default): stop and list them with the choices. quit_others: keep the target (pid you named, else newest launch), quit the rest. relaunch: quit them all and start the target's .app fresh (or app_path). allow: go ahead.";
+  "When the app runs more than once (other builds count). ask (default): stop and list them · quit_others: keep the target, quit the rest · relaunch: quit all, start fresh · allow: go ahead.";

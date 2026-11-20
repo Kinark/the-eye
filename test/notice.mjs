@@ -48,7 +48,7 @@ check("freeze", run("freeze", frozen), "rough", "FROZE 66.7ms (8 refreshes", "!w
 const hung = ease(60); hung[30].dt = 30;
 check("hang + cause", run("hang", hung, { "stalls.json": JSON.stringify({ name: "Demo", pid: 1, from: 990, to: 1100, threshold_ms: 10.4, stacks: true,
   stalls: [{ t: 1000 + 30 * P + 30 * P + 0.004, ms: 240, n: 20, app: [["Model.reload()", 18]], leaf: [["usleep [libsystem_c.dylib]", 20]], stack: ["usleep [libsystem_c.dylib]", "Model.reload()", "ContentView.body.getter"] }] }) }),
-  "broken", "HUNG 250ms", "why: Demo's main thread was blocked 240ms", "in app code: Model.reload() (90%)");
+  "broken", "HUNG 250ms", "why: main thread was blocked 240ms", "app: Model.reload() 90%");
 
 check("freeze, main thread free", run("offmain", frozen, { "stalls.json": JSON.stringify({ name: "Demo", pid: 1, from: 990, to: 1100, threshold_ms: 10.4, stacks: true, stalls: [] }) }),
   "rough", "main thread was free the whole time");
@@ -68,7 +68,7 @@ check("pop", run("pop", [{ w: 300, frac: 0.4, rest: 60 }]), "smooth", "NO ANIMAT
 
 const t0 = 5000 + 30 * P; // the motion starts on the first frame after the lead-in
 check("answers a click", run("click", ease(60), { "actions.jsonl": JSON.stringify({ wall0: t0 - 0.03, wall1: t0, op: "click", ok: true }) + "\n" }),
-  "smooth", "answered 38.3ms after click");
+  "smooth", "answered: 38.3ms click");
 check("lags after a click", run("lag", ease(60), { "actions.jsonl": JSON.stringify({ wall0: t0 - 0.4, wall1: t0 - 0.39, op: "click", ok: true }) + "\n" }),
   "rough", "LAGGED first visible change 408ms after click");
 

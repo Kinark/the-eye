@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { whyGap, type Stall, type Stalls } from "./notice.ts";
+import { sym, whyGap, type Stall, type Stalls } from "./notice.ts";
 import { CURVES, bezierValue, fitMotion, formatFit, type MotionFit, type Sample } from "./physics.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -167,7 +167,7 @@ function fmtEntry(e: any): string {
 }
 export function describeProbeLive(l: any, max = 8): string {
   if (!l) return "probe: (no live data yet)";
-  const lines = [`probe @${l.t.toFixed(1)}s · last ${l.window_s}s: ${l.ticks} ticks (${l.tick_hz.toFixed(0)}/s) · walk p50 ${l.walk_us_p50}µs max ${l.walk_us_max}µs · ${l.layers_tracked} layers · ${l.moving_count} moving${l.stalls ? ` · MAIN THREAD STALLED ${l.stalls}× so far (worst ${l.stall_worst_ms}ms)` : ""}`];
+  const lines = [`probe @${l.t.toFixed(1)}s · last ${l.window_s}s: ${l.ticks} ticks (${l.tick_hz.toFixed(0)}/s) · walk p50 ${l.walk_us_p50}µs max ${l.walk_us_max}µs · ${l.layers_tracked} ${l.web ? "elements" : "layers"} · ${l.moving_count} moving${l.stalls ? ` · MAIN THREAD STALLED ${l.stalls}× so far (worst ${l.stall_worst_ms}ms)` : ""}`];
   if (l.moving?.length) lines.push(` moving:`, ...l.moving.slice(0, max).map(fmtEntry));
   if (l.watched?.length) lines.push(` watched:`, ...l.watched.slice(0, max).map(fmtEntry));
   return lines.join("\n");
@@ -195,6 +195,7 @@ export function readStalls(file: string, name = "the app", pid = 0): Stalls | nu
   if (!head || head.stall_ms === undefined) return null; // recorded by a probe without the watchdog
   const short = (s: string) => s.replace(/\(.*?\)/g, "()").replace(/closure #\d+ in /g, "λ ").replace(/ -> .*$/, "").slice(0, 120);
   const stalls: Stall[] = [...raw.values()].sort((x, y) => x.t - y.t).map((h) => {
+    if (h.lines) return { t: h.t, ms: h.ms, n: 0, app: h.app ?? [], leaf: h.leaf ?? [], stack: [], lines: h.lines }; // the page probe: scripts, not stacks
     const app = new Map<string, number>(), leaf = new Map<string, number>(), whole = new Map<string, number>();
     for (const st of h.s as number[][]) {
       const f = st.map((i) => frames.get(i) ?? { s: "?", b: "?", a: 0 });
@@ -230,12 +231,13 @@ export function snapshotStalls(dir: string): Stalls | null {
   try { writeFileSync(join(dir, "stalls.json"), JSON.stringify(st)); } catch { /* run dir gone */ }
   return st;
 }
-function stallSection(st: Stalls | null, t0: number, top: number): string[] {
+function stallSection(st: Stalls | null, t0: number, top: number, web = false, brief = false): string[] {
   if (!st) return [];
-  if (!st.stalls.length) return [`main thread: no run-loop turn over ${st.threshold_ms}ms — the app's main thread never held a frame back`];
+  if (!st.stalls.length) return [web ? `main thread: no animation frame over ${st.threshold_ms}ms — the page's main thread never held a frame back` : `main thread: no run-loop turn over ${st.threshold_ms}ms — the app's main thread never held a frame back`];
   const worst = [...st.stalls].sort((x, y) => y.ms - x.ms).slice(0, top);
+  if (brief) return [`main-thread stalls over ${st.threshold_ms}ms: ${st.stalls.length}, ${st.stalls.reduce((s, x) => s + x.ms, 0).toFixed(0)}ms in all · worst: ${worst.map((s) => { const f = s.app?.[0]?.[0] ?? s.leaf?.[0]?.[0]; return `${s.ms >= 100 ? s.ms.toFixed(0) : s.ms.toFixed(1)}ms at ${(s.t - t0).toFixed(2)}s${f ? ` in ${sym(f, 44)}` : ""}`; }).join(" · ")}${st.stalls.length > top ? ` · … ${st.stalls.length - top} more` : ""}`];
   return [
-    `main-thread stalls (run-loop turns over ${st.threshold_ms}ms): ${st.stalls.length}, ${st.stalls.reduce((s, x) => s + x.ms, 0).toFixed(0)}ms in total · worst first:`,
+    `main-thread stalls (${web ? "long animation frames" : "run-loop turns"} over ${st.threshold_ms}ms): ${st.stalls.length}, ${st.stalls.reduce((s, x) => s + x.ms, 0).toFixed(0)}ms in total · worst first:`,
     ...worst.flatMap((s) => whyGap({ ...st, from: -Infinity, to: Infinity, stalls: [s] }, t0, s.t - t0, s.t - t0 + s.ms / 1000).map((l) => (l.startsWith(" ") ? `  ${l}` : `- ${l}`))),
     st.stalls.length > top ? `… ${st.stalls.length - top} more` : "",
   ];
@@ -287,11 +289,28 @@ const timing = (tf: number[] | null | undefined) => {
   return preset ? (preset[0] === "linear" ? "linear" : `${preset[0].split(" (")[0]} = ${bez}`) : bez;
 };
 
+const CSS_EASE: Record<string, number[]> = { linear: [0, 0, 1, 1], ease: [0.25, 0.1, 0.25, 1], "ease-in": [0.42, 0, 1, 1], "ease-out": [0, 0, 0.58, 1], "ease-in-out": [0.42, 0, 0.58, 1] };
+/** A CSS easing as its cubic Bézier; steps() and linear(…) are not one, so null. */
+export function cssBezier(easing: unknown): number[] | null {
+  const e = String(easing ?? "").trim().toLowerCase();
+  if (CSS_EASE[e]) return CSS_EASE[e];
+  const m = e.match(/^cubic-bezier\(\s*([-\d.e]+)\s*,\s*([-\d.e]+)\s*,\s*([-\d.e]+)\s*,\s*([-\d.e]+)\s*\)$/);
+  return m ? m.slice(1).map(Number) : null;
+}
+const CSS_KINDS = ["CSSTransition", "CSSAnimation", "Animation"];
+const isCss = (a: any) => CSS_KINDS.includes(a.cls);
+
 /** One Core Animation animation as the app declared it, in the words its code used. */
 export function describeDeclared(a: any): string {
   const on = a.kp ?? a.key ?? "?";
   const span = a.from !== null && a.from !== undefined && a.to !== null && a.to !== undefined ? ` ${shown(a.from)} → ${shown(a.to)}` : "";
   const extra = `${a.additive ? ", additive" : ""}${a.autoreverses ? ", autoreverses" : ""}${a.repeat ? `, repeats ${a.repeat === "forever" ? "forever" : `${r2(a.repeat)}×`}` : ""}${a.speed !== undefined && a.speed !== 1 ? `, speed ${r2(a.speed)}` : ""}`;
+  if (isCss(a)) {
+    const kind = a.cls === "CSSTransition" ? "CSS transition" : a.cls === "CSSAnimation" ? `CSS animation "${a.key}"` : "Web Animation";
+    const bez = cssBezier(a.easing), name = String(a.easing ?? "linear");
+    const curve = bez && !name.startsWith("cubic-bezier") && name !== "linear" ? `${name} = cubic-bezier(${bez.map(r2).join(", ")})` : name;
+    return `${kind} on ${on}${span}: ${r2(a.dur)}s ${curve}${a.delay ? `, ${r2(a.delay)}s delay` : ""}${a.stops > 2 ? `, ${a.stops} keyframes` : ""}${extra}${a.compositor ? " · on the compositor: it keeps moving while the main thread is blocked" : ""}`;
+  }
   if (a.cls === "CASpringAnimation" && a.mass > 0 && a.stiffness > 0) {
     const zeta = a.damping / (2 * Math.sqrt(a.stiffness * a.mass)), response = (2 * Math.PI) / Math.sqrt(a.stiffness / a.mass);
     return `CASpringAnimation on ${on}${span}: mass ${r2(a.mass)} stiffness ${r2(a.stiffness)} damping ${r2(a.damping)} = damping ratio ${r2(zeta)}, response ${r2(response)}s${a.v0 ? `, initial velocity ${r2(a.v0)}` : ""}; given ${r2(a.dur)}s to run${typeof a.settle === "number" && a.dur < a.settle * 0.8 ? ` — CUT SHORT: it needs ${r2(a.settle)}s to settle, so it snaps to the end` : ""}${extra}`;
@@ -310,7 +329,7 @@ export function declaredVerdict(fit: MotionFit, declared: any[]): string | null 
   const flat = declared.flatMap((a) => (a.cls === "CAAnimationGroup" ? a.group ?? [] : [a]));
   if (m.kind === "spring") {
     const s = flat.filter((a) => a.cls === "CASpringAnimation" && a.mass > 0 && a.stiffness > 0);
-    if (!s.length) return flat.some((a) => a.cls === "CABasicAnimation") ? "≠ the code declared a timed animation, yet it moved like a spring: something else is driving this layer too" : null;
+    if (!s.length) return flat.some((a) => a.cls === "CABasicAnimation" || isCss(a)) ? "≠ the code declared a timed animation, yet it moved like a spring: something else is driving this layer too" : null;
     const off = s.map((a) => {
       const zeta = a.damping / (2 * Math.sqrt(a.stiffness * a.mass)), response = (2 * Math.PI) / Math.sqrt(a.stiffness / a.mass);
       return { dz: Math.abs(zeta - m.zeta), dr: Math.abs(response - m.duration) / response, zeta, response };
@@ -319,23 +338,25 @@ export function declaredVerdict(fit: MotionFit, declared: any[]): string | null 
       : `≠ declared damping ratio ${r2(off.zeta)} / response ${r2(off.response)}s, but it ran as ${r2(m.zeta)} / ${r2(m.duration)}s: interrupted, retargeted mid-flight, or stacked with another animation`;
   }
   if (m.kind === "curve") {
-    const c = flat.filter((a) => a.cls === "CABasicAnimation");
+    const c = flat.filter((a) => a.cls === "CABasicAnimation" || (isCss(a) && (a.stops ?? 2) <= 2 && (a.tf || cssBezier(a.easing))));
     if (!c.length) return null;
     const off = c.map((a) => {
-      const tf: number[] = a.tf ?? [0, 0, 1, 1];
+      const tf: number[] = a.tf ?? cssBezier(a.easing) ?? [0, 0, 1, 1];
       let shape = 0;
       for (let p = 0.1; p < 0.95; p += 0.1) shape = Math.max(shape, Math.abs(bezierValue(tf[0], tf[1], tf[2], tf[3], p) - bezierValue(m.p[0], m.p[1], m.p[2], m.p[3], p)));
       return { shape, dd: Math.abs(a.dur - m.duration) / a.dur, a };
     }).sort((p, q) => p.shape + p.dd - (q.shape + q.dd))[0];
     return off.shape <= 0.04 && off.dd <= 0.1 ? "✓ it ran as declared"
-      : `≠ declared ${r2(off.a.dur)}s ${timing(off.a.tf)}, but it ran over ${r2(m.duration)}s${off.shape > 0.04 ? " along a different curve" : ""}: interrupted, slowed by dropped frames, or stacked with another animation`;
+      : `≠ declared ${r2(off.a.dur)}s ${isCss(off.a) ? off.a.easing : timing(off.a.tf)}, but it ran over ${r2(m.duration)}s${off.shape > 0.04 ? " along a different curve" : ""}: interrupted, slowed by dropped frames, or stacked with another animation`;
   }
   return null;
 }
 
 // ---- offline analysis
 
-type Opts = { match?: string[]; from_s?: number; to_s?: number; top?: number; split_ms?: number; capture_csv?: string; layer_id?: number; max_rows?: number; name?: string };
+type Opts = { match?: string[]; from_s?: number; to_s?: number; top?: number; split_ms?: number; capture_csv?: string; layer_id?: number; max_rows?: number; name?: string; web?: boolean;
+  /** The end of a session: one line per stall (their stacks are already under the freezes), one line per motion. */
+  brief?: boolean };
 
 export function analyzeProbe(file: string, o: Opts = {}): string {
   const lines = readFileSync(file, "utf8").split("\n");
@@ -438,7 +459,7 @@ export function analyzeProbe(file: string, o: Opts = {}): string {
     }
     if (!seen.size) return [];
     const rows = [...seen.values()].sort((p, q) => p.first - q.first);
-    return ["", `declared by the app's code (Core Animation animations found on layers as they changed): ${rows.length}`,
+    return [o.web ? `declared by the page (CSS transitions / animations, Web Animations): ${rows.length}` : `declared by the app's code (Core Animation animations on layers): ${rows.length}`,
       ...rows.slice(0, 12).map((r) => `  ${rel(r.first)}s ${r.line}${r.n > 1 ? ` · started ${r.n}×` : ""}`),
       rows.length > 12 ? `  … ${rows.length - 12} more` : ""];
   };
@@ -458,9 +479,9 @@ export function analyzeProbe(file: string, o: Opts = {}): string {
     const hit = hits[0], blocked = hits.reduce((t, h) => t + h.ms, 0);
     const unit = ser.channel === 4 ? "" : "pt";
     return [
-      `moved by: cannot be told — its ${CHANNELS[ser.channel]} went ${r2(x[k - 1].x)} → ${r2(x[k].x)}${unit} in ONE step at ${rel(x[k].t)}s (${Math.round((100 * Math.abs(step)) / span)}% of the way, ${Math.round(gap * 1000)}ms after its previous update); the animation's in-between positions were never shown`,
-      hit ? `  the app's main thread was blocked ${hits.length > 1 ? `${hits.length}× for ${blocked.toFixed(0)}ms around that gap, longest ` : ""}${hit.ms.toFixed(1)}ms from ${rel(hit.t)}s${hit.app.length ? ` in ${hit.app[0][0]}` : hit.leaf.length ? ` in ${hit.leaf[0][0]}` : ""}: that is where those positions went`
-        : `  ${seg.n} updates over ${Math.round((lastChange - x[0].t) * 1000)}ms: the app set it there in one go (no animation on this value), or its frames were dropped`,
+      `moved by: cannot be told — ${CHANNELS[ser.channel]} went ${r2(x[k - 1].x)}→${r2(x[k].x)}${unit} in ONE step at ${rel(x[k].t)}s (${Math.round((100 * Math.abs(step)) / span)}% of the way, ${Math.round(gap * 1000)}ms after its previous update): the in-between positions were never shown`,
+      hit ? `  the ${o.web ? "page" : "app"}'s main thread was blocked ${hits.length > 1 ? `${hits.length}× for ${blocked.toFixed(0)}ms around that gap, longest ` : ""}${hit.ms.toFixed(1)}ms from ${rel(hit.t)}s${hit.app.length ? ` in ${sym(hit.app[0][0], 48)}` : hit.leaf.length ? ` in ${sym(hit.leaf[0][0], 48)}` : ""}: that is where they went`
+        : `  ${seg.n} updates over ${Math.round((lastChange - x[0].t) * 1000)}ms: set in one go (no animation on this value), or its frames were dropped`,
     ];
   };
   const why = (s: any): string => {
@@ -470,7 +491,7 @@ export function analyzeProbe(file: string, o: Opts = {}): string {
       const declared = (anims.get(s.id) ?? []).filter((a) => a.t >= seg.a - 0.05 && a.t <= seg.b + 1e-6);
       const ser = segmentSeries(s.chs, seg, tickTimes, hz);
       const fit = ser ? fitMotion(ser.samples, 1 / hz, { cut: ser.cut, res: ser.channel === 4 ? 0.004 : 0.01 }) : null;
-      const shownAs = { unit: ser?.channel === 4 ? " (opacity)" : "pt", from: `the layer's own ${CHANNELS[ser?.channel ?? 0]} inside the app, exact, every display tick` };
+      const shownAs = { unit: ser?.channel === 4 ? " (opacity)" : "pt", from: `the ${o.web ? "element" : "layer"}'s own ${CHANNELS[ser?.channel ?? 0]}` };
       const verdict = fit && declared.length ? declaredVerdict(fit, declared) : null;
       const body = [
         ...declared.map((a) => `declared: ${describeDeclared(a)}`),
@@ -481,24 +502,26 @@ export function analyzeProbe(file: string, o: Opts = {}): string {
       const key = `${seg.a.toFixed(3)}|${body.join("|")}`, first = told.get(key);
       if (first !== undefined) { L.push(`   ${rel(seg.a)}→${rel(seg.b)}s: moved exactly as #${first} did`); continue; }
       told.set(key, s.id);
-      L.push(`   ${rel(seg.a)}→${rel(seg.b)}s`, ...body.map((b) => `     ${b}`));
+      if (o.brief) L.push(`   ${rel(seg.a)}→${rel(seg.b)}s ${body.map((b) => b.trim()).join(" · ").replace(/^moved by: /, "")}`);
+      else L.push(`   ${rel(seg.a)}→${rel(seg.b)}s`, ...body.map((b) => `     ${b}`));
     }
     return L.length ? "\n" + L.join("\n") : "";
   };
   const out = [
-    `probe ${head.id} · pid ${head.pid} · display ${head.display} @${hz}Hz · t relative to ${align}${end ? ` · ended: ${end.reason}` : ""}`,
-    `ticks: ${tk.length} over ${span.toFixed(2)}s (${span ? (tk.length / span).toFixed(1) : 0}/s) · display-link gaps >1.5 frames: ${missed} · walk cost p50 ${pct(us, 0.5)}µs p95 ${pct(us, 0.95)}µs max ${us[us.length - 1] ?? 0}µs (runs on the app's main thread)`,
-    ...stallSection(stalls, t0, 5),
-    `layers seen: ${layers.size} · layers that moved: ${stats.length}${match.length ? ` (matching ${o.match!.join(", ")})` : ""}`,
-    "",
-    "coverage = frames this layer's geometry actually changed / display frames during its motion (100% = updated every frame).",
+    `${o.web ? `page probe ${head.id} · ${head.url ?? ""} · browser pid ${head.pid}` : `probe ${head.id} · pid ${head.pid} · display ${head.display}`} @${hz}Hz · t relative to ${align}${end ? ` · ended: ${end.reason}` : ""}`,
+    `ticks: ${tk.length} over ${span.toFixed(2)}s (${span ? (tk.length / span).toFixed(1) : 0}/s) · ${o.web ? "animation-frame" : "display-link"} gaps >1.5 frames: ${missed} · walk cost p50 ${pct(us, 0.5)}µs p95 ${pct(us, 0.95)}µs max ${us[us.length - 1] ?? 0}µs`,
+    ...stallSection(stalls, t0, 5, o.web, o.brief),
+    `${o.web ? "elements" : "layers"} seen: ${layers.size} · moved: ${stats.length}${match.length ? ` (matching ${o.match!.join(", ")})` : ""} · coverage = frames its geometry changed / display frames during its motion`,
     ...stats.slice(0, top).map((s) => {
       const segs = s.segs.filter((x: any) => x.n >= 2).map((x: any) => `${rel(x.a)}→${rel(x.b)}s`).slice(0, 4).join(", ");
-      return `#${s.id} ${s.label.slice(0, 100)}\n   ${s.updates} updates · ${s.cov === null ? "no sustained motion" : `coverage ${(s.cov * 100).toFixed(0)}% (${s.upd}/${s.frames})`} · max gap ${(s.gap * 1000).toFixed(1)}ms · travel ${s.travel.toFixed(1)}pt${s.shapeTravel ? ` · shape travel ${s.shapeTravel.toFixed(1)}pt` : ""}\n   motion ${segs || "-"} · now ${fmtRect(s.last.slice(0, 4))}${s.last[5] !== null && s.last[5] !== undefined ? ` · shape ${fmtRect(s.last.slice(5, 9))}` : ""}` + why(s);
+      const head1 = `#${s.id} ${s.label.slice(0, o.brief ? 60 : 100)}`;
+      const nums = `${s.updates} updates · ${s.cov === null ? "no sustained motion" : `coverage ${(s.cov * 100).toFixed(0)}% (${s.upd}/${s.frames})`} · max gap ${(s.gap * 1000).toFixed(o.brief ? 0 : 1)}ms · travel ${s.travel.toFixed(o.brief ? 0 : 1)}pt${s.shapeTravel ? ` · shape travel ${s.shapeTravel.toFixed(o.brief ? 0 : 1)}pt` : ""}`;
+      if (o.brief) return `${head1} · ${nums}` + why(s);
+      return `${head1}\n   ${nums}\n   motion ${segs || "-"} · now ${fmtRect(s.last.slice(0, 4))}${s.last[5] !== null && s.last[5] !== undefined ? ` · shape ${fmtRect(s.last.slice(5, 9))}` : ""}` + why(s);
     }),
     stats.length > top ? `… ${stats.length - top} more (raise top, or filter with match)` : "",
     ...declaredSection(),
-    `\nfile: ${file}`,
+    `file: ${file}`,
   ];
   return out.filter((x) => x !== "").join("\n");
 }
@@ -516,7 +539,7 @@ export function peekProbe(id?: string, max = 8): string | null {
   return `${r.id} "${r.label}" · ${((Date.now() - r.started) / 1000).toFixed(1)}s${ended}\n${describeProbeLive(liveOf(r), max)}`;
 }
 /** Stop probe recordings (one id, or every running one) and return their reports. */
-export async function stopProbes(runDir: (label?: string) => string, id?: string, o: { capture_csv?: string; match?: string[]; top?: number } = {}): Promise<string[]> {
+export async function stopProbes(runDir: (label?: string) => string, id?: string, o: { capture_csv?: string; match?: string[]; top?: number; brief?: boolean } = {}): Promise<string[]> {
   const list = id ? [runs.get(id)].filter(Boolean) as ProbeRun[] : [...runs.values()].filter((x) => !x.final);
   const out: string[] = [];
   for (const r of list) {
@@ -587,7 +610,7 @@ export async function startProbe(proc: string | number, p: ProbeOpts = {}, again
         return no(sip ? `lldb could not load it into ${t.name}${said ? ` (${said})` : ""}`
           : `${t.name} is not a debuggable build${t.foreign ? " and is signed by someone else" : ""}: with System Integrity Protection on, the probe goes only into Debug builds (get-task-allow)${said ? ` (${said})` : ""}`);
       }
-      loaded = ` (loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s, once per launch)`;
+      loaded = ` (loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s)`;
     }
     retireOthers(t, v);
     const id = `probe${++seq}_${Date.now().toString(36)}`;
@@ -600,7 +623,7 @@ export async function startProbe(proc: string | number, p: ProbeOpts = {}, again
     for (let i = 0; i < 20; i++) {
       await sleep(100);
       const s = readStatus(t.dir, v);
-      if (s?.state === "recording" && s.id === id) { runs.set(id, r); return { ok: true, id, note: `probe inside ${t.name}${loaded}: freezes carry their cause, moving layers their declared animation` }; }
+      if (s?.state === "recording" && s.id === id) { runs.set(id, r); return { ok: true, id, note: `probe inside ${t.name}${loaded}` }; }
       if (s?.last?.error) return { ok: false, why: `the probe refused: ${s.last.error}` };
     }
     return { ok: false, why: "the probe is loaded but did not start within 2s (the app's main thread is blocked?)" };

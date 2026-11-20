@@ -1197,6 +1197,35 @@ func otherLockPids() -> [Int32] {
 /// Everything that can make a lock fail, checked BEFORE the countdown: the tap must actually turn on, and every
 /// pointing device must accept a seize (each is seized and released again at once, only while no button is held,
 /// so a press can't lose its release in that instant). Returns the problems, empty = good to go.
+/// The two permissions a lock needs, both held by the app that runs the agent (the helper inherits them): Accessibility
+/// for the event tap, Input Monitoring to seize the pointing devices. `perms` reports them; `perms --ask` also raises
+/// the system prompt for each missing one (macOS shows it once per app) and opens its pane in System Settings.
+func cmdPerms() -> Never {
+    let ask = CommandLine.arguments.contains("--ask")
+    let ax = AXIsProcessTrusted()
+    let im = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
+    var opened: [String] = []
+    if ask {
+        let pane = { (anchor: String) in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            p.arguments = ["x-apple.systempreferences:com.apple.preference.security?\(anchor)"]
+            try? p.run(); p.waitUntilExit()
+        }
+        if !ax {
+            _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+            pane("Privacy_Accessibility"); opened.append("Accessibility")
+        }
+        if !im {
+            _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+            if ax { pane("Privacy_ListenEvent") }   // one pane at a time: Accessibility first, this one on the next ask
+            opened.append("Input Monitoring")
+        }
+    }
+    let o: [String: Any] = ["accessibility": ax, "input_monitoring": im, "asked": opened]
+    print(String(data: try! JSONSerialization.data(withJSONObject: o, options: [.sortedKeys]), encoding: .utf8)!)
+    exit(0)
+}
 func lockPreflight(_ tap: CFMachPort) -> [String] {
     var problems: [String] = []
     CGEvent.tapEnable(tap: tap, enable: true)
@@ -4195,6 +4224,7 @@ case "raw": cmdRaw()
 case "draw": cmdDraw()
 case "capture": Task { await cmdCapture() }
 case "lock": cmdLock()
+case "perms": cmdPerms()
 case "watch": cmdWatch()
 case "release-cursor": CGAssociateMouseAndMouseCursorPosition(1); exit(0)
 default:

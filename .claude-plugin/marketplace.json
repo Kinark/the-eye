@@ -1,0 +1,8 @@
+{
+  "name": "the-eye",
+  "description": "the-eye: an MCP server that lets an agent see and drive a macOS screen, with its manual as a skill.",
+  "owner": { "name": "Igor Marcossi" },
+  "plugins": [
+    { "name": "the-eye", "source": "./", "description": "The the-eye MCP server with its manual as a skill." }
+  ]
+}

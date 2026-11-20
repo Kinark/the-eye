@@ -1,0 +1,12 @@
+{
+  "name": "the-eye",
+  "version": "0.3.0",
+  "description": "Eyes and hands on a macOS screen: drive an app or a website, see what a viewer would have noticed (fps, freezes, the spring behind a motion) and why.",
+  "author": { "name": "Igor Marcossi" },
+  "mcpServers": {
+    "the-eye": {
+      "command": "sh",
+      "args": ["-c", "cd \"${CLAUDE_PLUGIN_ROOT}\" && { [ -d node_modules ] || npm install --silent >&2; } && exec node src/index.ts"]
+    }
+  }
+}

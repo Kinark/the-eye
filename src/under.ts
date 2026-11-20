@@ -283,7 +283,7 @@ function carried(changes: number[], swaps: number[]): { frames: number; waits: n
  */
 function stalledHow(stalled: Readings["frames"], periodMs: number): string {
   const worst = stalled.reduce((a, b) => (b.life > a.life ? b : a));
-  return `${ms(worst.life)} from scheduled to on the glass, ${ms(worst.render)} of it rendering: ${worst.render < periodMs ? "it was waiting, not working" : "its own rendering was slow"}`;
+  return `${ms(worst.life)} scheduled→glass, ${ms(worst.render)} rendering: ${worst.render < periodMs ? "waiting, not working" : "its rendering was slow"}`;
 }
 
 /** Where a late update cycle spent its time, by AppKit's own signposts. */
@@ -317,12 +317,12 @@ export function whoWasLate(u: Readings, from: number, to: number, periodMs: numb
   const inside = insideTheApp(u, from - 3 * period, to + period, 0.5 * len * 1000);
   // What the window server says of its own frames here.
   const stalled = u.frames.filter((f) => f.stall && f.t > from - period && f.t < to + period);
-  const server = stalled.length ? `; the window server marked ${stalled.length === 1 ? "one of its frames" : `${stalled.length} of its frames`} here as stalled (${stalledHow(stalled, periodMs)})` : "";
+  const server = stalled.length ? `; it marked ${stalled.length} of its frames stalled (${stalledHow(stalled, periodMs)})` : "";
   if (!u.commits.length) return gap > 1.5 * period ? `the window server was late: no frame went to the display for ${ms(gap * 1000)} (${by})${server}` : undefined;
   if (co.length < 2) return `the app was late: it committed ${co.length ? "once" : "nothing"} to Core Animation around these ${ms(len * 1000)} (${by})${inside}`;
   if (quiet >= 0.7 * len) return `the app was late: it committed nothing to Core Animation for ${ms(quiet * 1000)}${after && after.ms > periodMs ? `, and the commit that ended the silence took ${ms(after.ms)}` : ""} (${by})${inside}`;
-  const kept = `the app kept committing (${co.length}×, never more than ${ms(quiet * 1000)} apart)`;
-  if (gap > 1.5 * period) return `the window server was late: ${kept} but no frame went to the display for ${ms(gap * 1000)} (${by})${server}`;
+  const kept = `the app kept committing (${co.length}×, ≤${ms(quiet * 1000)} apart)`;
+  if (gap > 1.5 * period) return `the window server was late: ${kept} but no frame reached the display for ${ms(gap * 1000)} (${by})${server}`;
   // The display's frames are everyone's. Whether THIS app's changes were among them is read from the window server itself.
   const ch = u.changes?.filter((t) => t > from - 3 * period && t < to);
   if (ch && !ch.length) return `${kept} but no change of its windows reached the window server (dtrace): what it committed was the same picture`;
@@ -348,10 +348,10 @@ export function underLines(u: Readings, segs: { start_s: number; end_s: number }
     const driven = co.length / dur >= 10;
     if (u.commits.length || u.swaps.length) {
       const long = co.reduce((m, c) => Math.max(m, c.ms), 0);
-      const handed = "the window server ran the motion on its own (a Core Animation animation: no per-frame work in the app)";
+      const handed = "the window server ran it alone (a Core Animation animation)";
       parts.push(!co.length ? `the app committed nothing: ${handed}`
         : !driven ? `the app committed ${times(co.length)} (longest ${ms(long)} on its main thread), then ${handed}`
-        : `the app committed ${co.length}× (${r0(co.length / dur)}/s, longest ${ms(long)} on its main thread): it drives the motion frame by frame`);
+        : `the app committed ${co.length}× (${r0(co.length / dur)}/s, longest ${ms(long)}): it drives the motion frame by frame`);
     }
     if (u.swaps.length) {
       let gap = 0;
@@ -370,16 +370,16 @@ export function underLines(u: Readings, segs: { start_s: number; end_s: number }
     const cy = within(u.cycles);
     if (cy.length && driven) {
       const flagged = cy.filter((c) => c.stall), ev = within(u.events), slow = within(u.stalledCommits);
-      more.push(`inside the app: ${cy.length} AppKit update cycles (median ${ms(median(cy.map((c) => c.ms)))}, longest ${ms(Math.max(...cy.map((c) => c.ms)))})`
-        + `${flagged.length ? `, ${flagged.length} of them flagged as ${flagged.length === 1 ? "a stall" : "stalls"} by AppKit` : ", none flagged as a stall"}`
-        + `${slow.length ? ` · Core Animation flagged ${slow.length === 1 ? "one commit" : `${slow.length} commits`} as stalled (longest ${ms(Math.max(...slow.map((c) => c.ms)))})` : ""}`
-        + `${ev.length ? ` · ${ev.length} events handled (longest ${ms(Math.max(...ev.map((e) => e.ms)))})` : ""}`);
+      more.push(`app: ${cy.length} AppKit cycles (median ${ms(median(cy.map((c) => c.ms)))}, longest ${ms(Math.max(...cy.map((c) => c.ms)))})`
+        + `${flagged.length ? `, ${flagged.length} flagged as stalls by AppKit` : ""}`
+        + `${slow.length ? ` · Core Animation flagged ${slow.length} commits as stalled (longest ${ms(Math.max(...slow.map((c) => c.ms)))})` : ""}`
+        + `${ev.length ? ` · ${ev.length} events (longest ${ms(Math.max(...ev.map((e) => e.ms)))})` : ""}`);
     }
     const fr = within(u.frames);
     if (fr.length) {
       const st = fr.filter((f) => f.stall);
-      more.push(`the window server: rendered each frame in ${ms(median(fr.map((f) => f.render)))} (longest ${ms(Math.max(...fr.map((f) => f.render)))}), ${ms(median(fr.map((f) => f.gpu)))} of GPU work`
-        + `${st.length ? `; it marked ${st.length} of ${fr.length} as stalled (${stalledHow(st, periodMs)})` : `; it marked none of ${fr.length} as stalled`}`);
+      more.push(`window server: ${ms(median(fr.map((f) => f.render)))} a frame to render (longest ${ms(Math.max(...fr.map((f) => f.render)))}), ${ms(median(fr.map((f) => f.gpu)))} GPU`
+        + `${st.length ? `; ${st.length} of ${fr.length} marked stalled (${stalledHow(st, periodMs)})` : ""}`);
     }
     // SkyLight's own counter checks the stream: signposts are best-effort, a count is not.
     const vi = u.vitals.filter((v) => v.t - v.s >= s.start_s && v.t <= s.end_s);
@@ -409,10 +409,10 @@ export function underLines(u: Readings, segs: { start_s: number; end_s: number }
     const moving = u.vitals.filter((v) => inSeg(v.t - v.s / 2)), rest = u.vitals.filter((v) => !inSeg(v.t) && !inSeg(v.t - v.s));
     const tell = (v: Vital[]) => {
       const s = sum(v.map((x) => x.s)), mj = sum(v.map((x) => x.mj)), p = sum(v.map((x) => x.pmj));
-      return `${r0(mj / s)} mW${mj > 0 ? ` (${r0((100 * p) / mj)}% on performance cores)` : ""}, ${r0((1000 * sum(v.map((x) => x.cpu))) / s)} ms/s CPU, ${r0(sum(v.map((x) => x.wk)) / s)} wakeups/s`;
+      return `${r0(mj / s)} mW${mj > 0 ? ` (${r0((100 * p) / mj)}% P-cores)` : ""}, ${r0((1000 * sum(v.map((x) => x.cpu))) / s)} ms/s CPU, ${r0(sum(v.map((x) => x.wk)) / s)} wakeups/s`;
     };
-    if (moving.length) L.push(`the app's own energy while moving: ${tell(moving)} · ${sum(moving.map((x) => x.mj)).toFixed(1)} mJ in all (rusage)`);
-    if (moving.length && rest.length) L.push(`the app's own energy at rest:      ${tell(rest)}`);
+    if (moving.length) L.push(`app energy moving: ${tell(moving)} · ${sum(moving.map((x) => x.mj)).toFixed(0)} mJ in all (rusage)`);
+    if (moving.length && rest.length) L.push(`app energy at rest: ${tell(rest)}`);
     if (!moving.length && rest.length) L.push(`the app's own energy: the motion was shorter than one 50ms sample; at rest: ${tell(rest)} (rusage)`);
   }
   return L;

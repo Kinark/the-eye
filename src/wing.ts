@@ -4,15 +4,12 @@
  */
 const COMPASS: Record<string, number> = { e: 0, se: 45, s: 90, sw: 135, w: 180, nw: 225, n: 270, ne: 315, "→": 0, "↘": 45, "↓": 90, "↙": 135, "←": 180, "↖": 225, "↑": 270, "↗": 315 };
 const PACE: Record<string, number> = { slow: 220, walk: 450, brisk: 700, fast: 1200 };
+/** The outline only: what each word does is the manual's "wing" and "fingers" chapters (skills/the-eye/). */
 export const WING_WORDS = [
-  '"Name" (fly to the thing called that; Button:"Name" to say which kind, #identifier by id)',
-  "x,y (a point)", "N NE E SE S SW W NW or ↑↗→↘↓↙←↖, then a distance in points, or none to keep flying that way",
-  "tap tap2 tap3 rtap down up", "scroll up|down|left|right <px> (the page goes that way: one gesture, lands and lifts)",
-  "fingers … (two fingers ON THE TRACKPAD, in two dimensions; they land and stay down, and what is under them follows as under a drag): fingers up|down|left|right|<compass> <pt> (a line) · fingers <dx>,<dy> <dx>,<dy> … (ONE curved stroke through those offsets, y down, never stopping at any) · fingers orbit <r> [turns] (a circle back to where it began; negative turns = the other way) · fingers wander <r> [ms] (roams within r of where it is, differently every time, and comes back) · fingers like:\"last\" [n] (plays back a touch the USER made, as they made it: recorded by any session that only watched; \"last\" or a run folder, n = which touch, default the longest; one that left at speed is thrown again: the fingers lift and the thing coasts) · flick right after a stroke (it leaves at speed and coasts) · lift · fingers play [gentle|lively|wild] [size] [up|down|left|right] (THEY PLAY BY THEMSELVES, also while you think, as a person does with a thing that stretches and wobbles: in phrases that run into each other without a stop, each chosen from what the screen did under the last one: a pull to see what it does and further while it grows, a wave where it answers that swells and goes on while it gives more, a shake, a slow slide across, further than it has been, held stretched and let go, thrown with a flick; they lift to watch it settle and land again by themselves; a place where it popped is crossed again slowly; a stroke you write meanwhile sends them there and they play on from it) · one thing kept up until the next word (for a moment, not to fill time: a held wave is a tremor): fingers wave <±pt> [times a second] [N|S = up and down] · fingers stir <r> [turns a second, negative = the other way] · fingers roam <r> · fingers go <way> (on and on at the pace) · fingers calm (play, or whatever they kept up, dies away; they stay down) · add `along <dx>,<dy> [ms]` to a wave, stir or roam and the place travels meanwhile",
-  "rest <ms>", "settle (until the screen is still)", "halt",
-  "slow walk brisk fast or <n>/s (pace from here on)",
-  "trackpad, where the hand is: pinch <scale> [ms] · rotate <degrees> [ms] · zoom (smart zoom) · swipe left|right|up|down · press [ms] (Force Touch, stage 1) · force [ms] (force click) · fling up|down|left|right <px> (scroll with momentum)",
-  "until:\"expr\" [ms] (wait until it holds, default 2000) · check:\"expr\" (stop the wing unless it holds) · layer:\"label\" (go to that probe layer)",
+  '"Name" Button:"Name" #identifier x,y', "N NE E SE S SW W NW [pt]", "tap tap2 tap3 rtap down up",
+  "scroll up|down|left|right <px>", "fingers … flick lift", "rest <ms> settle halt", "slow walk brisk fast <n>/s",
+  "pinch <scale> rotate <degrees> zoom swipe <way> press force fling <way> <px>",
+  'until:"expr" check:"expr" layer:"label"', 'el:"…" type:"…" key:"…" goto:"…" reload js:"…"',
 ].join(" · ");
 const SIDES = ["up", "down", "left", "right"];
 export function parseWing(s: string): { moves: any[]; words: string[] } | { error: string } {
@@ -28,6 +25,13 @@ export function parseWing(s: string): { moves: any[]; words: string[] } | { erro
     if (q && verb === "until") { const n = numAt(i + 1); m = { k: "exact", step: { op: "wait_until", expr: q[2], timeout_ms: n } }; if (n !== undefined) w += ` ${tok[++i]}`; }
     else if (q && verb === "check") m = { k: "exact", step: { op: "assert", expr: q[2] } };
     else if (q && verb === "layer") m = { k: "exact", step: { op: "move", on: q[2], ms: 250 } };
+    // Websites: the thing found in the page itself, and what goes straight into it.
+    else if (q && verb === "el") m = { k: "exact", step: { op: "move", on: q[2], ms: 250 } };
+    else if (q && verb === "type") m = { k: "exact", step: { op: "type", text: q[2].replace(/\\n/g, "\n") } };
+    else if (q && verb === "key") m = { k: "exact", step: { op: "key", key: q[2] } };
+    else if (q && verb === "goto") m = { k: "exact", step: { op: "goto", url: q[2] } };
+    else if (q && verb === "js") { const n = numAt(i + 1); m = { k: "exact", step: { op: "wait_until", js: q[2], timeout_ms: n } }; if (n !== undefined) w += ` ${tok[++i]}`; }
+    else if (l === "reload") m = { k: "exact", step: { op: "reload" } };
     else if (l === "pinch" || l === "rotate") {
       const v = numAt(i + 1), ms = numAt(i + 2);
       if (v === undefined || (l === "pinch" && v <= 0)) return { error: l === "pinch" ? `"pinch" needs a zoom factor, e.g. pinch 2 (spread to double) or pinch 0.5` : `"rotate" needs degrees, e.g. rotate 45 (+ = clockwise)` };
@@ -147,4 +151,22 @@ export function parseWing(s: string): { moves: any[]; words: string[] } | { erro
     moves.push(m); words.push(w);
   }
   return { moves, words };
+}
+
+/**
+ * About how long the hand needs for these moves, in ms: what decides between the "Just a sec…" pill and the full
+ * lock. It leans long on purpose (a guess that is too short would hold the user without the warning), and anything
+ * that goes on until told otherwise (fingers play / wave / stir / roam / go) has no end: Infinity.
+ */
+export function wingMs(moves: any[]): number {
+  let t = 0;
+  for (const m of moves) {
+    if (m.k === "rest" || m.k === "settle") t += m.ms ?? 0;
+    else if (m.k === "exact") t += (m.step.ms ?? 0) + (m.step.timeout_ms ?? (m.step.op === "wait_until" ? 2000 : 0)) + 400;
+    else if (m.k === "fingers") t += m.motif && m.motif !== "calm" ? Infinity : m.wander ? m.ms ?? 1500 : m.orbit ? Math.abs(m.turns ?? 1) * 800 : m.like ? 1500 : m.pts ? 300 + 200 * m.pts.length : 200;
+    else if (m.k === "thing" || m.k === "to" || m.k === "dir" || m.k === "scroll") t += 400;
+    else if (m.k === "tap") t += 150 * (m.count ?? 1);
+    else if (m.k === "down" || m.k === "up" || m.k === "lift") t += 100;
+  }
+  return t;
 }

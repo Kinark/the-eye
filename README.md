@@ -8,6 +8,7 @@ refreshes, hitches, frame-gap distribution, and the size/position curve of whate
 Built to answer "did this change make the animation smoother?" objectively, and to A/B app builds and settings.
 It's meant to be an agent's default way to test a macOS app's UI (SwiftUI or AppKit) on its own: find the element
 (accessibility tree), drive it (`eye_drive`), and measure the result, without asking the user to try it.
+Websites work the same way: `eye_drive {url}` (see [Websites](#websites)).
 
 ## How it measures
 
@@ -192,7 +193,8 @@ the accessibility tree costs the app frames. Judging what the numbers mean stays
 
 ## Tools
 
-Five tools. The server's MCP `instructions` carry the full "what / when / how" guide agents see on connect.
+Five tools. What an agent is sent on connect (the MCP `instructions`, the tool descriptions and schemas) is an
+outline; the manual comes a chapter at a time, when its part is used. See [The manual](#the-manual).
 
 | tool | what |
 |---|---|
@@ -219,6 +221,30 @@ Old → new (thirteen tools became five): `eye_act`, `eye_record`, `eye_stop`, `
 launch / quit / relaunch → `eye_drive` (`steps` · `hands:false` with `seconds` / `command` · `end:true` · `probe` ·
 `ask` · `app_path` / `quit` / `duplicates`) · `eye_glance` → `eye_snapshot {app}` · `eye_peek`, `eye_app list` →
 `eye_status`.
+
+### The manual
+
+A tool description is paid for by every session of every agent that has the server connected, used or not. So the
+agent-facing text lives once, in [`skills/the-eye/`](skills/the-eye/), and reaches an agent three ways:
+
+| file | what | how it arrives |
+|---|---|---|
+| `SKILL.md` | the outline: when to use the-eye, the loop in one call, the five tools, the lock, how to read a verdict, the list of chapters | its body is the server's MCP `instructions` (front matter stripped, paths made real), so it is sent on connect |
+| `wing.md` `fingers.md` `steps.md` `web.md` `reply.md` `session.md` `measure.md` | the chapters: every word, step, option and reply line | `eye_drive {guide:"wing"}` returns one and does nothing else: no session, no lock, no queue |
+
+- **A wing that cannot be read** is refused before anything opens (no lock is taken for a typo) and comes back with
+  its chapter: in full the first time a server hands it over, by name after that.
+- **The first use of a part** (a wing, fingers, steps, a website, a report) adds one line that names its chapter,
+  unless it was read already.
+- **As a skill**: the folder is an [Agent Skill](https://agentskills.io), and the repository is a Claude Code plugin
+  that carries it with the server (see [Install](#install)). A client with skills reads the chapters as files.
+
+On connect the server sent 43,204 characters before this split and sends about 24,400 after it; what is left is
+mostly the shape of the schemas. `node test/guide.mjs` holds it under 26,000, checks that every chapter is served
+and that the chapters name every word `src/wing.ts` parses.
+
+A change to what a tool does goes into the chapter that describes it, and into `SKILL.md` only when the outline
+changes.
 
 ## Accessibility (AX) context
 
@@ -423,9 +449,59 @@ permission prompts, Gatekeeper); `--app NAME|BUNDLE_ID|PID` (repeatable, names m
 The MCP instructions tell agents to use it, with the absolute command for this checkout. Test:
 `test/watch-events.mjs` (a self-changing fixture app, then TextEdit driven in a watch session that holds the lock).
 
+## Websites
+
+`eye_drive {url:"localhost:3000", …}` runs the same session on a web page. The page opens in the eye's own
+Chromium-family browser: Chrome for Testing, Chromium, Google Chrome, Brave or Edge, whichever is installed first, or
+`THE_EYE_BROWSER` / `browser:"brave"`. That browser runs on its own profile (`~/Library/Caches/the-eye/browser/<name>`,
+kept between sessions, never your everyday profile), with renderer accessibility forced on and no background
+throttling. It shows one tab in one window, and it is reused by the next session. Because the window belongs to the
+browser process, everything that works on an app works on the page unchanged: the window recording, what a viewer
+noticed, the hand, wings that aim at things by their accessible name, and accessibility events.
+
+On top of that, the session reaches into the page through the DevTools protocol:
+
+- **Things found in the page.** `on:"…"` in steps and `el:"…"` in a wing take a CSS selector or what the thing is
+  called (aria-label, label, text; exact before contains, interactive elements first). Before pressing, the hand waits
+  (`timeout_ms`, default 5s) until the thing is visible, enabled, not covered by anything else at its centre, and still
+  over two reads, scrolling it into view first if needed. A refusal says why: `button #off "Disabled one" is disabled`,
+  `… is covered by #cover`, `nothing on the page matches "#nope"`.
+- **Straight into the page:** steps `type {text, on?}` (key by key; `\n` = Enter), `key {key:"Shift+Tab" | "Meta+a" | …}`
+  (Meta+a/c/x/v/z run the macOS editing commands), `goto {url}`, `reload`. Wing words: `type:"…"`, `key:"…"`,
+  `goto:"…"`, `reload`.
+- **The page's own state:** `wait_until` / `assert` take `js:"document.querySelector('#toast')?.textContent === 'Saved'"`,
+  which is evaluated in the page and may await promises.
+- **What the page said:** every reply lists the console errors and warnings, uncaught exceptions, failed loads (404s,
+  CORS, network errors: `Log.entryAdded`), open dialogs, crashes, slow answers to input (Event Timing ≥40ms, one per
+  interaction: waiting + handlers + until painted) and layout shifts that no input caused (with the elements that moved).
+- **`look`** in a website session and `eye_inspect {page:true}` list what can be pressed or read in the window:
+  `button #move "Move the box" [62,129 96×21] (disabled)`, with the selector, name, state, value and screen rect.
+
+**The page probe** goes in by itself (`probe:false` skips it, `probe:{watch:["#box"]}` always shows those elements). It
+is `src/eye-page.js`, the page-side twin of the app probe. On every animation frame it records the geometry of the
+elements that are animating or were restyled, and it captures each CSS transition, CSS animation and Web Animation as
+the page declared it. It also logs Long Animation Frames with the scripts that ran in them, slow input and layout
+shifts. At the end it is written as a `probe.ndjson` in the app probe's format, on the capture's clock. That means:
+
+- **"why:"** under a freeze names the script function and its place:
+  `blockMainThread 127.0.0.1:5173:25 ran 200ms · event-listener BUTTON#block.onclick`. Forced style/layout, sync XHR or
+  alert pauses, and time spent outside any script are called out too.
+- **FROM INSIDE THE PAGE** shows each moving element's `declared:` animation, the fit on its exact per-frame values, and
+  the verdict on the two:
+  `CSS transition on transform none → translateX(200px): 0.3s ease-out = cubic-bezier(0, 0, 0.58, 1) · on the compositor` →
+  `moved by: a TIMING CURVE over 300ms: easeOut …` → `✓ it ran as declared`.
+  Under it, **THE PAGE ITSELF** gives the page's log, the slowest answers to input, and layout shifts with their CLS.
+
+Limits: only Chromium-family browsers can be driven (Safari and Firefox have no DevTools protocol the eye can use).
+Lookup does not reach into iframes or shadow DOM. Screen rects assume 100% page zoom. They are exact once the pointer
+has moved over the page (a real pointer event calibrates the viewport's screen origin) and estimated before that.
+A `file://` page's scripts are not attributed in long frames, so serve it over http. The dev server must be running:
+`did not load: net::ERR_CONNECTION_REFUSED (is the dev server running?)`. `eye_drive {url, quit:true}` quits the
+eye's browser.
+
 ## Input lock and drivers
 
-Every lock (a session with a hand, `eye_drive {hands:false, lock:true}`, `eye_snapshot {app}`, a question) taps every event type and drops
+Every lock (a session with a hand, `eye_drive {hands:"mine"}` or one with a `command`, `eye_snapshot {app}`, a question) taps every event type and drops
 all physical input whose source process ID is 0: pointer, scroll, trackpad gestures, force touch, keys, modifiers and
 media keys. It also seizes every pointing device at the HID level (`IOHIDDeviceOpen` with `kIOHIDOptionsTypeSeizeDevice`, including mice connected mid-lock), so the trackpad never reaches the window server and the cursor doesn't move at all, while posted moves still drive it. The kernel drops the seize if the process dies. The report has `pointer_devices_seized`, and `max_cursor_drift_pt` says how far the cursor ever got from where it should be (should be 0). One physical trackpad shows up as several HID handles that refuse each other's exclusive open, so
 handles are grouped by physical device and a device counts as held when any of its handles is seized.
@@ -437,7 +513,20 @@ anything appears on screen, and refuses with `preflight: …` at once.
 **Two styles.** `full` shows a 3·2·1 countdown in the middle of every screen (0.5s per number, 1.5s total) while input
 is still free (the tap is not armed until it ends; `test/lock.mjs` checks this), then the orange overlay on every
 screen; the tools wait for it. `quick` ("Just a sec…") has no countdown: a small pill springs down under the menu bar
-and the lock engages in ~0.1–0.2s. `eye_snapshot {app}` and a session that opens and ends in one call use it (`lock_style` overrides). The overlay
+and the lock engages in ~0.1–0.2s. `eye_snapshot {app}` uses it, and so does a session that opens and ends in one call whose steps and wing take under
+4 seconds (`wingMs` in `src/wing.ts` adds up the wing; `fingers play` and the like never count as short). Anything
+longer gets `full`, also when `lock_style:"quick"` was asked; `lock_style:"full"` is always honoured.
+
+**Who drives decides the lock; there is no switch.** The-eye's hand (the default) and the caller's own driver
+(`hands:"mine"`, or a `command`) always hold the user's input. Only `hands:false`, where the user is the one acting,
+leaves it free.
+
+**The lock does not fail.** A lock that is refused in preflight, or whose helper dies, is taken again (`holdLock` in
+`src/index.ts`, 0.3s apart growing to 2s) until one engages; nothing is driven meanwhile and nothing shows on screen
+for a refusal. The reply says when it took more than one try and what the first refusal was. Only a run that is told
+to stop gives up waiting. When the host app lacks Accessibility or Input Monitoring, the-eye asks for it: `eye-capture perms --ask` raises the
+macOS prompt and opens the pane in System Settings, again on every failed try while something is missing, and the waiting
+call goes on as soon as it is granted. `eye-capture perms` alone prints what is granted. The overlay
 or pill is shown exactly while a lock is held, so orange on screen means no physical input gets through.
 
 **Hands on the trackpad.** If the user is mid-drag, mid-scroll, mid-fling or mid-pinch when a lock is due, it waits up to
@@ -495,7 +584,7 @@ eye_drive {wing:'slow E'}                                    keep going east…
 eye_drive {wing:'S'}                                         …now bend south, from the speed it has
 eye_drive {steps:[{op:"scroll", dy:-200, momentum:true}, {op:"wait_until", expr:"!moving"}]}
 eye_drive {end:true}                                         let go, free the input, verdict for the whole session
-eye_drive {rect:{x:356,y:0,w:800,h:300}, hands:false, command:"./drive full", lock:true}   your own driver, watched
+eye_drive {rect:{x:356,y:0,w:800,h:300}, command:"./drive full"}                your own driver, watched
 ```
 
 | word | what the hand does |
@@ -505,7 +594,7 @@ eye_drive {rect:{x:356,y:0,w:800,h:300}, hands:false, command:"./drive full", lo
 | `N NE E SE S SW W NW` or `↑↗→↘↓↙←↖` | with a distance: that far that way. Without: keep flying that way until the next wing, the window's edge, or `coast_ms` |
 | `tap` `tap2` `tap3` `rtap` `down` `up` | press what is under the finger |
 | `scroll up\|down\|left\|right <px>` · `fling …` | a phased two-finger scroll at the pointer, named by where the page goes (`scroll down` = further down the page, whatever the Natural scrolling setting), exactly that many pixels, landing and lifting by itself · the same with momentum after the fingers lift |
-| `fingers …` · `… flick` · `lift` | two fingers on the trackpad, in two dimensions, named by where the FINGERS go (points, y down). What is under them follows as it does under a real hand: the scroll events are the ones this machine's trackpad would send under its Natural scrolling setting, direction flag included. Four strokes: `fingers up\|down\|left\|right\|<compass> <pt>` is a line; `fingers <dx>,<dy> <dx>,<dy> …` is ONE curved stroke through those offsets (a spline, it never stops at a point, so corners are turns); `fingers orbit <r> [turns]` draws a circle back to where it began (negative turns = the other way round); `fingers wander <r> [ms]` roams within `r` of where it is on two unrelated slow waves per axis with random phase, differently every time, and comes back (default 1500ms). They land with the first stroke and STAY DOWN: every further stroke is the same touch (began once, ended once) and exact to the pixel. Strokes written one after another are flown as ONE movement with no stop between them; the fingers slow into bends and run on the straights (speed follows the radius of the bend to the power ⅓, as a hand's does), a long stroke is faster than a short one, and each takes a slightly different time (±13%) around the wing's pace. `rest`, `settle`, `until:` and `check:` between strokes keep the fingers where they are; any other move lifts them first. `flick` after a stroke makes it leave at speed along its last direction, lift, and coast with momentum events. Fingers still down when the wing ends stay down while you read the reply, for `coast_ms` (default 1.5s), then lift by themselves; the reply says so either way. `fingers like:"last" [n]` plays back a touch the USER made, on its own clock: every recording also listens to the trackpad (`fingers.jsonl` in the run folder: one line per scroll event the user's fingers caused, never the-eye's own), a session that ends lists those touches under YOUR FINGERS (when, how long, where, travel, mean speed, how often it turned back, whether it left with a flick), and `like:` takes `last` or a run folder, with `n` choosing the touch (default the longest). A touch that left at speed (over 200 px/s in its last 40ms) is thrown again: the fingers lift at its end and momentum follows at that speed; one that came to a stop leaves the fingers down. This is how to play with something that follows the fingers and answers back (a notch that wobbles, a sheet that rubber-bands, a scrubber): stir it, read the reply, stir again or let go. Or let the hand do it: `fingers play [gentle\|lively\|wild] [size] [up\|down\|left\|right]` makes them play by themselves until told otherwise, also between calls (`hold_ms`). The hand reads the recording's 50ms motion bins twenty times a second and plays in phrases that run into each other: a pull and further while the thing grows, a wave that swells and goes on while the screen gives more, a shake, a slow slide, further than it has been, held stretched then let go, a flick let go at its fastest; it lifts to watch the thing settle and lands again; where the screen jumped without the fingers doing anything new (a POP) it goes slowly back over that place. Each stroke is a minimum-jerk submovement begun before the last has ended, and its turn, time and size lean on the previous one's. The reply lists what they did and where the screen gave most. A stroke written meanwhile redirects them, `fingers calm` stops the play with the fingers down, `lift` ends it. Also kept up until the next word: `fingers wave <±pt> [hz] [way]`, `fingers stir <r> [hz]`, `fingers roam <r>`, `fingers go <way>`, each optionally `along <dx>,<dy> [ms]` |
+| `fingers …` · `… flick` · `lift` | two fingers on the trackpad, in two dimensions, named by where the FINGERS go (points, y down). What is under them follows as it does under a real hand: the scroll events are the ones this machine's trackpad would send under its Natural scrolling setting, direction flag included. Four strokes: `fingers up\|down\|left\|right\|<compass> <pt>` is a line; `fingers <dx>,<dy> <dx>,<dy> …` is ONE curved stroke through those offsets (a spline, it never stops at a point, so corners are turns); `fingers orbit <r> [turns]` draws a circle back to where it began (negative turns = the other way round); `fingers wander <r> [ms]` roams within `r` of where it is on two unrelated slow waves per axis with random phase, differently every time, and comes back (default 1500ms). They land with the first stroke and STAY DOWN: every further stroke is the same touch (began once, ended once) and exact to the pixel. Strokes written one after another are flown as ONE movement with no stop between them; the fingers slow into bends and run on the straights (speed follows the radius of the bend to the power ⅓, as a hand's does), a long stroke is faster than a short one, and each takes a slightly different time (±13%) around the wing's pace. `rest`, `settle`, `until:` and `check:` between strokes keep the fingers where they are; any other move lifts them first. `flick` after a stroke makes it leave at speed along its last direction, lift, and coast with momentum events. Fingers still down when the wing ends stay down while you read the reply, for `hold_ms` (default 20s), then lift by themselves; the reply says so either way. `fingers like:"last" [n]` plays back a touch the USER made, on its own clock: every recording also listens to the trackpad (`fingers.jsonl` in the run folder: one line per scroll event the user's fingers caused, never the-eye's own), a session that ends lists those touches under YOUR FINGERS (when, how long, where, travel, mean speed, how often it turned back, whether it left with a flick), and `like:` takes `last` or a run folder, with `n` choosing the touch (default the longest). A touch that left at speed (over 200 px/s in its last 40ms) is thrown again: the fingers lift at its end and momentum follows at that speed; one that came to a stop leaves the fingers down. This is how to play with something that follows the fingers and answers back (a notch that wobbles, a sheet that rubber-bands, a scrubber): stir it, read the reply, stir again or let go. Or let the hand do it: `fingers play [gentle\|lively\|wild] [size] [up\|down\|left\|right]` makes them play by themselves until told otherwise, also between calls (`hold_ms`). The hand reads the recording's 50ms motion bins twenty times a second and plays in phrases that run into each other: a pull and further while the thing grows, a wave that swells and goes on while the screen gives more, a shake, a slow slide, further than it has been, held stretched then let go, a flick let go at its fastest; it lifts to watch the thing settle and lands again; where the screen jumped without the fingers doing anything new (a POP) it goes slowly back over that place. Each stroke is a minimum-jerk submovement begun before the last has ended, and its turn, time and size lean on the previous one's. The reply lists what they did and where the screen gave most. A stroke written meanwhile redirects them, `fingers calm` stops the play with the fingers down, `lift` ends it. Also kept up until the next word: `fingers wave <±pt> [hz] [way]`, `fingers stir <r> [hz]`, `fingers roam <r>`, `fingers go <way>`, each optionally `along <dx>,<dy> [ms]` |
 | `pinch <scale> [ms]` · `rotate <degrees> [ms]` · `zoom` · `swipe left\|right\|up\|down` | trackpad gestures where the hand is (`zoom` = smart zoom) |
 | `press [ms]` · `force [ms]` | Force Touch: stage 1 · a force click |
 | `rest <ms>` · `settle` · `halt` | let time pass (a heading keeps flying) · wait until the screen is still · brake |
@@ -605,12 +694,22 @@ OpenCode (`opencode.jsonc`):
 
 ```jsonc
 "mcp": { "servers": {
-  "the-eye": { "type": "local", "command": ["node", "/Users/kinark/Desktop/AI_Playground/the-eye/src/index.ts"],
+  "the-eye": { "type": "local", "command": ["node", "/path/to/the-eye/src/index.ts"],
                "timeout": { "execution": 660000 } }
 } }
 ```
 
-Claude Code: `claude mcp add the-eye -- node /Users/kinark/Desktop/AI_Playground/the-eye/src/index.ts`
+Claude Code: `claude mcp add the-eye -- node /path/to/the-eye/src/index.ts`
+
+Or as a plugin, which brings the server and the manual as a skill (`the-eye:the-eye`) together:
+
+```
+/plugin marketplace add Kinark/the-eye
+/plugin install the-eye@the-eye
+```
+
+The plugin's copy runs `npm install` by itself on its first start. From a checkout: `claude --plugin-dir .`. Use one
+or the other, not both: two servers would queue behind each other.
 
 **Permissions:** the host app (terminal or agent) needs **Screen Recording** for capture and **Accessibility** for
 the input lock.
@@ -630,8 +729,8 @@ notes are in `show-off/MASTER.md`.
 
 ```
 eye_drive  { app: "NOOTCH!-Dev", wing: '"Timer" tap settle', end: true, label: "timer-on" }
-eye_drive  { rect: {x:356,y:0,w:800,h:300}, hands: false, command: "./drive full", lock: true, label: "timer-on-script" }
+eye_drive  { rect: {x:356,y:0,w:800,h:300}, command: "./drive full", label: "timer-on-script" }
 eye_report { runs: [{csv: ".../frames.csv", label: "baseline"}, {csv: ".../frames.csv", label: "timer-on"}] }
 ```
 
-Tests: `node test/smoke.mjs` (all non-interactive tools), `node test/ax.mjs` (AX hover/tree path; never moves the pointer), `node test/notice.mjs` (what a viewer would notice, on synthetic recordings), `node test/why-e2e.mjs` (drive → see → why on a fixture app; takes the input lock).
+Tests: `node test/smoke.mjs` (all non-interactive tools), `node test/guide.mjs` (the manual: the size of what is sent on connect, every chapter, a wing that cannot be read), `node test/ax.mjs` (AX hover/tree path; never moves the pointer), `node test/notice.mjs` (what a viewer would notice, on synthetic recordings), `node test/why-e2e.mjs` (drive → see → why on a fixture app; takes the input lock).

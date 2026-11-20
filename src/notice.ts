@@ -24,7 +24,7 @@ export type Heard = { from: number; app: string; events: Said[] };
 /** One main-thread stall measured inside the app by the probe's watchdog (mach seconds). */
 import { loadUnder, underLines, underTitle, whoWasLate } from "./under.ts";
 
-export type Stall = { t: number; ms: number; n: number; ongoing?: boolean; app: [string, number][]; leaf: [string, number][]; stack: string[] };
+export type Stall = { t: number; ms: number; n: number; ongoing?: boolean; app: [string, number][]; leaf: [string, number][]; stack: string[]; lines?: string[] };
 export type Stalls = { name: string; pid: number; from: number; to: number; threshold_ms: number; stacks: boolean; stalls: Stall[] };
 type Action = { t0: number; t1: number; op: string; note?: string; ok?: boolean };
 
@@ -106,6 +106,12 @@ const pt = (x: number) => `${Math.round(x)}pt`;
 /** Things that answer on screen when they land (a move or a wait is not expected to). */
 const RESPONSIVE = new Set(["click", "down", "up", "scroll", "pinch", "rotate", "smart_zoom", "swipe", "press", "force_click"]);
 
+/** A symbol as a person reads it: no compiler prose in front, no library behind, no longer than `max`. */
+export function sym(f: string, max = 64, lib = false): string {
+  let s = f.replace(/^.*specialization <.*> of /, "").replace(/^(merged |reabstraction thunk helper from |implicit )+/, "");
+  if (!lib) s = s.replace(/ \[[^\]]+\]$/, "");
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
 /** Why the screen stood still between `from` and `to` (run clock), from the probe's main-thread watchdog. */
 export function whyGap(st: Stalls | null, t0Mach: number, from: number, to: number): string[] {
   if (!st || !t0Mach) return [];
@@ -113,16 +119,21 @@ export function whyGap(st: Stalls | null, t0Mach: number, from: number, to: numb
   if (a < st.from || b > st.to) return [];
   const hits = st.stalls.filter((s) => s.t < b + 0.004 && s.t + s.ms / 1000 > a - 0.004);
   if (!hits.length) {
-    return [`${st.name}'s main thread was free the whole time (no run-loop turn over ${st.threshold_ms}ms): the frames were lost after the app handed them over — render server, GPU or window server — or this motion is not driven by the app's main thread`];
+    return [`main thread was free the whole time (no turn over ${st.threshold_ms}ms): the frames were lost after the app (render server, GPU or window server), or this motion is not driven by its main thread`];
   }
   return hits.flatMap((s) => {
-    const head = `${st.name}'s main thread was ${s.ongoing ? "STILL blocked after" : "blocked"} ${ms(s.ms)} from ${at(s.t - t0Mach)}`;
+    const head = `main thread was ${s.ongoing ? "STILL blocked after" : "blocked"} ${ms(s.ms)} from ${at(s.t - t0Mach)}`;
+    if (s.lines) return [head, ...s.lines.map((l) => `  ${l}`)]; // the page probe names the scripts directly
     if (!s.n) return [`${head} (too short to sample${st.stacks ? "" : "; stack sampling needs arm64"})`];
-    const share = (c: number) => `${Math.round((100 * c) / s.n)}%`;
-    const out = [`${head} · ${s.n} stack sample${s.n > 1 ? "s" : ""}`];
-    if (s.app.length) out.push(`  in app code: ${s.app.slice(0, 3).map(([f, c]) => `${f} (${share(c)})`).join(" · ")}`);
-    if (s.leaf.length) out.push(`  executing: ${s.leaf.slice(0, 3).map(([f, c]) => `${f} (${share(c)})`).join(" · ")}`);
-    if (s.stack.length) out.push(`  commonest stack: ${s.stack.slice(0, 10).join(" ← ")}`);
+    const share = (c: number) => `${Math.round((100 * c) / s.n)}%`, top = (v: [string, number][], k: number) => {
+      const by = new Map<string, number>(); // the same function under two compiler names is one
+      for (const [f, c] of v) { const n = sym(f, 64, true); by.set(n, (by.get(n) ?? 0) + c); }
+      return [...by].sort((x, y) => y[1] - x[1]).slice(0, k).map(([f, c]) => `${f} ${share(c)}`).join(" · ");
+    };
+    const out = [`${head} · ${s.n} sample${s.n > 1 ? "s" : ""}`];
+    if (s.app.length) out.push(`  app: ${top(s.app, 3)}`);
+    if (s.leaf.length) out.push(`  in: ${top(s.leaf, s.app.length ? 2 : 3)}`);
+    if (s.stack.length) out.push(`  stack: ${s.stack.slice(0, 6).map((f) => sym(f, 48)).filter((f, i, v) => f !== v[i - 1]).join(" ← ")}`);
     return out;
   });
 }
@@ -190,7 +201,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
       // Certain when the edge carried on the same way, or when the app's own main thread was blocked right then.
       const sev = prevEnd.dir !== 0 || why.some((w) => /blocked/.test(w)) ? sevOf(gapMs) : 1;
       P.push({ t: prevEnd.end, from: prevEnd.end, to: s.start_s, sev, kind: "freeze",
-        text: `${word(sev)} ${ms(gapMs)} (${Math.round(gapMs / period)} refreshes with no new image) at ${at(prevEnd.end)}: motion ${si} stopped dead${prevEnd.dir ? ` at ${pt(prevEnd.value)}` : ""} and motion ${si + 1} carried on from there — one motion, torn in two`,
+        text: `${word(sev)} ${ms(gapMs)} (${Math.round(gapMs / period)} refreshes) at ${at(prevEnd.end)}: motion ${si} stopped dead${prevEnd.dir ? ` at ${pt(prevEnd.value)}` : ""} and motion ${si + 1} carried on from there — one motion, torn in two`,
         why });
     }
 
@@ -214,7 +225,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
       const caught = jump >= 6 && jump > 3 * Math.max(steps[first - 1] ?? 0, steps[i + 1] ?? 0) ? `, then ${dimName[d]} jumped ${pt(jump)} to catch up (${pt(v[i])}→${pt(v[i + 1])})` : "";
       const from = r.t - total / 1000;
       P.push({ t: from, from, to: r.t, sev, kind: "freeze",
-        text: `${word(sev)} ${ms(total)} (${Math.round(total / period)} refreshes with no new image) at ${at(from)}, ${Math.round((100 * (from - s.start_s)) / Math.max(1e-3, s.end_s - s.start_s))}% into ${name}${caught}`,
+        text: `${word(sev)} ${ms(total)} (${Math.round(total / period)} refreshes) at ${at(from)}, ${Math.round((100 * (from - s.start_s)) / Math.max(1e-3, s.end_s - s.start_s))}% into ${name}${caught}`,
         why: whyFroze(from, r.t) });
     }
     {
@@ -275,7 +286,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
       const lum: Cand = { samples: series(before?.luma ?? m[0].luma, m.map((r) => r.luma)), res: 0.05, unit: "/255", from: lumFrom };
       const lumLit: Cand[] = on > 0 && Math.abs(fr[on - 1].luma - (before?.luma ?? fr[on - 1].luma)) > 0.05
         ? [{ samples: series(fr[on - 1].luma, m.map((r) => r.luma)), res: 0.05, unit: "/255", from: lumFrom }] : [];
-      const dist: Cand = { samples: series(0, m.map((r) => (run += r.diff))), res: 0.02, unit: " (change)", from: "the amount of change from frame to frame: distance covered, so an overshoot shows as extra distance, not as a reversal" };
+      const dist: Cand = { samples: series(0, m.map((r) => (run += r.diff))), res: 0.02, unit: " (change)", from: "frame-to-frame change (distance covered: an overshoot reads as extra distance)" };
       const followed: Cand[] = tr.tracks.map((x) => ({ samples: x.samples, res: cell, unit: "pt", from: x.from, minLead: x.minLead, shape: x.shape }));
       const inStep = followed.length > 0 && !tr.twoD
         && Math.abs(correlation(tr.tracks[0].samples.slice(1).map((p) => p.x), m.map((r) => r.luma))) >= 0.985;
@@ -310,7 +321,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
         if (i < 3 || frozeAt.has(i) || x < Math.max(12, 4 * around(i)) || n >= 3) return;
         n++;
         P.push({ t: fr[i].t, sev: a.extent_source === "top-anchored" ? 2 : 1, kind: "jump",
-          text: `${a.extent_source === "top-anchored" ? "SNAPPED" : "jump:"} ${dimName[d]} went ${pt(v[i])}→${pt(v[i + 1])} in one frame at ${at(fr[i].t)} (the frames around it move ~${around(i).toFixed(1)}pt each${a.extent_source === "top-anchored" ? "" : "; the extent is the box around everything that changed, so another element appearing or vanishing in the region reads the same"})` });
+          text: `${a.extent_source === "top-anchored" ? "SNAPPED" : "jump:"} ${dimName[d]} ${Math.round(v[i])}→${pt(v[i + 1])} in one frame at ${at(fr[i].t)} (its neighbours move ~${around(i).toFixed(1)}pt)` });
       });
     }
 
@@ -390,7 +401,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
     if (lat <= 1000) answered++;
     if (lat > 1000) P.push({ t: act.t0, sev: 0, kind: "no-response", more, text: `nothing visible changed within 1s of ${what}` });
     else P.push({ t: act.t0, sev: lat > 300 ? 2 : lat > 150 ? 1 : 0, kind: "response", more,
-      text: `${lat > 150 ? `${lat > 300 ? "LAGGED" : "slow:"} first visible change ${ms(lat)} after` : `answered ${ms(lat)} after`} ${what} (from the moment the step was sent)` });
+      text: `${lat > 150 ? `${lat > 300 ? "LAGGED" : "slow:"} first visible change ${ms(lat)} after` : `answered ${ms(lat)} after`} ${what}` });
   }
 
   // 8. Main-thread stalls during a motion that no visible gap above accounts for: the cause, seen from inside.
@@ -403,7 +414,7 @@ export function notice(rows: Row[], meta: Meta, a: Analysis, o: Options & { dir?
       const si = a.segments.findIndex((s) => from < s.end_s + 0.05 && to > s.start_s - 0.05);
       if (si < 0 || claimed.some((p) => from < p.to! + 0.004 && to > p.from! - 0.004)) continue;
       n++;
-      P.push({ t: from, from, to, sev: 1, kind: "stall", text: `the main thread stalled ${ms(st.ms)} at ${at(from)}, around ${a.segments.length > 1 ? `motion ${si + 1}` : "the motion"}, without a matching gap on screen`, why: whyGap(stalls, t0Mach, from, to) });
+      P.push({ t: from, from, to, sev: 1, kind: "stall", text: `stall: main thread was blocked ${ms(st.ms)} at ${at(from)}, in ${a.segments.length > 1 ? `motion ${si + 1}` : "the motion"}, no gap on screen`, why: ((w) => (w.filter((l) => !l.startsWith(" ")).length === 1 ? w.slice(1) : w))(whyGap(stalls, t0Mach, from, to)) });
     }
   }
 
@@ -478,10 +489,14 @@ export function formatSeen(s: Seen, max = 10, probed = false): string {
     for (const w of p.why ?? []) L.push(`    ${w.startsWith(" ") ? w : `why: ${w}`}`);
     for (const m of p.more ?? []) L.push(`    ${m}`);
   }
-  if (bad.length > max) L.push(`  … ${bad.length - max} more`);
+  if (bad.length > max) L.push(`  … ${bad.length - max} more (eye_report lists all)`);
+  if (bad.some((p) => p.kind === "jump" && p.text.startsWith("jump:"))) L.push("  (a jump is read from the box around everything that changed: an element appearing or vanishing reads the same)");
   if (!probed && bad.some((p) => p.kind === "freeze" && !p.why?.length)) L.push("  (cause not measured: no probe was inside the app. eye_drive puts one in by itself in Debug builds and then names what held the main thread)");
-  for (const p of facts.slice(0, max)) { L.push(`· ${p.text}`); for (const m of p.more ?? []) L.push(`    ${m}`); }
-  if (facts.length > max) L.push(`  … ${facts.length - max} more`);
+  // Steps that were answered in time are one line together; everything else keeps its own.
+  const quick = facts.filter((p) => p.text.startsWith("answered ") && !p.more?.length), rest = facts.filter((p) => !quick.includes(p));
+  for (const p of rest.slice(0, max)) { L.push(`· ${p.text}`); for (const m of p.more ?? []) L.push(`    ${m}`); }
+  if (rest.length > max) L.push(`  … ${rest.length - max} more`);
+  if (quick.length) L.push(`· answered: ${quick.slice(0, 12).map((p) => p.text.replace(/^answered (\S+) after /, "$1 ")).join(" · ")}${quick.length > 12 ? ` · … ${quick.length - 12} more` : ""}`);
   if (s.said?.lines.length) {
     const n = Math.max(3, Math.min(max, 8));
     L.push(`what the app told accessibility (same clock):`);

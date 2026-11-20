@@ -1,5 +1,5 @@
 // The words of a wing → the moves the hand flies. node test/wing.mjs
-import { parseWing } from "../src/wing.ts";
+import { parseWing, wingMs } from "../src/wing.ts";
 let bad = 0;
 const eq = (name, got, want) => {
   const ok = JSON.stringify(got) === JSON.stringify(want);
@@ -49,6 +49,10 @@ const steps = (s) => { const r = parseWing(s); return "error" in r ? r.error : r
 eq("waiting on the screen and checking it", steps('until:"a>100" 800 until:"!live.moving" check:"h.role"'),
   [{ op: "wait_until", expr: "a>100", timeout_ms: 800 }, { op: "wait_until", expr: "!live.moving" }, { op: "assert", expr: "h.role" }]);
 eq("a probe layer as the aim", steps('layer:"puck" tap'), [{ op: "move", on: "puck", ms: 250 }, "tap"]);
+eq("websites: a thing in the page, typing, keys, navigation, the page's own state",
+  steps('el:"#email" tap type:"ada@x.io\\n" key:"Meta+a" goto:"localhost:3000/b" reload js:"document.title==\'Done\'" 900 el:"Sign in" tap'),
+  [{ op: "move", on: "#email", ms: 250 }, "tap", { op: "type", text: "ada@x.io\n" }, { op: "key", key: "Meta+a" }, { op: "goto", url: "localhost:3000/b" }, { op: "reload" },
+    { op: "wait_until", js: "document.title=='Done'", timeout_ms: 900 }, { op: "move", on: "Sign in", ms: 250 }, "tap"]);
 eq("trackpad gestures", steps("pinch 1.5 pinch 0.5 400 rotate 45 zoom swipe left"),
   [{ op: "pinch", scale: 1.5 }, { op: "pinch", scale: 0.5, ms: 400 }, { op: "rotate", degrees: 45 }, { op: "smart_zoom" }, { op: "swipe", direction: "left" }]);
 eq("a fling is a scroll with momentum", steps("fling down 300"), [{ op: "scroll", dy: -300, dx: 0, momentum: true }]);
@@ -56,5 +60,13 @@ eq("pressure", steps("press press 600 force"), [{ op: "press" }, { op: "press", 
 eq("a gesture between two flights keeps its place", steps('"Map" pinch 2 E 40'), ["thing", { op: "pinch", scale: 2 }, "dir"]);
 eq("pinch without a factor says what it needs", String(steps("pinch")).includes("pinch 2"), true);
 eq("swipe without a direction says what it needs", String(steps("swipe")).includes("swipe left"), true);
+// How long a wing takes: under 4000 is what earns the "Just a sec…" pill instead of the full lock.
+const ms = (s) => wingMs(parseWing(s).moves);
+eq("a press on a thing is short", ms('"OK" tap') < 4000, true);
+eq("a rest counts in full", ms('"OK" tap rest 12000') >= 4000, true);
+eq("a wait counts its timeout", ms('tap until:"fps > 0" 5000') >= 4000, true);
+eq("a default wait_until is 2s", ms('tap until:"fps > 0"'), 150 + 2400);
+eq("fingers that play have no end", ms("756,14 fingers play rest 500"), Infinity);
+eq("a wander lasts as long as it says", ms("fingers wander 30 6000 lift") >= 4000, true);
 console.log(bad ? `${bad} FAILED` : "all wing words parse");
 process.exit(bad ? 1 : 0);

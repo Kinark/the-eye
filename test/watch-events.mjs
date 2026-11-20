@@ -71,7 +71,7 @@ const call = async (name, args) => (await client.callTool({ name, arguments: arg
 const w = watch(["--app", "TextEdit", "--seconds", "30"]);
 await w.ready;
 // A session that only watches, with the user's input held for this script's own driver (osascript).
-const lock = await call("eye_drive", { rect: { x: 0, y: 0, w: 400, h: 300 }, hands: false, lock: true, ax: false, max_seconds: 30 });
+const lock = await call("eye_drive", { rect: { x: 0, y: 0, w: 400, h: 300 }, hands: "mine", ax: false, max_seconds: 30 });
 check(/input is held/.test(lock) && !/refused|QUEUED/.test(lock), "input held for the TextEdit drive", lock.split("\n")[0]);
 const osa = (...lines) => { try { execFileSync("osascript", lines.flatMap((l) => ["-e", l]), { stdio: "pipe" }); } catch (e) { console.log("     osascript: " + String(e.stderr).trim()); } };
 osa('tell application "TextEdit" to activate', "delay 2",
@@ -101,7 +101,7 @@ check(!has(lines, /window-focused TextEdit$/), "no untitled focus noise");
   execFileSync("open", ["-a", "Calculator"]); await sleep(2500);
   const c = watch(["--app", "Calculator", "--until", "Result, 92", "--seconds", "25"]);
   await c.ready;
-  const lock3 = await call("eye_drive", { rect: { x: 0, y: 0, w: 400, h: 300 }, hands: false, lock: true, ax: false, max_seconds: 25 });
+  const lock3 = await call("eye_drive", { rect: { x: 0, y: 0, w: 400, h: 300 }, hands: "mine", ax: false, max_seconds: 25 });
   check(/input is held/.test(lock3) && !/refused|QUEUED/.test(lock3), "input held for the Calculator drive", lock3.split("\n")[0]);
   osa('tell application "Calculator" to activate', "delay 1",
     'tell application "System Events" to key code 53', "delay 0.5",
